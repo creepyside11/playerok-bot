@@ -4,8 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -35,14 +34,14 @@ class TelegramUser(Base):
     __tablename__ = "telegram_users"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    active_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    active_account_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class PlayerokAccount(Base):
     __tablename__ = "playerok_accounts"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tg_user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("telegram_users.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -52,7 +51,7 @@ class PlayerokAccount(Base):
     cookies_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     proxy_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str] = mapped_column(Text, nullable=False)
-    settings: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=fresh_settings)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=fresh_settings)
     worker_initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -67,9 +66,9 @@ class PlayerokAccount(Base):
 class ProcessedEvent(Base):
     __tablename__ = "processed_events"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+        Uuid(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     external_id: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -85,7 +84,7 @@ class AutoReplyRule(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+        Uuid(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     trigger: Mapped[str] = mapped_column(String(255), nullable=False)
     response: Mapped[str] = mapped_column(Text, nullable=False)
@@ -98,7 +97,7 @@ class DeliveryRule(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+        Uuid(as_uuid=True), ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     item_id: Mapped[str] = mapped_column(String(128), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -114,7 +113,7 @@ class DeliveryRule(Base):
 class DeliveryStock(Base):
     __tablename__ = "delivery_stock"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     rule_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("delivery_rules.id", ondelete="CASCADE"), nullable=False, index=True
     )

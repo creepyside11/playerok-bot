@@ -6,3 +6,8 @@ venv/
 .pytest_cache/
 .idea/
 .vscode/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3

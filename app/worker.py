@@ -9,7 +9,7 @@ from typing import Any
 
 from aiogram import Bot
 from sqlalchemy import delete, select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from playerokapi.enums import ChatTypes, ItemDealDirections, ItemDealStatuses
 
@@ -45,13 +45,12 @@ async def claim_event(
     stmt = (
         insert(ProcessedEvent)
         .values(account_id=account_id, kind=kind, external_id=str(external_id))
-        .on_conflict_do_nothing(constraint="uq_processed_event")
-        .returning(ProcessedEvent.id)
+        .on_conflict_do_nothing(index_elements=["account_id", "kind", "external_id"])
     )
     async with factory() as session:
-        value = (await session.execute(stmt)).scalar_one_or_none()
+        result = await session.execute(stmt)
         await session.commit()
-        return value is not None
+        return bool(result.rowcount)
 
 
 async def release_event(
@@ -248,7 +247,6 @@ class WorkerManager:
                     select(DeliveryStock)
                     .where(DeliveryStock.rule_id == rule.id, DeliveryStock.used_at.is_(None))
                     .order_by(DeliveryStock.id)
-                    .with_for_update(skip_locked=True)
                 )
                 if not stock:
                     await release_event(self.db, account.id, "delivery_action", action_id)
