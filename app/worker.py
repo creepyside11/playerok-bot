@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -16,6 +17,7 @@ from playerokapi.enums import ChatTypes, ItemDealDirections, ItemDealStatuses
 from .crypto import SecretCipher
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, PlayerokAccount, ProcessedEvent
 from .playerok import PlayerokGateway
+from .plugin_system import PluginManager
 
 
 logger = logging.getLogger(__name__)
@@ -78,12 +80,14 @@ class WorkerManager:
         gateway: PlayerokGateway,
         cipher: SecretCipher,
         poll_interval: float,
+        plugin_manager: PluginManager | None = None,
     ):
         self.bot = bot
         self.db = session_factory
         self.gateway = gateway
         self.cipher = cipher
         self.poll_interval = poll_interval
+        self.plugins = plugin_manager
         self._stop = asyncio.Event()
         self._sem = asyncio.Semaphore(4)
 
@@ -167,6 +171,9 @@ class WorkerManager:
         item_id = str(getattr(item, "id", "") or "")
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)
+
+        if new_deal and self.plugins:
+            await self.plugins.dispatch_deal(account, client, self.bot, deal)
 
         if new_deal and cfg["notifications"]["new_deal"]:
             amount = f"\nСумма: <b>{html.escape(str(price))} ₽</b>" if price is not None else ""
@@ -301,12 +308,22 @@ class WorkerManager:
         text = str(getattr(message, "text", "") or "")
         sender_name = getattr(sender, "username", None) or "пользователь"
         if settings_for(account)["notifications"]["new_message"]:
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{chat.id}"),
+                    InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat.id}"),
+                ]
+            ])
             await self._notify(
                 account.tg_user_id,
                 "💬 <b>Новое сообщение</b>\n"
                 f"От: <b>{html.escape(str(sender_name))}</b>\n"
                 f"{html.escape(text)[:3000]}",
+                markup,
             )
+
+        if self.plugins:
+            await self.plugins.dispatch_message(account, client, self.bot, chat, message)
 
         async with self.db() as session:
             rules = list((await session.scalars(
@@ -320,8 +337,10 @@ class WorkerManager:
                 await client.send_message(str(chat.id), rule.response, mark_chat_as_read=True)
                 break
 
-    async def _notify(self, chat_id: int, text: str) -> None:
+    async def _notify(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
         try:
-            await self.bot.send_message(chat_id, text, parse_mode="HTML")
+            await self.bot.send_message(
+                chat_id, text, parse_mode="HTML", reply_markup=reply_markup
+            )
         except Exception:
             logger.exception("Telegram notification failed for %s", chat_id)
