@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
+import shutil
+import threading
 from dataclasses import dataclass
 from typing import Any
 
+import certifi
 from curl_cffi import requests as curl_requests
+import playerokapi.account as playerok_account_module
 from playerokapi.account import Account
 from playerokapi.enums import ItemDealStatuses
 
@@ -42,10 +47,44 @@ VIEWER_QUERY = """query viewer {
 }"""
 
 
+_PLAYEROK_INIT_LOCK = threading.RLock()
+
+
+class _PlayerokShutilProxy:
+    """Fallback for a packaging bug in PlayerokAPI.
+
+    Upstream copies playerokapi/cacert.pem during Account.__init__, but its
+    setup.py does not package that file. On pip/git installs the source path can
+    therefore be missing. Use certifi's CA bundle only for that missing file.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(shutil, name)
+
+    @staticmethod
+    def copyfile(src: str, dst: str, *args: Any, **kwargs: Any) -> str:
+        source = src
+        if not os.path.exists(source) and os.path.basename(source) == "cacert.pem":
+            source = certifi.where()
+        return shutil.copyfile(source, dst, *args, **kwargs)
+
+
 class MultiAccount(Account):
     # Upstream Account is a singleton. The bot needs isolated sessions.
     def __new__(cls, *args: Any, **kwargs: Any) -> "MultiAccount":
         return object.__new__(cls)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Account.__init__ resolves shutil from playerokapi.account globals.
+        # Swap only that module reference while initialization runs; this avoids
+        # patching Python's global shutil module and remains safe across threads.
+        with _PLAYEROK_INIT_LOCK:
+            original_shutil = playerok_account_module.shutil
+            playerok_account_module.shutil = _PlayerokShutilProxy()
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                playerok_account_module.shutil = original_shutil
 
 
 def normalize_proxy(raw: str | None) -> str | None:
