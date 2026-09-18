@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 
 
-DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///playerok.db"
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost/playerok"
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,12 +22,16 @@ class Settings:
         if not bot_token:
             raise RuntimeError("BOT_TOKEN is required")
 
-        if database_url.startswith("sqlite://") and not database_url.startswith("sqlite+aiosqlite://"):
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif database_url.startswith("sqlite://"):
             database_url = database_url.replace("sqlite://", "sqlite+aiosqlite://", 1)
 
-        if not database_url.startswith("sqlite+aiosqlite://"):
+        if not database_url.startswith(("postgresql+asyncpg://", "sqlite+aiosqlite://")):
             raise RuntimeError(
-                "Only SQLite is supported. Use DATABASE_URL=sqlite+aiosqlite:///playerok.db"
+                "DATABASE_URL must use postgresql+asyncpg:// or sqlite+aiosqlite://"
             )
 
         try:
