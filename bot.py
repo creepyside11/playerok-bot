@@ -10,8 +10,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from app.config import Settings
 from app.crypto import SecretCipher
 from app.db import init_db, make_engine, make_session_factory
+from app.advanced_handlers import configure_advanced
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
+from app.plugin_system import PluginManager
 from app.worker import WorkerManager
 
 
@@ -30,8 +32,12 @@ async def main() -> None:
     gateway = PlayerokGateway(cipher)
     email_auth = EmailAuthClient()
 
+    plugin_manager = PluginManager(session_factory)
+    plugin_manager.load()
+
     bot = Bot(settings.bot_token)
     dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(configure_advanced(plugin_manager))
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))
     )
@@ -42,6 +48,7 @@ async def main() -> None:
         gateway=gateway,
         cipher=cipher,
         poll_interval=settings.poll_interval,
+        plugin_manager=plugin_manager,
     )
     worker_task = asyncio.create_task(worker.run(), name="playerok-worker")
 
