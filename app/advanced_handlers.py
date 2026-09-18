@@ -123,7 +123,7 @@ async def _load_catalog(account: PlayerokAccount) -> list[tuple[str, str, str, s
     client = await svc().gateway.get_client(account)
     cursor = None
     rows: list[tuple[str, str, str, str, str]] = []
-    for _ in range(5):
+    for _ in range(20):
         page = await client.call("get_games", count=24, after_cursor=cursor)
         for game in list(getattr(page, "games", []) or []):
             for category in list(getattr(game, "categories", []) or []):
