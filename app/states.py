@@ -31,3 +31,20 @@ class ItemCreate(StatesGroup):
     description = State()
     image = State()
     priority = State()
+
+
+class ItemCatalog(StatesGroup):
+    game_search = State()
+    category_search = State()
+
+
+class ChatReply(StatesGroup):
+    text = State()
+
+
+class PluginSettingEdit(StatesGroup):
+    value = State()
+
+
+class DeliveryStockAdd(StatesGroup):
+    content = State()
