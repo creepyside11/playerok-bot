@@ -556,7 +556,7 @@ async def chats_menu(call: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("chat:open:"))
-async def chat_open(call: CallbackQuery) -> None:
+async def chat_open(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)
     if not account:
         return
@@ -573,6 +573,12 @@ async def chat_open(call: CallbackQuery) -> None:
         await edit(call, f"❌ <code>{html.escape(str(exc))[:1600]}</code>", back_menu("chats"))
         return
     messages = list(getattr(page, "messages", []) or [])
+    page_info = getattr(page, "page_info", None)
+    await state.update_data(
+        history_chat_id=chat_id,
+        history_cursor=getattr(page_info, "end_cursor", None),
+        history_has_next=bool(getattr(page_info, "has_next_page", False)),
+    )
     lines = [f"💬 <b>{html.escape(_user_name(chat, str(account.playerok_user_id)))}</b>"]
     for msg in reversed(messages):
         user = getattr(msg, "user", None)
@@ -590,12 +596,62 @@ async def chat_open(call: CallbackQuery) -> None:
     if len(body) > 3900:
         body = body[-3900:]
         body = "…\n" + body
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat_id}")],
+    ]
+    if getattr(page_info, "has_next_page", False):
+        rows.append([InlineKeyboardButton(text="⬅️ Более старые сообщения", callback_data="chat:more")])
+    rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chat:open:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Чаты", callback_data="menu:chats")],
     ])
-    await edit(call, body, markup)
+    await edit(call, body, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "chat:more")
+async def chat_more(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    data = await state.get_data()
+    chat_id = data.get("history_chat_id")
+    cursor = data.get("history_cursor")
+    if not chat_id or not cursor:
+        await call.answer("История устарела", show_alert=True)
+        return
+    await call.answer("Загружаю…")
+    try:
+        page = await (await svc().gateway.get_client(account)).call(
+            "get_chat_messages", chat_id, count=24, after_cursor=cursor
+        )
+    except Exception as exc:
+        await call.message.answer(f"❌ <code>{html.escape(str(exc))[:1500]}</code>", parse_mode="HTML")
+        return
+    messages = list(getattr(page, "messages", []) or [])
+    page_info = getattr(page, "page_info", None)
+    await state.update_data(
+        history_cursor=getattr(page_info, "end_cursor", None),
+        history_has_next=bool(getattr(page_info, "has_next_page", False)),
+    )
+    lines = ["💬 <b>Более старые сообщения</b>"]
+    for msg in reversed(messages):
+        user = getattr(msg, "user", None)
+        mine = str(getattr(user, "id", "")) == str(account.playerok_user_id)
+        who = "Вы" if mine else str(getattr(user, "username", "Покупатель"))
+        text = str(getattr(msg, "text", "") or "")
+        if getattr(msg, "images", None):
+            text += f" [изображений: {len(msg.images)}]"
+        if not text:
+            text = f"[{getattr(getattr(msg, 'event', None), 'name', 'системное сообщение')}]"
+        lines.append(f"\n<b>{html.escape(who)}</b>: {html.escape(clip(text, 320))}")
+    body = "\n".join(lines)
+    if len(body) > 3900:
+        body = "…\n" + body[-3900:]
+    rows = [[InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat_id}")]]
+    if getattr(page_info, "has_next_page", False):
+        rows.append([InlineKeyboardButton(text="⬅️ Ещё старше", callback_data="chat:more")])
+    rows.append([InlineKeyboardButton(text="↩️ К последним", callback_data=f"chat:open:{chat_id}")])
+    await edit(call, body, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(F.data.startswith("chat:reply:"))
