@@ -1,0 +1,1 @@
+"""Playerok Telegram automation bot."""

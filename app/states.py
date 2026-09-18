@@ -1,0 +1,33 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class AddAccount(StatesGroup):
+    proxy = State()
+    auth_method = State()
+    cookie = State()
+    email = State()
+    code = State()
+
+
+class AutoReplyAdd(StatesGroup):
+    trigger = State()
+    response = State()
+
+
+class DeliveryAdd(StatesGroup):
+    item_id = State()
+    mode = State()
+    content = State()
+
+
+class ItemCreate(StatesGroup):
+    game = State()
+    category = State()
+    obtaining = State()
+    attributes = State()
+    data_fields = State()
+    name = State()
+    price = State()
+    description = State()
+    image = State()
+    priority = State()
