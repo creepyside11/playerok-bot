@@ -374,8 +374,7 @@ async def autoreply_toggle(call: CallbackQuery) -> None:
             rule.enabled = not rule.enabled
             await session.commit()
     await call.answer("Сохранено")
-    call.data = f"ar:view:{rid}"
-    await autoreply_view(call)
+    await _show_autoreplies(call)
 
 
 @router.callback_query(F.data.startswith("ar:remove:"))
@@ -478,8 +477,7 @@ async def delivery_toggle(call: CallbackQuery) -> None:
             rule.enabled = not rule.enabled
             await session.commit()
     await call.answer("Сохранено")
-    call.data = f"del:view:{rid}"
-    await delivery_view(call)
+    await _show_delivery(call)
 
 
 @router.callback_query(F.data.startswith("del:stock:"))
@@ -696,8 +694,7 @@ async def plugin_toggle(call: CallbackQuery) -> None:
     enabled, _ = await plugins().resolved_state(account.id, plugin)
     await plugins().set_enabled(account.id, plugin, not enabled)
     await call.answer("Сохранено")
-    call.data = f"plugin:view:{idx}"
-    await plugin_view(call)
+    await _show_plugins(call)
 
 
 @router.callback_query(F.data.startswith("plugin:settings:"))
@@ -773,8 +770,20 @@ async def plugin_choice(call: CallbackQuery) -> None:
         return
     await plugins().set_setting(account.id, plugin, key, choices[ci])
     await call.answer("Сохранено")
-    call.data = f"plugin:settings:{idx}"
-    await plugin_settings(call)
+    plugin = plugins().by_index(idx)
+    if plugin:
+        _enabled, config = await plugins().resolved_state(account.id, plugin)
+        b = InlineKeyboardBuilder()
+        for setting_key, meta in plugin.settings.items():
+            value = config.get(setting_key)
+            shown = "✅" if value is True else "❌" if value is False else clip(value, 16)
+            b.button(
+                text=f"{meta.get('label', setting_key)}: {shown}",
+                callback_data=f"pset:{idx}:{setting_key}",
+            )
+        b.button(text="⬅️ К плагину", callback_data=f"plugin:view:{idx}")
+        b.adjust(1)
+        await edit(call, f"⚙️ <b>Настройки: {html.escape(plugin.name)}</b>", b.as_markup())
 
 
 @router.message(PluginSettingEdit.value)
