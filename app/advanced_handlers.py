@@ -791,8 +791,7 @@ async def plugin_setting_click(call: CallbackQuery, state: FSMContext) -> None:
     if kind == "bool":
         await plugins().set_setting(account.id, plugin, key, not bool(config.get(key)))
         await call.answer("Сохранено")
-        call.data = f"plugin:settings:{idx}"
-        await plugin_settings(call)
+        await _show_plugins(call)
         return
     if kind == "choice":
         choices = list(meta.get("choices") or [])
