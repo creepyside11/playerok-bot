@@ -690,11 +690,13 @@ async def _show_plugins(call: CallbackQuery) -> None:
     manager = plugins()
     items = manager.ordered()
     b = InlineKeyboardBuilder()
+    b.button(text="🛍 Каталог плагинов", callback_data="plugins:catalog")
+    b.button(text="📦 Мои плагины", callback_data="plugins:mine")
+    b.button(text="📤 Загрузить плагин", callback_data="plugins:upload")
+    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
     for i, plugin in enumerate(items):
         enabled, _ = await manager.resolved_state(account.id, plugin)
         b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 28)}", callback_data=f"plugin:view:{i}")
-    b.button(text="📤 Загрузить плагин", callback_data="plugins:upload")
-    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
     b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
@@ -706,6 +708,66 @@ async def _show_plugins(call: CallbackQuery) -> None:
 async def plugins_menu(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
+    await _show_plugins(call)
+
+
+@router.callback_query(F.data == "plugins:mine")
+async def plugins_mine(call: CallbackQuery) -> None:
+    await call.answer()
+    await _show_plugins(call)
+
+
+@router.callback_query(F.data == "plugins:catalog")
+async def plugins_catalog(call: CallbackQuery) -> None:
+    manager = plugins()
+    catalog = manager.catalog_plugins()
+    installed = {plugin.id for plugin in manager.ordered()}
+    b = InlineKeyboardBuilder()
+    for plugin in catalog:
+        suffix = " ✅ установлено" if plugin.id in installed else ""
+        b.button(
+            text=f"{clip(plugin.name, 28)}{suffix}",
+            callback_data=f"plugincatalog:view:{plugin.id}",
+        )
+    b.button(text="⬅️ Мои плагины", callback_data="plugins:mine")
+    b.adjust(1)
+    text = "🛍 <b>Каталог плагинов</b>\n\n" + (
+        "\n".join(f"• <b>{html.escape(plugin.name)}</b> — {html.escape(plugin.description)}" for plugin in catalog)
+        or "Каталог пока пуст."
+    )
+    await edit(call, text, b.as_markup())
+
+
+@router.callback_query(F.data.startswith("plugincatalog:view:"))
+async def plugin_catalog_view(call: CallbackQuery) -> None:
+    plugin_id = call.data.rsplit(":", 1)[-1]
+    plugin = next((item for item in plugins().catalog_plugins() if item.id == plugin_id), None)
+    if not plugin:
+        await call.answer("Плагин не найден", show_alert=True)
+        return
+    installed = plugin.id in plugins().plugins
+    rows = []
+    if not installed:
+        rows.append([InlineKeyboardButton(text="📥 Установить", callback_data=f"plugincatalog:install:{plugin.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Каталог", callback_data="plugins:catalog")])
+    await call.answer()
+    await edit(
+        call,
+        f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+        f"Автор: {html.escape(plugin.author)}\n\n{html.escape(plugin.description)}",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("plugincatalog:install:"))
+async def plugin_catalog_install(call: CallbackQuery) -> None:
+    plugin_id = call.data.rsplit(":", 1)[-1]
+    try:
+        plugin = plugins().install_catalog(plugin_id)
+    except Exception as exc:
+        await call.answer(f"Ошибка: {str(exc)[:180]}", show_alert=True)
+        return
+    await call.answer(f"Установлен: {plugin.name}")
     await _show_plugins(call)
 
 

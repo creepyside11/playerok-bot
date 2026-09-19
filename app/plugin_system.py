@@ -62,9 +62,15 @@ class PluginContext:
 
 
 class PluginManager:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], plugin_dir: str | Path = "plugins") -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        plugin_dir: str | Path = "plugins",
+        catalog_dir: str | Path = "plugin_catalog",
+    ) -> None:
         self.db = session_factory
         self.plugin_dir = Path(plugin_dir)
+        self.catalog_dir = Path(catalog_dir)
         self.plugins: dict[str, PluginSpec] = {}
         self.load_errors: dict[str, str] = {}
         self.telethon = TelethonManager()
@@ -78,6 +84,17 @@ class PluginManager:
 
     def plugin_source(self, plugin: PluginSpec) -> bytes:
         return (self.plugin_dir / plugin.filename).read_bytes()
+
+    def catalog_plugins(self) -> list[PluginSpec]:
+        catalog = PluginManager(self.db, self.catalog_dir, self.catalog_dir)
+        catalog.load()
+        return catalog.ordered()
+
+    def install_catalog(self, plugin_id: str) -> PluginSpec:
+        source = next((path for path in self.catalog_dir.glob("*.py") if path.stem == plugin_id), None)
+        if source is None:
+            raise ValueError("Плагин не найден в каталоге")
+        return self.install(source.name, source.read_bytes())
 
     def load(self) -> None:
         self.plugins.clear()
