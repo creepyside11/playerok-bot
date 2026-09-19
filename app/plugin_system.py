@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -30,6 +31,14 @@ class PluginSpec:
     author: str
     settings: dict[str, dict[str, Any]]
     module: ModuleType
+    filename: str = ""
+
+    @property
+    def hooks(self) -> list[str]:
+        return [
+            name for name in ("on_load", "on_unload", "on_message", "on_deal", "on_command", "on_schedule")
+            if hasattr(self.module, name)
+        ]
 
     def defaults(self) -> dict[str, Any]:
         return {key: meta.get("default") for key, meta in self.settings.items()}
@@ -64,6 +73,12 @@ class PluginManager:
     def set_external_api(self, api: ExternalAPI) -> None:
         self.external_api = api
 
+    def documentation(self) -> str:
+        return (Path(__file__).resolve().parent.parent / "docs" / "PLUGINS_FOR_AI.md").read_text(encoding="utf-8")
+
+    def plugin_source(self, plugin: PluginSpec) -> bytes:
+        return (self.plugin_dir / plugin.filename).read_bytes()
+
     def load(self) -> None:
         self.plugins.clear()
         self.load_errors.clear()
@@ -81,7 +96,11 @@ class PluginManager:
                 if not isinstance(meta, dict):
                     raise ValueError("PLUGIN_META must be a dict")
                 plugin_id = str(meta.get("id") or path.stem)
+                if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+                    raise ValueError("PLUGIN_META.id содержит недопустимые символы")
                 settings = meta.get("settings") or {}
+                if not isinstance(settings, dict):
+                    raise ValueError("PLUGIN_META.settings must be a dict")
                 normalized = {str(k): dict(v or {}) for k, v in settings.items()}
                 self.plugins[plugin_id] = PluginSpec(
                     id=plugin_id,
@@ -91,10 +110,31 @@ class PluginManager:
                     author=str(meta.get("author") or "unknown"),
                     settings=normalized,
                     module=module,
+                    filename=path.name,
                 )
             except Exception as exc:
                 self.load_errors[path.name] = str(exc)
                 logger.exception("Failed to load plugin %s", path)
+
+    def install(self, filename: str, content: bytes) -> PluginSpec:
+        path_name = Path(filename).name
+        if not path_name.endswith(".py") or path_name.startswith("_"):
+            raise ValueError("Нужен Python-файл с расширением .py")
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]+\.py", path_name):
+            raise ValueError("Недопустимое имя файла")
+        if len(content) > 256 * 1024:
+            raise ValueError("Плагин слишком большой (максимум 256 КБ)")
+        path = self.plugin_dir / path_name
+        with tempfile.NamedTemporaryFile(dir=self.plugin_dir, prefix=f".{path.stem}.", suffix=".tmp", delete=False) as temp:
+            temp.write(content)
+            temp_path = Path(temp.name)
+        temp_path.replace(path)
+        self.load()
+        plugin_id = path.stem
+        plugin = self.plugins.get(plugin_id)
+        if plugin is None:
+            raise ValueError(self.load_errors.get(path_name, "Плагин не загрузился"))
+        return plugin
 
     def ordered(self) -> list[PluginSpec]:
         return sorted(self.plugins.values(), key=lambda x: x.name.casefold())
@@ -123,6 +163,12 @@ class PluginManager:
 
     async def dispatch_deal(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any) -> None:
         await self._dispatch("on_deal", account, client, bot, deal)
+
+    async def dispatch_command(self, account: PlayerokAccount, client: Any, bot: Any, command: str, args: list[str]) -> None:
+        await self._dispatch("on_command", account, client, bot, command, args)
+
+    async def dispatch_schedule(self, account: PlayerokAccount, client: Any, bot: Any) -> None:
+        await self._dispatch("on_schedule", account, client, bot)
 
     async def _dispatch(self, hook_name: str, account: PlayerokAccount, client: Any, bot: Any, *args: Any) -> None:
         for plugin in self.ordered():

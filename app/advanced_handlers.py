@@ -8,7 +8,7 @@ from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from playerokapi.enums import ChatTypes, ItemDealDirections
@@ -23,6 +23,7 @@ from .states import (
     ItemCatalog,
     ItemCreate,
     PluginSettingEdit,
+    PluginUpload,
 )
 
 
@@ -98,6 +99,7 @@ async def enhanced_items(call: CallbackQuery, state: FSMContext) -> None:
         [InlineKeyboardButton(text="🔎 Найти игру", callback_data="catalog:search")],
         [InlineKeyboardButton(text="📚 Категория → игра", callback_data="catalog:categories")],
         [InlineKeyboardButton(text="📋 Мои товары", callback_data="items:list")],
+        [InlineKeyboardButton(text="🧩 Шаблоны товаров", callback_data="templates:list")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
     ])
     await edit(
@@ -691,6 +693,8 @@ async def _show_plugins(call: CallbackQuery) -> None:
     for i, plugin in enumerate(items):
         enabled, _ = await manager.resolved_state(account.id, plugin)
         b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 28)}", callback_data=f"plugin:view:{i}")
+    b.button(text="📤 Загрузить плагин", callback_data="plugins:upload")
+    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
     b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
@@ -705,11 +709,55 @@ async def plugins_menu(call: CallbackQuery, state: FSMContext) -> None:
     await _show_plugins(call)
 
 
+@router.callback_query(F.data == "plugins:docs")
+async def plugins_docs(call: CallbackQuery) -> None:
+    await call.answer("Отправляю документацию…")
+    await call.message.answer_document(
+        BufferedInputFile(plugins().documentation().encode("utf-8"), filename="PLUGINS_FOR_AI.md"),
+        caption="📘 Документация API плагинов. Её можно отправить в ИИ для генерации собственного плагина.",
+    )
+
+
 @router.callback_query(F.data == "plugins:reload")
 async def plugins_reload(call: CallbackQuery) -> None:
     plugins().load()
     await call.answer("Перезагружено")
     await _show_plugins(call)
+
+
+@router.callback_query(F.data == "plugins:upload")
+async def plugins_upload_start(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginUpload.file)
+    await call.answer()
+    await edit(call, "📤 Пришлите файл плагина `.py` документом.", back_menu("plugins"))
+
+
+@router.message(PluginUpload.file, F.document)
+async def plugins_upload_file(message: Message, state: FSMContext, bot: Any) -> None:
+    document = message.document
+    if not document.file_name or not document.file_name.endswith(".py"):
+        await message.answer("Нужен файл с расширением .py")
+        return
+    if document.file_size and document.file_size > 256 * 1024:
+        await message.answer("Файл слишком большой (максимум 256 КБ).")
+        return
+    buffer = await bot.download(document)
+    try:
+        plugin = plugins().install(document.file_name, buffer.read())
+    except Exception as exc:
+        await message.answer(f"❌ Не удалось загрузить плагин: <code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Плагин загружен: <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}",
+        parse_mode="HTML",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(PluginUpload.file)
+async def plugins_upload_wrong_type(message: Message) -> None:
+    await message.answer("Пришлите плагин именно документом, одним файлом .py.")
 
 
 @router.callback_query(F.data.startswith("plugin:view:"))

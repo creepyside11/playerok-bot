@@ -4,7 +4,6 @@ import base64
 import copy
 import html
 import io
-import json
 import uuid
 from typing import Any
 
@@ -19,7 +18,7 @@ from playerokapi.enums import GameCategoryDataFieldTypes
 
 from .crypto import SecretCipher
 from .keyboards import auth_method_menu, back_menu, delivery_mode_menu, main_menu
-from .models import AutoReplyRule, DeliveryRule, DeliveryStock, PlayerokAccount, TelegramUser, fresh_settings
+from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, PlayerokAccount, TelegramUser, fresh_settings
 from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, normalize_proxy
 from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate
 
@@ -740,10 +739,63 @@ async def delivery_delete(call: CallbackQuery) -> None:
 async def show_items(call: CallbackQuery) -> None:
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои товары", callback_data="items:list")],
+        [InlineKeyboardButton(text="🧩 Шаблоны товаров", callback_data="templates:list")],
         [InlineKeyboardButton(text="➕ Выставить товар", callback_data="items:create")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
     ])
     await edit(call, "📦 <b>Товары Playerok</b>", markup)
+
+
+@router.callback_query(F.data == "templates:list")
+async def templates_list(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    async with svc().db() as session:
+        rows = list((await session.scalars(
+            select(ItemTemplate).where(ItemTemplate.account_id == account.id).order_by(ItemTemplate.created_at.desc())
+        )).all())
+    builder = InlineKeyboardBuilder()
+    for row in rows:
+        builder.button(text=f"📄 {clip(row.name, 32)}", callback_data=f"template:use:{row.id}")
+        builder.button(text="🗑", callback_data=f"template:delete:{row.id}")
+    builder.button(text="⬅️ Товары", callback_data="menu:items")
+    builder.adjust(2, 1)
+    text = "🧩 <b>Шаблоны товаров</b>\n\n" + ("\n".join(f"• {html.escape(row.name)}" for row in rows) or "Шаблонов пока нет.")
+    await call.answer()
+    await edit(call, text, builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("template:delete:"))
+async def template_delete(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    template_id = int(call.data.rsplit(":", 1)[-1])
+    async with svc().db() as session:
+        row = await session.get(ItemTemplate, template_id)
+        if row and row.account_id == account.id:
+            await session.delete(row)
+            await session.commit()
+    await call.answer("Шаблон удалён")
+    await templates_list(call)
+
+
+@router.callback_query(F.data.startswith("template:use:"))
+async def template_use(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    template_id = int(call.data.rsplit(":", 1)[-1])
+    async with svc().db() as session:
+        row = await session.get(ItemTemplate, template_id)
+    if not row or row.account_id != account.id:
+        await call.answer("Шаблон не найден", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(account_id=str(account.id), **row.payload)
+    await call.answer()
+    await create_draft(call.message, state, call.from_user.id)
 
 
 @router.callback_query(F.data == "menu:items")
@@ -875,65 +927,79 @@ async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
         obtaining_name=obtaining_name,
         field_meta=field_meta,
         option_meta=option_meta,
+        attributes={},
     )
     await state.set_state(ItemCreate.attributes)
     if option_meta:
-        preview = "\n".join(
-            f"• <code>{html.escape(field)}</code> = <code>{html.escape(value)}</code> — {html.escape(label)}"
-            for field, value, label in option_meta[:30]
-        )
-        prompt = (
-            "⚙️ Отправьте JSON-словарь выбранных атрибутов, например "
-            "<code>{\"region\": \"TR\"}</code>.\n\n" + preview
-        )
+        b = InlineKeyboardBuilder()
+        for i, (_field, _value, label) in enumerate(option_meta[:40]):
+            b.button(text=clip(label, 38), callback_data=f"itemopt:{i}")
+        b.button(text="⏭ Пропустить атрибуты", callback_data="itemopt:skip")
+        b.adjust(1)
+        prompt = "⚙️ Выберите значение атрибута или пропустите этот шаг."
     else:
-        prompt = "Атрибутов нет. Отправьте <code>{}</code>."
-    await call.answer()
-    await edit(call, prompt, back_menu("items"))
-
-
-@router.message(ItemCreate.attributes)
-async def item_attrs(message: Message, state: FSMContext) -> None:
-    try:
-        value = json.loads((message.text or "").strip())
-        if not isinstance(value, dict):
-            raise ValueError
-    except Exception:
-        await message.answer("Нужен JSON-словарь.")
+        await state.set_state(ItemCreate.data_fields)
+        await call.message.answer("Атрибутов нет. Переходим к полям товара.")
         return
-    await state.update_data(attributes=value)
+    await call.answer()
+    await edit(call, prompt, b.as_markup())
+
+
+async def _start_item_fields(target: Message, state: FSMContext) -> None:
     data = await state.get_data()
     fields = data.get("field_meta") or []
+    if not fields:
+        await state.update_data(data_field_values={})
+        await state.set_state(ItemCreate.name)
+        await target.answer("Название товара:")
+        return
+    await state.update_data(field_index=0, data_field_values={})
     await state.set_state(ItemCreate.data_fields)
-    if fields:
-        preview = "\n".join(
-            f"• <code>{html.escape(fid)}</code> — {html.escape(label)}{' (обязательно)' if required else ''}"
-            for fid, label, required in fields
-        )
-        await message.answer(
-            "🧾 Отправьте JSON: ключ = ID поля, значение = текст.\n" + preview,
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer("Полей нет. Отправьте <code>{}</code>.", parse_mode="HTML")
+    _field_id, label, required = fields[0]
+    suffix = " (обязательно)" if required else " (можно пропустить: —)"
+    await target.answer(f"🧾 Введите значение поля «{html.escape(label)}»{suffix}:", parse_mode="HTML")
+
+
+@router.callback_query(ItemCreate.attributes, F.data.startswith("itemopt:"))
+async def item_option(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    raw = call.data.split(":", 1)[1]
+    attributes = dict(data.get("attributes") or {})
+    if raw != "skip":
+        index = int(raw)
+        options = data.get("option_meta") or []
+        if index >= len(options):
+            await call.answer("Список устарел", show_alert=True)
+            return
+        field, value, _label = options[index]
+        attributes[field] = value
+    await state.update_data(attributes=attributes)
+    await call.answer()
+    await _start_item_fields(call.message, state)
 
 
 @router.message(ItemCreate.data_fields)
 async def item_fields(message: Message, state: FSMContext) -> None:
-    try:
-        values = json.loads((message.text or "").strip())
-        if not isinstance(values, dict):
-            raise ValueError
-    except Exception:
-        await message.answer("Нужен JSON-словарь.")
-        return
     data = await state.get_data()
-    missing = [
-        label for fid, label, required in data.get("field_meta") or []
-        if required and not str(values.get(fid, "")).strip()
-    ]
-    if missing:
-        await message.answer("Не заполнены обязательные поля: " + ", ".join(missing))
+    fields = data.get("field_meta") or []
+    index = int(data.get("field_index", 0))
+    if index >= len(fields):
+        await _start_item_fields(message, state)
+        return
+    field_id, label, required = fields[index]
+    value = (message.text or "").strip()
+    if not value and required:
+        await message.answer(f"Поле «{label}» обязательно. Введите значение:")
+        return
+    values = dict(data.get("data_field_values") or {})
+    if value:
+        values[field_id] = value
+    index += 1
+    if index < len(fields):
+        await state.update_data(data_field_values=values, field_index=index)
+        _next_id, next_label, next_required = fields[index]
+        suffix = " (обязательно)" if next_required else " (можно пропустить: —)"
+        await message.answer(f"🧾 Введите значение поля «{html.escape(next_label)}»{suffix}:", parse_mode="HTML")
         return
     await state.update_data(data_field_values=values)
     await state.set_state(ItemCreate.name)
@@ -1039,6 +1105,7 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
     b = InlineKeyboardBuilder()
     for i, (_id, name, price) in enumerate(packed):
         b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
+    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
     b.button(text="Оставить черновиком", callback_data="itemprio:draft")
     b.adjust(1)
     await target.answer(
@@ -1046,6 +1113,35 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
         reply_markup=b.as_markup(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(ItemCreate.priority, F.data == "itemtemplate:save")
+async def item_template_save_start(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ItemCreate.template_name)
+    await call.answer()
+    await call.message.answer("Введите название шаблона:")
+
+
+@router.message(ItemCreate.template_name)
+async def item_template_save(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Название не должно быть пустым.")
+        return
+    data = await state.get_data()
+    payload = {
+        key: data[key]
+        for key in (
+            "category_id", "category_name", "obtaining_id", "obtaining_name", "attributes",
+            "data_field_values", "item_name", "item_price", "item_description",
+        )
+        if key in data
+    }
+    async with svc().db() as session:
+        session.add(ItemTemplate(account_id=uuid.UUID(data["account_id"]), name=name, payload=payload))
+        await session.commit()
+    await state.clear()
+    await message.answer("✅ Шаблон сохранён.", reply_markup=main_menu())
 
 
 @router.callback_query(ItemCreate.priority, F.data == "itemprio:draft")

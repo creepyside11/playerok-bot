@@ -31,6 +31,11 @@ class ItemCreate(StatesGroup):
     description = State()
     image = State()
     priority = State()
+    template_name = State()
+
+
+class PluginUpload(StatesGroup):
+    file = State()
 
 
 class ItemCatalog(StatesGroup):
