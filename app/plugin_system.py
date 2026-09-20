@@ -36,7 +36,9 @@ class PluginSpec:
     @property
     def hooks(self) -> list[str]:
         return [
-            name for name in ("on_load", "on_unload", "on_message", "on_deal", "on_command", "on_schedule")
+            name for name in (
+                "on_load", "on_unload", "on_message", "on_deal", "on_command", "on_action", "on_schedule"
+            )
             if hasattr(self.module, name)
         ]
 
@@ -57,8 +59,12 @@ class PluginContext:
     async def send_chat(self, chat_id: str, text: str) -> Any:
         return await self.client.send_message(str(chat_id), str(text), mark_chat_as_read=True)
 
-    async def notify(self, text: str) -> Any:
-        return await self.bot.send_message(self.account.tg_user_id, str(text))
+    async def notify(self, text: str, reply_markup: Any = None) -> Any:
+        return await self.bot.send_message(
+            self.account.tg_user_id,
+            str(text),
+            reply_markup=reply_markup,
+        )
 
 
 class PluginManager:
@@ -95,6 +101,16 @@ class PluginManager:
         if source is None:
             raise ValueError("Плагин не найден в каталоге")
         return self.install(source.name, source.read_bytes())
+
+    def uninstall(self, plugin_id: str) -> None:
+        plugin = self.plugins.get(plugin_id)
+        if not plugin:
+            return
+        target = self.plugin_dir / plugin.filename
+        if target.exists():
+            target.unlink()
+        self.plugins.pop(plugin_id, None)
+        self.load()
 
     def load(self) -> None:
         self.plugins.clear()
@@ -183,6 +199,16 @@ class PluginManager:
 
     async def dispatch_command(self, account: PlayerokAccount, client: Any, bot: Any, command: str, args: list[str]) -> None:
         await self._dispatch("on_command", account, client, bot, command, args)
+
+    async def dispatch_action(
+        self,
+        account: PlayerokAccount,
+        client: Any,
+        bot: Any,
+        action: str,
+        payload: dict[str, Any],
+    ) -> None:
+        await self._dispatch("on_action", account, client, bot, action, payload)
 
     async def dispatch_schedule(self, account: PlayerokAccount, client: Any, bot: Any) -> None:
         await self._dispatch("on_schedule", account, client, bot)

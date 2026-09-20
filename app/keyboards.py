@@ -15,7 +15,8 @@ def main_menu() -> InlineKeyboardMarkup:
         ("💬 Автоответчик", "menu:autoreply"),
         ("⚡ Автовыдача", "menu:delivery"),
         ("💬 Чаты", "menu:chats"),
-        ("🧩 Плагины", "menu:plugins"),
+        ("🛍 Каталог плагинов", "plugins:catalog"),
+        ("🧩 Мои плагины", "plugins:mine"),
         ("🔐 Аккаунты", "menu:accounts"),
     ]:
         b.button(text=text, callback_data=data)

@@ -126,12 +126,24 @@ class WorkerManager:
 
     async def _poll(self, account: PlayerokAccount) -> None:
         client = await self.gateway.get_client(account)
-        deals_page, chats_page = await asyncio.gather(
+        # Fetch deals (outgoing sales and incoming purchases) + chats (PM, Notifications, Support)
+        deals_out_page, deals_in_page, chats_page = await asyncio.gather(
             client.get_deals(direction=ItemDealDirections.OUT, count=24),
-            client.get_chats(type=ChatTypes.PM, count=24),
+            client.get_deals(direction=ItemDealDirections.IN, count=24),
+            client.get_chats(count=24),
         )
-        deals = list(getattr(deals_page, "deals", []) or [])
+        deals = list(getattr(deals_out_page, "deals", []) or []) + list(getattr(deals_in_page, "deals", []) or [])
         chats = list(getattr(chats_page, "chats", []) or [])
+
+        # Deduplicate deals by ID if any overlap
+        seen_deals: set[str] = set()
+        unique_deals = []
+        for d in deals:
+            did = str(getattr(d, "id", ""))
+            if did and did not in seen_deals:
+                seen_deals.add(did)
+                unique_deals.append(d)
+        deals = unique_deals
 
         if not account.worker_initialized:
             for deal in deals:
@@ -298,7 +310,8 @@ class WorkerManager:
             return
         sender = getattr(message, "user", None)
         sender_id = str(getattr(sender, "id", "") or "")
-        if not sender_id or sender_id == str(account.playerok_user_id):
+        # Don't notify about our own outgoing messages
+        if sender_id and sender_id == str(account.playerok_user_id):
             return
         if getattr(message, "is_auto_response", False):
             return
@@ -306,36 +319,63 @@ class WorkerManager:
             return
 
         text = str(getattr(message, "text", "") or "")
-        sender_name = getattr(sender, "username", None) or "пользователь"
+        images = list(getattr(message, "images", []) or [])
+        images_info = f"\n📷 <i>Прикреплено фото: {len(images)} шт.</i>" if images else ""
+
+        chat_type_obj = getattr(chat, "type", None)
+        chat_type_name = getattr(chat_type_obj, "name", "")
+        type_badge = ""
+        if chat_type_name == "NOTIFICATIONS":
+            type_badge = " [Уведомление]"
+        elif chat_type_name == "SUPPORT":
+            type_badge = " [Поддержка]"
+
+        sender_name = getattr(sender, "username", None)
+        if not sender_name:
+            if chat_type_name == "NOTIFICATIONS":
+                sender_name = "Playerok Уведомления"
+            elif chat_type_name == "SUPPORT":
+                sender_name = "Служба поддержки Playerok"
+            else:
+                sender_name = "Пользователь"
+
+        display_text = text
+        if not display_text and not images:
+            event = getattr(getattr(message, "event", None), "name", None)
+            display_text = f"[{event or 'Системное событие'}]"
+
         if settings_for(account)["notifications"]["new_message"]:
             markup = InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{chat.id}"),
                     InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat.id}"),
+                    InlineKeyboardButton(text="📷 Фото", callback_data=f"chat:photo:{chat.id}"),
                 ]
             ])
             await self._notify(
                 account.tg_user_id,
-                "💬 <b>Новое сообщение</b>\n"
+                f"💬 <b>Новое сообщение{type_badge}</b>\n"
                 f"От: <b>{html.escape(str(sender_name))}</b>\n"
-                f"{html.escape(text)[:3000]}",
+                f"{html.escape(display_text)[:3000]}"
+                f"{images_info}",
                 markup,
             )
 
         if self.plugins:
             await self.plugins.dispatch_message(account, client, self.bot, chat, message)
 
-        async with self.db() as session:
-            rules = list((await session.scalars(
-                select(AutoReplyRule)
-                .where(AutoReplyRule.account_id == account.id, AutoReplyRule.enabled.is_(True))
-                .order_by(AutoReplyRule.id)
-            )).all())
-        lower = text.casefold()
-        for rule in rules:
-            if rule.trigger == "*" or rule.trigger.casefold() in lower:
-                await client.send_message(str(chat.id), rule.response, mark_chat_as_read=True)
-                break
+        if text:
+            async with self.db() as session:
+                rules = list((await session.scalars(
+                    select(AutoReplyRule)
+                    .where(AutoReplyRule.account_id == account.id, AutoReplyRule.enabled.is_(True))
+                    .order_by(AutoReplyRule.id)
+                )).all())
+            lower = text.casefold()
+            for rule in rules:
+                if rule.trigger == "*" or rule.trigger.casefold() in lower:
+                    await client.send_message(str(chat.id), rule.response, mark_chat_as_read=True)
+                    break
 
     async def _notify(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
         try:

@@ -52,3 +52,32 @@ class ExternalAPI:
 
     async def post(self, url: str, **kwargs: Any) -> Any:
         return await self.client.post(url, **kwargs)
+
+
+class EmeraldSellerAPI:
+    """Client for the documented EmeraldAI seller API."""
+
+    base_url = "https://emeraldai.sbs/seller/v1"
+
+    def __init__(self, api_key: str, client: Any):
+        self.api_key = api_key.strip()
+        self.client = client
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def create_promo_code(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self.client.post(
+            f"{self.base_url}/promo-codes",
+            headers=self._headers(),
+            json=payload,
+        )
+        data = response.json()
+        if response.status_code >= 400:
+            error = data.get("error") if isinstance(data, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            raise RuntimeError(message or f"EmeraldAI API error: HTTP {response.status_code}")
+        return data

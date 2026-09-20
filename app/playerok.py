@@ -168,9 +168,19 @@ class PlayerokSession:
     async def get_chats(self, *args: Any, **kwargs: Any) -> Any:
         return await self.call("get_chats", *args, **kwargs)
 
-    async def send_message(self, chat_id: str, text: str, mark_chat_as_read: bool = True) -> Any:
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str | None = None,
+        images: list[str | bytes] | None = None,
+        mark_chat_as_read: bool = True,
+    ) -> Any:
         return await self.call(
-            "send_message", chat_id=chat_id, text=text, mark_chat_as_read=mark_chat_as_read
+            "send_message",
+            chat_id=chat_id,
+            text=text,
+            images=images or [],
+            mark_chat_as_read=mark_chat_as_read,
         )
 
     async def update_deal(self, deal_id: str, status: ItemDealStatuses) -> Any:

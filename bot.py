@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 
+import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -14,6 +15,7 @@ from app.advanced_handlers import configure_advanced
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
+from app.telegram_plugin_runtime import ExternalAPI
 from app.worker import WorkerManager
 
 
@@ -36,6 +38,8 @@ async def main() -> None:
     plugin_manager.load()
 
     bot = Bot(settings.bot_token)
+    http_client = httpx.AsyncClient(timeout=30)
+    plugin_manager.set_external_api(ExternalAPI(http_client))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(configure_advanced(plugin_manager))
     dispatcher.include_router(
@@ -60,6 +64,7 @@ async def main() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
         await bot.session.close()
+        await http_client.aclose()
         await engine.dispose()
 
 

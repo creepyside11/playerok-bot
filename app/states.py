@@ -45,6 +45,7 @@ class ItemCatalog(StatesGroup):
 
 class ChatReply(StatesGroup):
     text = State()
+    photo = State()
 
 
 class PluginSettingEdit(StatesGroup):

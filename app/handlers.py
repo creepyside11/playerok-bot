@@ -921,28 +921,69 @@ async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
     fields = list(getattr(fields_page, "data_fields", []) or [])
     options = list(getattr(category, "options", []) or [])
     field_meta = [(str(f.id), str(f.label), bool(f.required)) for f in fields]
-    option_meta = [(str(o.field), str(o.value), str(o.label)) for o in options]
+    
+    # Группируем опции по их полю и названию группы
+    groups_dict: dict[str, dict[str, Any]] = {}
+    for o in options:
+        fld = str(o.field)
+        grp = str(o.group or fld)
+        if fld not in groups_dict:
+            groups_dict[fld] = {
+                "field": fld,
+                "group_name": grp,
+                "multiple": bool(getattr(o, "multiple", False)),
+                "choices": [],
+            }
+        groups_dict[fld]["choices"].append((str(o.value), str(o.label)))
+
+    option_groups = list(groups_dict.values())
+
     await state.update_data(
         obtaining_id=obtaining_id,
         obtaining_name=obtaining_name,
         field_meta=field_meta,
-        option_meta=option_meta,
+        option_groups=option_groups,
+        attribute_group_index=0,
         attributes={},
     )
-    await state.set_state(ItemCreate.attributes)
-    if option_meta:
-        b = InlineKeyboardBuilder()
-        for i, (_field, _value, label) in enumerate(option_meta[:40]):
-            b.button(text=clip(label, 38), callback_data=f"itemopt:{i}")
-        b.button(text="⏭ Пропустить атрибуты", callback_data="itemopt:skip")
-        b.adjust(1)
-        prompt = "⚙️ Выберите значение атрибута или пропустите этот шаг."
+
+    if option_groups:
+        await _show_attribute_group(call, state)
     else:
         await state.set_state(ItemCreate.data_fields)
         await call.message.answer("Атрибутов нет. Переходим к полям товара.")
+        await _start_item_fields(call.message, state)
+
+
+async def _show_attribute_group(call_or_msg: Any, state: FSMContext) -> None:
+    data = await state.get_data()
+    groups = data.get("option_groups") or []
+    idx = int(data.get("attribute_group_index", 0))
+    if idx >= len(groups):
+        target = call_or_msg.message if isinstance(call_or_msg, CallbackQuery) else call_or_msg
+        await _start_item_fields(target, state)
         return
-    await call.answer()
-    await edit(call, prompt, b.as_markup())
+
+    grp = groups[idx]
+    group_name = grp["group_name"]
+    choices = grp["choices"]
+
+    b = InlineKeyboardBuilder()
+    for i, (_val, label) in enumerate(choices[:30]):
+        b.button(text=clip(label, 36), callback_data=f"itemopt:{idx}:{i}")
+    b.button(text="⏭ Пропустить этот атрибут", callback_data=f"itemopt:{idx}:skip")
+    b.adjust(1)
+
+    prompt = (
+        f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>\n"
+        "Выберите подходящее значение:"
+    )
+    await state.set_state(ItemCreate.attributes)
+    if isinstance(call_or_msg, CallbackQuery):
+        await call_or_msg.answer()
+        await edit(call_or_msg, prompt, b.as_markup())
+    else:
+        await call_or_msg.answer(prompt, reply_markup=b.as_markup(), parse_mode="HTML")
 
 
 async def _start_item_fields(target: Message, state: FSMContext) -> None:
@@ -963,19 +1004,34 @@ async def _start_item_fields(target: Message, state: FSMContext) -> None:
 @router.callback_query(ItemCreate.attributes, F.data.startswith("itemopt:"))
 async def item_option(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    raw = call.data.split(":", 1)[1]
+    parts = call.data.split(":")
+    # Формат: itemopt:<group_index>:<choice_index или skip>
+    if len(parts) == 3:
+        grp_idx = int(parts[1])
+        choice_raw = parts[2]
+    else:
+        # Обратная совместимость
+        grp_idx = int(data.get("attribute_group_index", 0))
+        choice_raw = parts[1]
+
+    groups = data.get("option_groups") or []
     attributes = dict(data.get("attributes") or {})
-    if raw != "skip":
-        index = int(raw)
-        options = data.get("option_meta") or []
-        if index >= len(options):
-            await call.answer("Список устарел", show_alert=True)
-            return
-        field, value, _label = options[index]
-        attributes[field] = value
-    await state.update_data(attributes=attributes)
-    await call.answer()
-    await _start_item_fields(call.message, state)
+
+    if 0 <= grp_idx < len(groups) and choice_raw != "skip":
+        grp = groups[grp_idx]
+        choice_idx = int(choice_raw)
+        if 0 <= choice_idx < len(grp["choices"]):
+            val, _lbl = grp["choices"][choice_idx]
+            attributes[grp["field"]] = val
+
+    next_idx = grp_idx + 1
+    await state.update_data(attributes=attributes, attribute_group_index=next_idx)
+
+    if next_idx < len(groups):
+        await _show_attribute_group(call, state)
+    else:
+        await call.answer()
+        await _start_item_fields(call.message, state)
 
 
 @router.message(ItemCreate.data_fields)
@@ -987,13 +1043,14 @@ async def item_fields(message: Message, state: FSMContext) -> None:
         await _start_item_fields(message, state)
         return
     field_id, label, required = fields[index]
-    value = (message.text or "").strip()
-    if not value and required:
-        await message.answer(f"Поле «{label}» обязательно. Введите значение:")
+    raw_value = (message.text or "").strip()
+    # Если поле обязательно, не разрешаем пустой ввод или пропуск через "-"
+    if required and (not raw_value or raw_value in {"-", "—", "пропуск", "skip"}):
+        await message.answer(f"⚠️ Поле «{label}» <b>обязательно</b> для выставления этого лота. Пожалуйста, введите корректное значение:", parse_mode="HTML")
         return
     values = dict(data.get("data_field_values") or {})
-    if value:
-        values[field_id] = value
+    if raw_value and raw_value not in {"-", "—", "пропуск", "skip"}:
+        values[field_id] = raw_value
     index += 1
     if index < len(fields):
         await state.update_data(data_field_values=values, field_index=index)

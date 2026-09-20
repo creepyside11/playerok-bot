@@ -95,17 +95,19 @@ async def enhanced_items(call: CallbackQuery, state: FSMContext) -> None:
         return
     await call.answer()
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Выставить товар", callback_data="catalog:start")],
-        [InlineKeyboardButton(text="🔎 Найти игру", callback_data="catalog:search")],
-        [InlineKeyboardButton(text="📚 Категория → игра", callback_data="catalog:categories")],
+        [InlineKeyboardButton(text="➕ Выставить товар (Поиск)", callback_data="catalog:search")],
+        [InlineKeyboardButton(text="🎮 Ввести slug вручную", callback_data="items:create")],
+        [InlineKeyboardButton(text="📚 Каталог: категория → игра", callback_data="catalog:categories")],
         [InlineKeyboardButton(text="📋 Мои товары", callback_data="items:list")],
         [InlineKeyboardButton(text="🧩 Шаблоны товаров", callback_data="templates:list")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
     ])
     await edit(
         call,
-        "📦 <b>Товары</b>\n\nМожно выбрать сначала категорию, затем игру, "
-        "или найти игру поиском по названию.",
+        "📦 <b>Управление товарами</b>\n\n"
+        "• <b>Выставить товар (Поиск):</b> быстрый поиск игры или приложения (например, <i>Claude</i>, <i>ChatGPT</i>, <i>Brawl Stars</i>).\n"
+        "• <b>Ввести slug вручную:</b> для точного перехода к разделу по его коду (например: <code>claude</code>, <code>cgpt</code>, <code>brawl-stars</code>).\n"
+        "• <b>Каталог:</b> древовидный просмотр рубрик.",
         markup,
     )
 
@@ -114,11 +116,12 @@ async def enhanced_items(call: CallbackQuery, state: FSMContext) -> None:
 async def catalog_start(call: CallbackQuery) -> None:
     await call.answer()
     markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Поиск игры или приложения", callback_data="catalog:search")],
+        [InlineKeyboardButton(text="🎮 Ввести slug вручную", callback_data="items:create")],
         [InlineKeyboardButton(text="📚 Категория → игра", callback_data="catalog:categories")],
-        [InlineKeyboardButton(text="🔎 Поиск игры", callback_data="catalog:search")],
         [InlineKeyboardButton(text="⬅️ Товары", callback_data="menu:items")],
     ])
-    await edit(call, "Как найти товарную категорию?", markup)
+    await edit(call, "Как найти товарную категорию для выставления?", markup)
 
 
 async def _load_catalog(account: PlayerokAccount) -> list[tuple[str, str, str, str, str]]:
@@ -530,31 +533,113 @@ async def delivery_remove(call: CallbackQuery) -> None:
     await _show_delivery(call)
 
 
-@router.callback_query(F.data == "menu:chats")
+DEFAULT_CHATS_LIMIT = 24
+
+
+@router.callback_query(F.data.startswith("menu:chats"))
 async def chats_menu(call: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     account = await require_account(call)
     if not account:
         return
     await call.answer("Загружаю…")
+
+    # callback format: menu:chats:<filter>:<cursor_or_none>
+    parts = call.data.split(":")
+    chat_filter = parts[2] if len(parts) > 2 and parts[2] else "ALL"
+    after_cursor = parts[3] if len(parts) > 3 and parts[3] != "_" else None
+
+    # Determine ChatTypes enum
+    target_type = None
+    if chat_filter == "PM":
+        target_type = ChatTypes.PM
+    elif chat_filter == "NOTIFICATIONS":
+        target_type = ChatTypes.NOTIFICATIONS
+    elif chat_filter == "SUPPORT":
+        target_type = ChatTypes.SUPPORT
+
     try:
-        page = await (await svc().gateway.get_client(account)).get_chats(type=ChatTypes.PM, count=16)
+        kwargs: dict[str, Any] = {"count": DEFAULT_CHATS_LIMIT}
+        if target_type is not None:
+            kwargs["type"] = target_type
+        if after_cursor:
+            kwargs["after_cursor"] = after_cursor
+        page = await (await svc().gateway.get_client(account)).get_chats(**kwargs)
         chats = list(getattr(page, "chats", []) or [])
     except Exception as exc:
         await edit(call, f"❌ <code>{html.escape(str(exc))[:1600]}</code>", back_menu())
         return
+
     b = InlineKeyboardBuilder()
+
+    # Filter selector tabs
+    filter_labels = [
+        ("Все", "ALL"),
+        ("ЛС", "PM"),
+        ("Уведомления", "NOTIFICATIONS"),
+        ("Поддержка", "SUPPORT"),
+    ]
+    filter_row = []
+    for flabel, fval in filter_labels:
+        mark = "🔹 " if chat_filter == fval else ""
+        filter_row.append(
+            InlineKeyboardButton(text=f"{mark}{flabel}", callback_data=f"menu:chats:{fval}:_")
+        )
+    b.row(*filter_row)
+
     for chat in chats:
         unread = int(getattr(chat, "unread_messages_counter", 0) or 0)
         prefix = f"🔴 {unread} · " if unread else ""
-        b.button(
-            text=prefix + clip(_user_name(chat, str(account.playerok_user_id)), 30),
-            callback_data=f"chat:open:{chat.id}",
+        title = _user_name(chat, str(account.playerok_user_id))
+        ctype = getattr(getattr(chat, "type", None), "name", "")
+        type_prefix = ""
+        if ctype == "NOTIFICATIONS":
+            type_prefix = "🔔 "
+        elif ctype == "SUPPORT":
+            type_prefix = "🛟 "
+        b.row(
+            InlineKeyboardButton(
+                text=prefix + type_prefix + clip(title, 28),
+                callback_data=f"chat:open:{chat.id}",
+            )
         )
-    b.button(text="🔄 Обновить", callback_data="menu:chats")
-    b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(1)
-    await edit(call, f"💬 <b>Чаты</b>\nВсего: {getattr(page, 'total_count', len(chats))}", b.as_markup())
+
+    page_info = getattr(page, "page_info", None)
+    has_next = bool(getattr(page_info, "has_next_page", False))
+    end_cursor = getattr(page_info, "end_cursor", None)
+
+    nav_row = []
+    if has_next and end_cursor:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="➡️ След. страница",
+                callback_data=f"menu:chats:{chat_filter}:{end_cursor}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"menu:chats:{chat_filter}:{after_cursor or '_'}",
+        )
+    )
+    b.row(*nav_row)
+    b.row(InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main"))
+
+    filter_desc = {
+        "ALL": "Все диалоги",
+        "PM": "Личные сообщения (ЛС)",
+        "NOTIFICATIONS": "Уведомления Playerok",
+        "SUPPORT": "Поддержка Playerok",
+    }.get(chat_filter, chat_filter)
+
+    total = getattr(page, "total_count", len(chats))
+    await edit(
+        call,
+        f"💬 <b>Чаты Playerok</b>\n"
+        f"Категория: <b>{filter_desc}</b>\n"
+        f"Показано в списке: <b>{len(chats)}</b> (всего на аккаунте: <b>{total}</b>)\n\n"
+        f"<i>Выберите диалог для просмотра сообщений, ответа текстом или отправки фото:</i>",
+        b.as_markup(),
+    )
 
 
 @router.callback_query(F.data.startswith("chat:open:"))
@@ -599,7 +684,10 @@ async def chat_open(call: CallbackQuery, state: FSMContext) -> None:
         body = body[-3900:]
         body = "…\n" + body
     rows = [
-        [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat_id}")],
+        [
+            InlineKeyboardButton(text="✍️ Ответить текстом", callback_data=f"chat:reply:{chat_id}"),
+            InlineKeyboardButton(text="📷 Отправить фото", callback_data=f"chat:photo:{chat_id}"),
+        ],
     ]
     if getattr(page_info, "has_next_page", False):
         rows.append([InlineKeyboardButton(text="⬅️ Более старые сообщения", callback_data="chat:more")])
@@ -649,7 +737,12 @@ async def chat_more(call: CallbackQuery, state: FSMContext) -> None:
     body = "\n".join(lines)
     if len(body) > 3900:
         body = "…\n" + body[-3900:]
-    rows = [[InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat_id}")]]
+    rows = [
+        [
+            InlineKeyboardButton(text="✍️ Ответить", callback_data=f"chat:reply:{chat_id}"),
+            InlineKeyboardButton(text="📷 Фото", callback_data=f"chat:photo:{chat_id}"),
+        ]
+    ]
     if getattr(page_info, "has_next_page", False):
         rows.append([InlineKeyboardButton(text="⬅️ Ещё старше", callback_data="chat:more")])
     rows.append([InlineKeyboardButton(text="↩️ К последним", callback_data=f"chat:open:{chat_id}")])
@@ -662,25 +755,132 @@ async def chat_reply_start(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ChatReply.text)
     await state.update_data(reply_chat_id=chat_id)
     await call.answer()
-    await edit(call, "✍️ Отправьте текст ответа:", back_menu("chats"))
+    await edit(
+        call,
+        "✍️ <b>Ответ в чат</b>\n\nОтправьте текст сообщения (или нажмите «Назад»):",
+        back_menu(f"chats"),
+    )
+
+
+@router.callback_query(F.data.startswith("chat:photo:"))
+async def chat_photo_start(call: CallbackQuery, state: FSMContext) -> None:
+    chat_id = call.data.split(":", 2)[2]
+    await state.set_state(ChatReply.photo)
+    await state.update_data(reply_chat_id=chat_id)
+    await call.answer()
+    await edit(
+        call,
+        "📷 <b>Отправка фото в чат</b>\n\n"
+        "Пришлите фото (можно с текстовой подписью) для отправки в диалог Playerok:",
+        back_menu("chats"),
+    )
 
 
 @router.message(ChatReply.text)
 async def chat_reply_value(message: Message, state: FSMContext) -> None:
     account = await active_account(message.from_user.id)
+    if not account:
+        await message.answer("❌ Аккаунт не найден.")
+        return
     data = await state.get_data()
+    chat_id = data.get("reply_chat_id")
+    if not chat_id:
+        await message.answer("❌ Ошибка: чат не выбран.", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    # If user sent photo while in text reply mode, handle it seamlessly
+    if message.photo:
+        await _handle_chat_photo_send(message, state, account, chat_id)
+        return
+
     text = (message.text or "").strip()
     if not text:
         return
     try:
         await (await svc().gateway.get_client(account)).send_message(
-            data["reply_chat_id"], text, mark_chat_as_read=True
+            chat_id, text=text, mark_chat_as_read=True
         )
     except Exception as exc:
         await message.answer(f"❌ <code>{html.escape(str(exc))[:1500]}</code>", parse_mode="HTML")
         return
     await state.clear()
-    await message.answer("✅ Ответ отправлен.", reply_markup=main_menu())
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Вернуться в чат", callback_data=f"chat:open:{chat_id}")],
+        [InlineKeyboardButton(text="📋 К списку чатов", callback_data="menu:chats")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
+    ])
+    await message.answer("✅ Ответ отправлен в Playerok.", reply_markup=markup)
+
+
+@router.message(ChatReply.photo, F.photo)
+async def chat_reply_photo(message: Message, state: FSMContext, bot: Any) -> None:
+    account = await active_account(message.from_user.id)
+    if not account:
+        await message.answer("❌ Аккаунт не найден.")
+        return
+    data = await state.get_data()
+    chat_id = data.get("reply_chat_id")
+    if not chat_id:
+        await message.answer("❌ Ошибка: чат не выбран.", reply_markup=main_menu())
+        await state.clear()
+        return
+    await _handle_chat_photo_send(message, state, account, chat_id)
+
+
+async def _handle_chat_photo_send(message: Message, state: FSMContext, account: Any, chat_id: str) -> None:
+    caption = (message.caption or "").strip() or None
+    wait_msg = await message.answer("⏳ Загружаю и отправляю изображение в Playerok…")
+    try:
+        from io import BytesIO
+        buffer = BytesIO()
+        await message.bot.download(message.photo[-1], destination=buffer)
+        image_bytes = buffer.getvalue()
+
+        client = await svc().gateway.get_client(account)
+        await client.send_message(
+            chat_id=chat_id,
+            text=caption,
+            images=[image_bytes],
+            mark_chat_as_read=True,
+        )
+    except Exception as exc:
+        await wait_msg.edit_text(f"❌ <code>{html.escape(str(exc))[:1500]}</code>", parse_mode="HTML")
+        return
+
+    await state.clear()
+    await wait_msg.delete()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Вернуться в чат", callback_data=f"chat:open:{chat_id}")],
+        [InlineKeyboardButton(text="📋 К списку чатов", callback_data="menu:chats")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
+    ])
+    await message.answer("✅ Фото успешно отправлено в чат Playerok.", reply_markup=markup)
+
+
+async def _show_my_plugins(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    manager = plugins()
+    items = manager.ordered()
+    b = InlineKeyboardBuilder()
+    for i, plugin in enumerate(items):
+        enabled, _ = await manager.resolved_state(account.id, plugin)
+        b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 26)}", callback_data=f"plugin:view:{i}")
+    b.button(text="🛍 Каталог плагинов", callback_data="plugins:catalog")
+    b.button(text="📤 Загрузить плагин (.py)", callback_data="plugins:upload")
+    b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
+    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
+    b.button(text="⬅️ Главное меню", callback_data="menu:main")
+    b.adjust(1)
+    errors = f"\n⚠️ Ошибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
+    await edit(
+        call,
+        f"📦 <b>Мои установленные плагины</b>\nВсего установлено: <b>{len(items)}</b>{errors}\n\n"
+        "Нажмите на плагин для настройки или включения/выключения:",
+        b.as_markup(),
+    )
 
 
 async def _show_plugins(call: CallbackQuery) -> None:
@@ -701,7 +901,7 @@ async def _show_plugins(call: CallbackQuery) -> None:
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     errors = f"\nОшибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
-    await edit(call, f"🧩 <b>Плагины</b>\nНайдено: <b>{len(items)}</b>{errors}", b.as_markup())
+    await edit(call, f"🧩 <b>Управление плагинами</b>\nУстановлено: <b>{len(items)}</b>{errors}", b.as_markup())
 
 
 @router.callback_query(F.data == "menu:plugins")
@@ -714,7 +914,7 @@ async def plugins_menu(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "plugins:mine")
 async def plugins_mine(call: CallbackQuery) -> None:
     await call.answer()
-    await _show_plugins(call)
+    await _show_my_plugins(call)
 
 
 @router.callback_query(F.data == "plugins:catalog")
@@ -724,16 +924,22 @@ async def plugins_catalog(call: CallbackQuery) -> None:
     installed = {plugin.id for plugin in manager.ordered()}
     b = InlineKeyboardBuilder()
     for plugin in catalog:
-        suffix = " ✅ установлено" if plugin.id in installed else ""
+        status_icon = "✅ " if plugin.id in installed else "📥 "
         b.button(
-            text=f"{clip(plugin.name, 28)}{suffix}",
+            text=f"{status_icon}{clip(plugin.name, 26)}",
             callback_data=f"plugincatalog:view:{plugin.id}",
         )
-    b.button(text="⬅️ Мои плагины", callback_data="plugins:mine")
+    b.button(text="📦 Мои плагины", callback_data="plugins:mine")
+    b.button(text="⬅️ Плагины", callback_data="menu:plugins")
     b.adjust(1)
-    text = "🛍 <b>Каталог плагинов</b>\n\n" + (
-        "\n".join(f"• <b>{html.escape(plugin.name)}</b> — {html.escape(plugin.description)}" for plugin in catalog)
-        or "Каталог пока пуст."
+    text = (
+        "🛍 <b>Каталог готовых плагинов</b>\n\n"
+        "Выберите плагин для просмотра описания и установки в 1 клик:\n\n"
+        + ("\n".join(
+            f"{'✅' if p.id in installed else '▫️'} <b>{html.escape(p.name)}</b> v{html.escape(p.version)}\n"
+            f"   {html.escape(p.description)}"
+            for p in catalog
+        ) or "Каталог пока пуст.")
     )
     await edit(call, text, b.as_markup())
 
@@ -748,13 +954,22 @@ async def plugin_catalog_view(call: CallbackQuery) -> None:
     installed = plugin.id in plugins().plugins
     rows = []
     if not installed:
-        rows.append([InlineKeyboardButton(text="📥 Установить", callback_data=f"plugincatalog:install:{plugin.id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Каталог", callback_data="plugins:catalog")])
+        rows.append([InlineKeyboardButton(text="📥 Установить плагин", callback_data=f"plugincatalog:install:{plugin.id}")])
+    else:
+        # Найдем индекс для перехода в настройки
+        installed_plugin_idx = next((i for i, p in enumerate(plugins().ordered()) if p.id == plugin.id), None)
+        if installed_plugin_idx is not None:
+            rows.append([InlineKeyboardButton(text="⚙️ Открыть и настроить", callback_data=f"plugin:view:{installed_plugin_idx}")])
+        rows.append([InlineKeyboardButton(text="🗑 Удалить из установленных", callback_data=f"plugin:delete:{plugin.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В каталог", callback_data="plugins:catalog")])
     await call.answer()
+    status_text = "✅ <b>Установлен</b>" if installed else "▫️ <b>Не установлен</b>"
     await edit(
         call,
         f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
-        f"Автор: {html.escape(plugin.author)}\n\n{html.escape(plugin.description)}",
+        f"Автор: {html.escape(plugin.author)}\n"
+        f"Статус: {status_text}\n\n"
+        f"{html.escape(plugin.description)}",
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -767,8 +982,20 @@ async def plugin_catalog_install(call: CallbackQuery) -> None:
     except Exception as exc:
         await call.answer(f"Ошибка: {str(exc)[:180]}", show_alert=True)
         return
-    await call.answer(f"Установлен: {plugin.name}")
-    await _show_plugins(call)
+    await call.answer(f"✅ Установлен: {plugin.name}", show_alert=True)
+    await _show_my_plugins(call)
+
+
+@router.callback_query(F.data.startswith("plugin:delete:"))
+async def plugin_delete(call: CallbackQuery) -> None:
+    plugin_id = call.data.rsplit(":", 1)[-1]
+    try:
+        plugins().uninstall(plugin_id)
+    except Exception as exc:
+        await call.answer(f"Ошибка удаления: {str(exc)[:180]}", show_alert=True)
+        return
+    await call.answer("🗑 Плагин удалён", show_alert=True)
+    await _show_my_plugins(call)
 
 
 @router.callback_query(F.data == "plugins:docs")
@@ -822,6 +1049,32 @@ async def plugins_upload_wrong_type(message: Message) -> None:
     await message.answer("Пришлите плагин именно документом, одним файлом .py.")
 
 
+@router.callback_query(F.data.startswith("plugin_action:"))
+async def plugin_action(call: CallbackQuery) -> None:
+    parts = call.data.split(":", 2)
+    action = parts[1]
+    extra = parts[2] if len(parts) > 2 else ""
+    account = await require_account(call)
+    if not account:
+        return
+    try:
+        client = await svc().gateway.get_client(account)
+        payload = {"deal_id": extra} if extra and not extra.startswith("idx_") else {"param": extra}
+        if extra.startswith("idx_"):
+            payload["plugin_index"] = extra.replace("idx_", "")
+        await plugins().dispatch_action(
+            account,
+            client,
+            call.bot,
+            action,
+            payload,
+        )
+    except Exception as exc:
+        await call.answer(f"Ошибка: {str(exc)[:180]}", show_alert=True)
+        return
+    await call.answer("Запрос обработан")
+
+
 @router.callback_query(F.data.startswith("plugin:view:"))
 async def plugin_view(call: CallbackQuery) -> None:
     account = await require_account(call)
@@ -837,8 +1090,13 @@ async def plugin_view(call: CallbackQuery) -> None:
             callback_data=f"plugin:toggle:{idx}",
         )],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data=f"plugin:settings:{idx}")],
-        [InlineKeyboardButton(text="⬅️ Плагины", callback_data="menu:plugins")],
     ]
+    if hasattr(plugin.module, "on_action"):
+        rows.append([InlineKeyboardButton(text="🔌 Проверить соединение / Баланс", callback_data=f"plugin_action:test_connection:idx_{idx}")])
+    rows.extend([
+        [InlineKeyboardButton(text="🗑 Удалить плагин", callback_data=f"plugin:delete:{plugin.id}")],
+        [InlineKeyboardButton(text="⬅️ Мои плагины", callback_data="plugins:mine")],
+    ])
     await call.answer()
     await edit(
         call,
