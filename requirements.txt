@@ -16,4 +16,3 @@ websockets>=12,<16
 packaging>=23
 setuptools>=70
 
-playerokapi @ git+https://github.com/alleexxeeyy/PlayerokAPI.git@58a077d2cc2045f39b84de1092f7caa0950b74fd
