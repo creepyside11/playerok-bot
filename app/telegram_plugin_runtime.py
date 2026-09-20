@@ -4,7 +4,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from telethon import TelegramClient
+try:
+    from telethon import TelegramClient
+except ImportError:
+    TelegramClient = Any  # type: ignore
 
 
 @dataclass(slots=True)
