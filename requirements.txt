@@ -15,4 +15,4 @@ websocket-client>=1.8.0
 websockets>=12,<16
 packaging>=23
 setuptools>=70
-
+certifi>=2024.8.30

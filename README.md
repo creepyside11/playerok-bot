@@ -96,7 +96,7 @@ Dockerfile использует постоянную SQLite-базу /data/playe
 - leizov/Seal-Playerok-Bot — актуальная email OTP схема getEmailAuthCode/checkEmailAuthCode;
 - exfador/playerok-api — примеры автоматизации.
 
-PlayerokAPI подключён внешней git-зависимостью и закреплён на конкретном commit SHA.
+Пакет `playerokapi` вендорится непосредственно в репозитории для гарантии надёжного деплоя без внешних зависимостей от git во время `pip install`.
 
 
 ## Плагины
