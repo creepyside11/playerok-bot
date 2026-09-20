@@ -10,7 +10,8 @@ from typing import Any
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, select
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from playerokapi.enums import ChatTypes, ItemDealDirections, ItemDealStatuses
 
@@ -44,12 +45,20 @@ async def claim_event(
     kind: str,
     external_id: str,
 ) -> bool:
-    stmt = (
-        insert(ProcessedEvent)
-        .values(account_id=account_id, kind=kind, external_id=str(external_id))
-        .on_conflict_do_nothing(index_elements=["account_id", "kind", "external_id"])
-    )
     async with factory() as session:
+        dialect_name = session.bind.dialect.name if session.bind else ""
+        if dialect_name == "postgresql":
+            stmt = (
+                pg_insert(ProcessedEvent)
+                .values(account_id=account_id, kind=kind, external_id=str(external_id))
+                .on_conflict_do_nothing(index_elements=["account_id", "kind", "external_id"])
+            )
+        else:
+            stmt = (
+                sqlite_insert(ProcessedEvent)
+                .values(account_id=account_id, kind=kind, external_id=str(external_id))
+                .on_conflict_do_nothing(index_elements=["account_id", "kind", "external_id"])
+            )
         result = await session.execute(stmt)
         await session.commit()
         return bool(result.rowcount)
