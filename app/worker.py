@@ -137,10 +137,10 @@ class WorkerManager:
         client = await self.gateway.get_client(account)
         # Fetch deals (outgoing sales and incoming purchases) + chats + reviews
         deals_out_res, deals_in_res, chats_res, reviews_res = await asyncio.gather(
-            asyncio.to_thread(client.get_deals, direction=ItemDealDirections.OUT, count=24),
-            asyncio.to_thread(client.get_deals, direction=ItemDealDirections.IN, count=24),
-            asyncio.to_thread(client.get_chats, count=24),
-            asyncio.to_thread(client.get_my_reviews, count=24),
+            client.get_deals(direction=ItemDealDirections.OUT, count=24),
+            client.get_deals(direction=ItemDealDirections.IN, count=24),
+            client.get_chats(count=24),
+            client.get_my_reviews(count=24),
             return_exceptions=True,
         )
         deals_out_page = deals_out_res if not isinstance(deals_out_res, Exception) else None

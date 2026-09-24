@@ -168,6 +168,9 @@ class PlayerokSession:
     async def get_chats(self, *args: Any, **kwargs: Any) -> Any:
         return await self.call("get_chats", *args, **kwargs)
 
+    async def get_my_reviews(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.call("get_my_reviews", *args, **kwargs)
+
     async def send_message(
         self,
         chat_id: str,

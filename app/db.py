@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from .models import Base
@@ -30,3 +30,13 @@ def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Auto-migrate: ensure newly added columns exist in existing PostgreSQL / SQLite tables
+        try:
+            if str(engine.url).startswith("sqlite"):
+                await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN web_login VARCHAR(64)"))
+                await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN web_password_hash VARCHAR(128)"))
+            else:
+                await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN IF NOT EXISTS web_login VARCHAR(64)"))
+                await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN IF NOT EXISTS web_password_hash VARCHAR(128)"))
+        except Exception:
+            pass
