@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import html
 import io
+import secrets
 import uuid
 from typing import Any
 
@@ -152,9 +154,70 @@ async def show_accounts(call: CallbackQuery) -> None:
     b.button(text="➕ Добавить аккаунт", callback_data="account:add")
     if accounts and user and user.active_account_id:
         b.button(text="🗑 Удалить активный", callback_data="account:delete")
+    b.button(text="🌐 Доступ к веб-панели", callback_data="menu:web")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     await edit(call, "🔐 <b>Playerok аккаунты</b>", b.as_markup())
+
+
+@router.callback_query(F.data == "menu:web")
+async def web_credentials_menu(call: CallbackQuery) -> None:
+    user = await ensure_user(call.from_user.id)
+    plain_password = None
+    async with svc().db() as session:
+        db_user = await session.get(TelegramUser, call.from_user.id)
+        if not db_user.web_login or not db_user.web_password_hash:
+            db_user.web_login = f"user_{call.from_user.id}"
+            plain_password = secrets.token_hex(4)
+            db_user.web_password_hash = hashlib.sha256(plain_password.encode()).hexdigest()
+            await session.commit()
+            login = db_user.web_login
+            pwd_text = f"<code>{plain_password}</code> (сохраните сейчас)"
+        else:
+            login = db_user.web_login
+            pwd_text = "•••••••• (уже сгенерирован)"
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Сгенерировать новый пароль", callback_data="web:reset_password")
+    b.button(text="⬅️ Назад", callback_data="menu:accounts")
+    b.adjust(1)
+
+    text = (
+        "🌐 <b>Доступ к Веб-панели управления</b>\n\n"
+        f"👤 Логин: <code>{html.escape(login)}</code>\n"
+        f"🔑 Пароль: {pwd_text}\n\n"
+        "<i>Используйте эти данные для входа в веб-версию Playerok BOT. Все настройки синхронизируются в реальном времени через общую базу данных.</i>"
+    )
+    await edit(call, text, b.as_markup())
+
+
+@router.callback_query(F.data == "web:reset_password")
+async def web_reset_password(call: CallbackQuery) -> None:
+    plain_password = secrets.token_hex(4)
+    async with svc().db() as session:
+        db_user = await session.get(TelegramUser, call.from_user.id)
+        if db_user:
+            if not db_user.web_login:
+                db_user.web_login = f"user_{call.from_user.id}"
+            db_user.web_password_hash = hashlib.sha256(plain_password.encode()).hexdigest()
+            await session.commit()
+            login = db_user.web_login
+        else:
+            login = f"user_{call.from_user.id}"
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Сгенерировать снова", callback_data="web:reset_password")
+    b.button(text="⬅️ Назад", callback_data="menu:accounts")
+    b.adjust(1)
+
+    text = (
+        "✅ <b>Новый пароль для веб-панели сгенерирован!</b>\n\n"
+        f"👤 Логин: <code>{html.escape(login)}</code>\n"
+        f"🔑 Новый пароль: <code>{plain_password}</code>\n\n"
+        "⚠️ Скопируйте и сохраните пароль, он отображается в открытом виде только один раз."
+    )
+    await call.answer("Пароль обновлен")
+    await edit(call, text, b.as_markup())
 
 
 @router.callback_query(F.data == "menu:accounts")

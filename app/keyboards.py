@@ -7,6 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for text, data in [
+        ("🌐 Веб-панель", "menu:web"),
         ("👤 Профиль", "menu:profile"),
         ("💰 Баланс", "menu:balance"),
         ("💬 Чаты", "menu:chats"),

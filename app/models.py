@@ -42,6 +42,8 @@ class TelegramUser(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     active_account_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    web_login: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    web_password_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
