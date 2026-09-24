@@ -1630,6 +1630,8 @@ async def plugin_view(call: CallbackQuery) -> None:
         )],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data=f"plugin:settings:{idx}")],
     ]
+    if plugin.id == "emerald_promo":
+        rows.insert(1, [InlineKeyboardButton(text="🎛 Панель Emerald Promo", callback_data="emp:open")])
     if hasattr(plugin.module, "on_action"):
         rows.append([InlineKeyboardButton(text="🔌 Проверить соединение / Баланс", callback_data=f"plugin_action:test_connection:idx_{idx}")])
     rows.extend([

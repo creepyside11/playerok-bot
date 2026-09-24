@@ -62,3 +62,7 @@ class AIPluginBuilderState(StatesGroup):
     model_id = State()
     request = State()
     edit_request = State()
+
+
+class EmeraldPromoState(StatesGroup):
+    input_value = State()

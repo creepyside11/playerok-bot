@@ -12,6 +12,7 @@ from app.config import Settings
 from app.crypto import SecretCipher
 from app.db import init_db, make_engine, make_session_factory
 from app.advanced_handlers import configure_advanced
+from app.emerald_promo_ui import router as emerald_promo_router
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
@@ -42,6 +43,7 @@ async def main() -> None:
     plugin_manager.set_external_api(ExternalAPI(http_client))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(configure_advanced(plugin_manager))
+    dispatcher.include_router(emerald_promo_router)
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))
     )
