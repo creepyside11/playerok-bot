@@ -26,7 +26,7 @@ from .emerald_promo_manager import (
     validate_api_url,
     validate_token_amount,
 )
-from .handlers import clip, edit, require_account, svc
+from .handlers import active_account, clip, edit, require_account, svc
 from .keyboards import back_menu
 from .models import PlayerokAccount
 from .states import EmeraldPromoState
@@ -191,8 +191,27 @@ async def emp_set_param(call: CallbackQuery, state: FSMContext) -> None:
         "free": "🪙 <b>Номинал #free</b>\n\nОтправьте номинал #free от 10 000 до 1 000 000 000 токенов (по умолчанию 200 000).",
         "age": "📅 <b>Возраст аккаунта</b>\n\nОтправьте минимальный возраст аккаунта в днях (0–3650). Рекомендуется 7.",
     }
-    b = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="emp:open")]])
+    kb_rows = []
+    if field == "token":
+        kb_rows.append([InlineKeyboardButton(text="🗑 Очистить / удалить токен", callback_data="emp:clear:token")])
+    kb_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="emp:open")])
+    b = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await edit(call, prompts.get(field, "Введите значение:"), b)
+
+
+@router.callback_query(F.data == "emp:clear:token")
+async def emp_clear_token(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    account = await require_account(call)
+    if not account:
+        return
+    async with svc().db() as session:
+        st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+        if st:
+            st.api_token_enc = None
+            await session.commit()
+    await call.answer("API-токен удалён")
+    await render_emerald_settings(call, account)
 
 
 @router.callback_query(F.data == "emp:lots")
@@ -454,15 +473,14 @@ async def emp_api_test(call: CallbackQuery) -> None:
 async def emp_handle_input(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     field = data.get("field")
-    account = await svc().db()
-    async with account as session:
-        user_row = await session.scalar(select(PlayerokAccount).where(PlayerokAccount.tg_user_id == message.from_user.id))
-    if not user_row:
+    account = await active_account(message.from_user.id)
+    if not account:
         await state.clear()
+        await message.answer("❌ Сначала выберите активный аккаунт Playerok в боте.")
         return
 
     raw_val = (message.text or "").strip()
-    setting = await get_or_create_settings(user_row.id)
+    setting = await get_or_create_settings(account.id)
 
     try:
         if field == "token":
@@ -475,9 +493,10 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
                 return
             enc = svc().cipher.encrypt(raw_val)
             async with svc().db() as session:
-                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == user_row.id))
-                st.api_token_enc = enc
-                await session.commit()
+                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+                if st:
+                    st.api_token_enc = enc
+                    await session.commit()
             await state.clear()
             await message.answer("✅ API-токен сохранён в зашифрованном виде.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ К настройкам", callback_data="emp:open")]]))
             return
@@ -485,9 +504,10 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
         elif field == "base":
             url = validate_api_url(raw_val)
             async with svc().db() as session:
-                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == user_row.id))
-                st.api_base_url = url
-                await session.commit()
+                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+                if st:
+                    st.api_base_url = url
+                    await session.commit()
             await state.clear()
             await message.answer(f"✅ Base URL установлен: <code>{html.escape(url)}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ К настройкам", callback_data="emp:open")]]))
             return
@@ -498,9 +518,10 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
                 await message.answer("Target должен быть одним из: <code>funpay_shared</code>, <code>auto</code>, <code>public</code>, <code>seller_site</code>", parse_mode="HTML")
                 return
             async with svc().db() as session:
-                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == user_row.id))
-                st.key_target = target
-                await session.commit()
+                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+                if st:
+                    st.key_target = target
+                    await session.commit()
             await state.clear()
             await message.answer(f"✅ Target ключей установлен: <code>{html.escape(target)}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ К настройкам", callback_data="emp:open")]]))
             return
@@ -508,9 +529,10 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
         elif field == "free":
             val = validate_token_amount(raw_val)
             async with svc().db() as session:
-                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == user_row.id))
-                st.free_token_amount = val
-                await session.commit()
+                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+                if st:
+                    st.free_token_amount = val
+                    await session.commit()
             await state.clear()
             await message.answer(f"✅ Номинал #free установлен: <b>{format_tokens(val)}</b> токенов.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ К настройкам", callback_data="emp:open")]]))
             return
@@ -520,9 +542,10 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
             if not 0 <= days <= 3650:
                 raise ValueError("Возраст от 0 до 3650 дней.")
             async with svc().db() as session:
-                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == user_row.id))
-                st.min_account_age_days = days
-                await session.commit()
+                st = await session.scalar(select(EmeraldPromoSetting).where(EmeraldPromoSetting.account_id == account.id))
+                if st:
+                    st.min_account_age_days = days
+                    await session.commit()
             await state.clear()
             await message.answer(f"✅ Мин. возраст аккаунта: <b>{days}</b> дн.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ К настройкам", callback_data="emp:open")]]))
             return
@@ -534,13 +557,13 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
             async with svc().db() as session:
                 rule = await session.scalar(
                     select(EmeraldPromoLotRule).where(
-                        EmeraldPromoLotRule.account_id == user_row.id,
+                        EmeraldPromoLotRule.account_id == account.id,
                         EmeraldPromoLotRule.lot_id == lot_id,
                     )
                 )
                 if not rule:
                     rule = EmeraldPromoLotRule(
-                        account_id=user_row.id,
+                        account_id=account.id,
                         lot_id=lot_id,
                         lot_title=lot_title,
                         tokens_per_unit=val,
@@ -565,7 +588,7 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
             val = validate_token_amount(raw_val)
             async with svc().db() as session:
                 rule = await session.get(EmeraldPromoLotRule, rule_id)
-                if rule and rule.account_id == user_row.id:
+                if rule and rule.account_id == account.id:
                     rule.tokens_per_unit = val
                     await session.commit()
             await state.clear()
@@ -577,7 +600,7 @@ async def emp_handle_input(message: Message, state: FSMContext) -> None:
             val = validate_token_amount(raw_val)
             async with svc().db() as session:
                 rule = await session.get(EmeraldPromoLotRule, rule_id)
-                if rule and rule.account_id == user_row.id:
+                if rule and rule.account_id == account.id:
                     rule.review_bonus_tokens = val
                     await session.commit()
             await state.clear()
