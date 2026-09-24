@@ -9,14 +9,14 @@ def main_menu() -> InlineKeyboardMarkup:
     for text, data in [
         ("👤 Профиль", "menu:profile"),
         ("💰 Баланс", "menu:balance"),
-        ("🔔 Уведомления", "menu:notifications"),
-        ("✅ Автоподтверждение", "menu:autoconfirm"),
-        ("📦 Товары", "menu:items"),
-        ("💬 Автоответчик", "menu:autoreply"),
-        ("⚡ Автовыдача", "menu:delivery"),
         ("💬 Чаты", "menu:chats"),
-        ("🛍 Каталог плагинов", "plugins:catalog"),
-        ("🧩 Мои плагины", "plugins:mine"),
+        ("📦 Сделки и заказы", "menu:deals"),
+        ("📢 Товары", "menu:items"),
+        ("⚡ Автовыдача", "menu:delivery"),
+        ("🤖 Автоответчик", "menu:autoreply"),
+        ("✅ Автоподтверждение", "menu:autoconfirm"),
+        ("🧩 Плагины", "menu:plugins"),
+        ("🔔 Уведомления", "menu:notifications"),
         ("🔐 Аккаунты", "menu:accounts"),
     ]:
         b.button(text=text, callback_data=data)

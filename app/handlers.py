@@ -420,13 +420,14 @@ async def notifications_markup(account: PlayerokAccount) -> InlineKeyboardMarkup
     cfg = settings(account)
     labels = {
         "new_message": "Новые сообщения",
-        "new_deal": "Новые заказы",
-        "deal_status": "Статусы заказов",
+        "new_deal": "Новые заказы (оплата)",
+        "deal_status": "Статусы заказов (выполнение/подтверждение)",
+        "new_review": "Новые отзывы покупателей",
         "errors": "Ошибки API",
     }
     b = InlineKeyboardBuilder()
     for key, label in labels.items():
-        enabled = cfg["notifications"].get(key, True)
+        enabled = cfg.get("notifications", {}).get(key, True)
         b.button(text=f"{'✅' if enabled else '❌'} {label}", callback_data=f"notify:{key}")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
@@ -452,17 +453,19 @@ async def notify_toggle(call: CallbackQuery) -> None:
     if not account:
         return
     key = call.data.split(":", 1)[1]
-    if key not in {"new_message", "new_deal", "deal_status", "errors"}:
+    if key not in {"new_message", "new_deal", "deal_status", "new_review", "errors"}:
         return
     async with svc().db() as session:
         row = await session.get(PlayerokAccount, account.id)
         cfg = settings(row)
+        if "notifications" not in cfg:
+            cfg["notifications"] = {}
         cfg["notifications"][key] = not cfg["notifications"].get(key, True)
         row.settings = copy.deepcopy(cfg)
         await session.commit()
         account.settings = cfg
     await call.answer("Сохранено")
-    await edit(call, "🔔 <b>Уведомления</b>", await notifications_markup(account))
+    await edit(call, f"🔔 <b>Уведомления — {html.escape(account.username)}</b>", await notifications_markup(account))
 
 
 async def render_autoconfirm(call: CallbackQuery, account: PlayerokAccount) -> None:

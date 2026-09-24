@@ -18,12 +18,23 @@ from .keyboards import back_menu, main_menu
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, PlayerokAccount
 from .plugin_system import PluginManager
 from .states import (
+    AIPluginBuilderState,
     ChatReply,
     DeliveryStockAdd,
     ItemCatalog,
     ItemCreate,
     PluginSettingEdit,
     PluginUpload,
+)
+from .ai_plugin_builder import (
+    AnthropicPluginBuilder,
+    AIPluginBuilderError,
+    inspect_generated_source,
+    generated_filename,
+    validate_api_base_url,
+    validate_model_id,
+    validate_plugin_request,
+    DEFAULT_API_BASE_URL as AI_BUILDER_DEFAULT_BASE_URL,
 )
 
 
@@ -858,6 +869,166 @@ async def _handle_chat_photo_send(message: Message, state: FSMContext, account: 
     await message.answer("✅ Фото успешно отправлено в чат Playerok.", reply_markup=markup)
 
 
+# --- Deals & Orders UI ---
+
+@router.callback_query(F.data == "menu:deals")
+async def show_deals_menu(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await call.answer("Загружаю сделки…")
+    try:
+        client = await svc().gateway.get_client(account)
+        page = await asyncio.to_thread(client.get_deals, direction=ItemDealDirections.OUT, count=24)
+        deals = list(getattr(page, "deals", []) or [])
+    except Exception as exc:
+        await edit(call, f"❌ Ошибка загрузки сделок: <code>{html.escape(str(exc))[:600]}</code>", back_menu("main"))
+        return
+
+    b = InlineKeyboardBuilder()
+    for deal in deals:
+        status_obj = getattr(deal, "status", None)
+        status_name = getattr(status_obj, "name", "—")
+        status_icon = "⏳"
+        if status_name == "SENT":
+            status_icon = "✅"
+        elif status_name in {"CONFIRMED", "CONFIRMED_AUTOMATICALLY"}:
+            status_icon = "🤝"
+        elif status_name == "ROLLED_BACK":
+            status_icon = "↩️"
+
+        item = getattr(deal, "item", None)
+        item_title = getattr(item, "name", None) or "Товар"
+        price = getattr(item, "price", None)
+        price_str = f" · {price}₽" if price is not None else ""
+
+        btn_text = f"{status_icon} #{str(deal.id)[-6:]} · {clip(item_title, 20)}{price_str}"
+        b.button(text=btn_text, callback_data=f"deal:view:{deal.id}")
+
+    b.button(text="🔄 Обновить", callback_data="menu:deals")
+    b.button(text="⬅️ Главное меню", callback_data="menu:main")
+    b.adjust(1)
+
+    await edit(
+        call,
+        f"📦 <b>Сделки и заказы Playerok</b>\n"
+        f"Аккаунт: <b>{html.escape(account.username)}</b>\n"
+        f"Найдено: <b>{len(deals)}</b> сделок\n\n"
+        "<i>Нажмите на сделку для просмотра деталей или изменения статуса:</i>",
+        b.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("deal:view:"))
+async def deal_view(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    deal_id = call.data.split(":", 2)[2]
+    await call.answer("Загружаю…")
+    try:
+        client = await svc().gateway.get_client(account)
+        deal = await asyncio.to_thread(client.get_deal, deal_id)
+    except Exception as exc:
+        await edit(call, f"❌ Сделка недоступна: <code>{html.escape(str(exc))[:600]}</code>", back_menu("deals"))
+        return
+
+    item = getattr(deal, "item", None)
+    buyer = getattr(deal, "user", None)
+    chat = getattr(deal, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    status_obj = getattr(deal, "status", None)
+    status_name = getattr(status_obj, "name", "—")
+
+    status_ru = {
+        "PAID": "Оплачен, ожидает выполнения",
+        "PENDING": "В ожидании отправки",
+        "SENT": "Выполнен продавцом (ожидает подтверждения)",
+        "CONFIRMED": "Подтверждён покупателем",
+        "CONFIRMED_AUTOMATICALLY": "Подтверждён автоматически",
+        "ROLLED_BACK": "Возврат средств",
+    }.get(status_name, status_name)
+
+    rows = []
+    if status_name in {"PENDING", "PAID"}:
+        rows.append([InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"deal:sent_ask:{deal_id}")])
+    if chat_id:
+        rows.append([InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку сделок", callback_data="menu:deals")])
+
+    price = getattr(item, "price", 0)
+    comment = getattr(deal, "comment_from_buyer", None) or "—"
+    text = (
+        "📦 <b>Сделка Playerok</b>\n\n"
+        f"🆔 ID: <code>{html.escape(str(deal.id))}</code>\n"
+        f"📌 Статус: <b>{html.escape(status_ru)}</b>\n"
+        f"👤 Покупатель: <b>{html.escape(str(getattr(buyer, 'username', '—')))}</b>\n"
+        f"🏷 Товар: <b>{html.escape(str(getattr(item, 'name', '—')))}</b>\n"
+        f"💰 Сумма: <b>{price} ₽</b>\n"
+        f"💬 Комментарий покупателя: <pre>{html.escape(str(comment)[:800])}</pre>"
+    )
+    await edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("deal:sent_ask:"))
+async def deal_sent_ask(call: CallbackQuery) -> None:
+    deal_id = call.data.split(":", 2)[2]
+    await call.answer()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, подтвердить выполнение", callback_data=f"deal:sent_do:{deal_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"deal:view:{deal_id}")],
+    ])
+    await edit(
+        call,
+        f"❓ <b>Отметить сделку #{deal_id[-6:]} выполненной?</b>\n\n"
+        "Статус заказа на Playerok изменится на «Отправлен», и покупатель получит запрос на подтверждение и отзыв.",
+        markup,
+    )
+
+
+@router.callback_query(F.data.startswith("deal:sent_do:"))
+async def deal_sent_do(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    deal_id = call.data.split(":", 2)[2]
+    await call.answer("Отправляю…")
+    try:
+        from playerokapi.enums import ItemDealStatuses
+        client = await svc().gateway.get_client(account)
+        await asyncio.to_thread(client.update_deal, deal_id, ItemDealStatuses.SENT)
+    except Exception as exc:
+        await call.answer(f"❌ Не удалось: {str(exc)[:120]}", show_alert=True)
+        return
+
+    await call.answer("✅ Сделка отмечена выполненной", show_alert=True)
+    # Refresh deal view
+    try:
+        deal = await asyncio.to_thread(client.get_deal, deal_id)
+        item = getattr(deal, "item", None)
+        buyer = getattr(deal, "user", None)
+        chat = getattr(deal, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        rows = []
+        if chat_id:
+            rows.append([InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{chat_id}")])
+        rows.append([InlineKeyboardButton(text="⬅️ К списку сделок", callback_data="menu:deals")])
+        await edit(
+            call,
+            "✅ <b>Заказ успешно выполнен продавцом!</b>\n\n"
+            f"🆔 ID: <code>{html.escape(str(deal.id))}</code>\n"
+            f"📌 Статус: <b>Выполнен продавцом (ожидает подтверждения)</b>\n"
+            f"👤 Покупатель: <b>{html.escape(str(getattr(buyer, 'username', '—')))}</b>\n"
+            f"🏷 Товар: <b>{html.escape(str(getattr(item, 'name', '—')))}</b>\n\n"
+            "<i>Ожидается подтверждение получения и оставление отзыва покупателем.</i>",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception:
+        await show_deals_menu(call)
+
+
+# --- Plugins UI ---
+
 async def _show_my_plugins(call: CallbackQuery) -> None:
     account = await require_account(call)
     if not account:
@@ -868,17 +1039,18 @@ async def _show_my_plugins(call: CallbackQuery) -> None:
     for i, plugin in enumerate(items):
         enabled, _ = await manager.resolved_state(account.id, plugin)
         b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 26)}", callback_data=f"plugin:view:{i}")
-    b.button(text="🛍 Каталог плагинов", callback_data="plugins:catalog")
-    b.button(text="📤 Загрузить плагин (.py)", callback_data="plugins:upload")
+    b.button(text="🧭 Каталог плагинов", callback_data="plugins:catalog:0")
+    b.button(text="✨ Создать плагин (AI)", callback_data="plugins:ai_builder")
+    b.button(text="➕ Загрузить плагин (.py)", callback_data="plugins:upload_warning")
+    b.button(text="📚 Документация", callback_data="plugins:docs")
     b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
-    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     errors = f"\n⚠️ Ошибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
     await edit(
         call,
-        f"📦 <b>Мои установленные плагины</b>\nВсего установлено: <b>{len(items)}</b>{errors}\n\n"
-        "Нажмите на плагин для настройки или включения/выключения:",
+        f"🧩 <b>Мои плагины</b>\nУстановлено: <b>{len(items)}</b>{errors}\n\n"
+        "Нажмите на плагин для просмотра карточки, настройки параметров или включения/выключения:",
         b.as_markup(),
     )
 
@@ -890,18 +1062,22 @@ async def _show_plugins(call: CallbackQuery) -> None:
     manager = plugins()
     items = manager.ordered()
     b = InlineKeyboardBuilder()
-    b.button(text="🛍 Каталог плагинов", callback_data="plugins:catalog")
-    b.button(text="📦 Мои плагины", callback_data="plugins:mine")
-    b.button(text="📤 Загрузить плагин", callback_data="plugins:upload")
-    b.button(text="📘 MD-документация для ИИ", callback_data="plugins:docs")
-    for i, plugin in enumerate(items):
-        enabled, _ = await manager.resolved_state(account.id, plugin)
-        b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 28)}", callback_data=f"plugin:view:{i}")
-    b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
+    b.button(text="🧭 Каталог плагинов", callback_data="plugins:catalog:0")
+    b.button(text=f"🧩 Мои плагины ({len(items)})", callback_data="plugins:mine")
+    b.button(text="✨ Создать плагин (AI)", callback_data="plugins:ai_builder")
+    b.button(text="➕ Загрузить плагин", callback_data="plugins:upload_warning")
+    b.button(text="📚 Документация", callback_data="plugins:docs")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     errors = f"\nОшибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
-    await edit(call, f"🧩 <b>Управление плагинами</b>\nУстановлено: <b>{len(items)}</b>{errors}", b.as_markup())
+    await edit(
+        call,
+        "🧩 <b>Плагины Playerok</b>\n"
+        f"Установлено: <b>{len(items)}</b>{errors}\n\n"
+        "Каталог содержит готовые официальные расширения и скрипты. "
+        "Вы можете создать свой плагин с помощью ИИ или загрузить готовый Python-скрипт.",
+        b.as_markup(),
+    )
 
 
 @router.callback_query(F.data == "menu:plugins")
@@ -917,28 +1093,51 @@ async def plugins_mine(call: CallbackQuery) -> None:
     await _show_my_plugins(call)
 
 
-@router.callback_query(F.data == "plugins:catalog")
+@router.callback_query(F.data.startswith("plugins:catalog"))
 async def plugins_catalog(call: CallbackQuery) -> None:
+    parts = call.data.split(":")
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
     manager = plugins()
     catalog = manager.catalog_plugins()
     installed = {plugin.id for plugin in manager.ordered()}
+
+    page_size = 5
+    total_pages = max(1, (len(catalog) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    current_items = catalog[page * page_size : (page + 1) * page_size]
+
     b = InlineKeyboardBuilder()
-    for plugin in catalog:
+    for plugin in current_items:
         status_icon = "✅ " if plugin.id in installed else "📥 "
         b.button(
             text=f"{status_icon}{clip(plugin.name, 26)}",
-            callback_data=f"plugincatalog:view:{plugin.id}",
+            callback_data=f"plugincatalog:view:{plugin.id}:{page}",
         )
-    b.button(text="📦 Мои плагины", callback_data="plugins:mine")
-    b.button(text="⬅️ Плагины", callback_data="menu:plugins")
     b.adjust(1)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"plugins:catalog:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"Стр. {page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"plugins:catalog:{page + 1}"))
+    if nav:
+        b.row(*nav)
+
+    b.row(
+        InlineKeyboardButton(text=f"🧩 Мои плагины ({len(installed)})", callback_data="plugins:mine"),
+        InlineKeyboardButton(text="✨ Создать через ИИ", callback_data="plugins:ai_builder"),
+    )
+    b.row(InlineKeyboardButton(text="⬅️ Плагины", callback_data="menu:plugins"))
+
     text = (
-        "🛍 <b>Каталог готовых плагинов</b>\n\n"
-        "Выберите плагин для просмотра описания и установки в 1 клик:\n\n"
-        + ("\n".join(
+        "🧭 <b>Каталог готовых плагинов Playerok</b>\n\n"
+        f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> (всего: <b>{len(catalog)}</b>):\n\n"
+        + ("\n\n".join(
             f"{'✅' if p.id in installed else '▫️'} <b>{html.escape(p.name)}</b> v{html.escape(p.version)}\n"
-            f"   {html.escape(p.description)}"
-            for p in catalog
+            f"   <i>{html.escape(p.description)}</i>"
+            for p in current_items
         ) or "Каталог пока пуст.")
     )
     await edit(call, text, b.as_markup())
@@ -946,7 +1145,9 @@ async def plugins_catalog(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("plugincatalog:view:"))
 async def plugin_catalog_view(call: CallbackQuery) -> None:
-    plugin_id = call.data.rsplit(":", 1)[-1]
+    parts = call.data.split(":")
+    plugin_id = parts[2]
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
     plugin = next((item for item in plugins().catalog_plugins() if item.id == plugin_id), None)
     if not plugin:
         await call.answer("Плагин не найден", show_alert=True)
@@ -954,29 +1155,48 @@ async def plugin_catalog_view(call: CallbackQuery) -> None:
     installed = plugin.id in plugins().plugins
     rows = []
     if not installed:
-        rows.append([InlineKeyboardButton(text="📥 Установить плагин", callback_data=f"plugincatalog:install:{plugin.id}")])
+        rows.append([InlineKeyboardButton(text="📥 Установить плагин", callback_data=f"plugincatalog:install:{plugin.id}:{page}")])
     else:
-        # Найдем индекс для перехода в настройки
         installed_plugin_idx = next((i for i, p in enumerate(plugins().ordered()) if p.id == plugin.id), None)
         if installed_plugin_idx is not None:
-            rows.append([InlineKeyboardButton(text="⚙️ Открыть и настроить", callback_data=f"plugin:view:{installed_plugin_idx}")])
+            rows.append([InlineKeyboardButton(text="⚙️ Открыть настройки", callback_data=f"plugin:view:{installed_plugin_idx}")])
         rows.append([InlineKeyboardButton(text="🗑 Удалить из установленных", callback_data=f"plugin:delete:{plugin.id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ В каталог", callback_data="plugins:catalog")])
+    rows.append([
+        InlineKeyboardButton(text="💾 Скачать исходник (.py)", callback_data=f"plugincatalog:source:{plugin.id}"),
+        InlineKeyboardButton(text="⬅️ В каталог", callback_data=f"plugins:catalog:{page}"),
+    ])
     await call.answer()
     status_text = "✅ <b>Установлен</b>" if installed else "▫️ <b>Не установлен</b>"
     await edit(
         call,
-        f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
-        f"Автор: {html.escape(plugin.author)}\n"
+        f"🧭 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+        f"Автор: <b>{html.escape(plugin.author)}</b>\n"
         f"Статус: {status_text}\n\n"
-        f"{html.escape(plugin.description)}",
+        f"<b>Описание:</b>\n{html.escape(plugin.description)}",
         InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("plugincatalog:source:"))
+async def plugin_catalog_source(call: CallbackQuery) -> None:
+    plugin_id = call.data.split(":", 2)[2]
+    source_path = next((path for path in plugins().catalog_dir.glob("*.py") if path.stem == plugin_id), None)
+    if not source_path:
+        await call.answer("Файл не найден", show_alert=True)
+        return
+    await call.answer("Отправляю файл…")
+    await call.message.answer_document(
+        BufferedInputFile(source_path.read_bytes(), filename=source_path.name),
+        caption=f"📄 Исходный код плагина <b>{html.escape(source_path.stem)}</b>",
+        parse_mode="HTML",
     )
 
 
 @router.callback_query(F.data.startswith("plugincatalog:install:"))
 async def plugin_catalog_install(call: CallbackQuery) -> None:
-    plugin_id = call.data.rsplit(":", 1)[-1]
+    parts = call.data.split(":")
+    plugin_id = parts[2]
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
     try:
         plugin = plugins().install_catalog(plugin_id)
     except Exception as exc:
@@ -988,7 +1208,7 @@ async def plugin_catalog_install(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("plugin:delete:"))
 async def plugin_delete(call: CallbackQuery) -> None:
-    plugin_id = call.data.rsplit(":", 1)[-1]
+    plugin_id = call.data.split(":", 2)[2]
     try:
         plugins().uninstall(plugin_id)
     except Exception as exc:
@@ -998,13 +1218,332 @@ async def plugin_delete(call: CallbackQuery) -> None:
     await _show_my_plugins(call)
 
 
+# --- Documentation UI ---
+
 @router.callback_query(F.data == "plugins:docs")
-async def plugins_docs(call: CallbackQuery) -> None:
-    await call.answer("Отправляю документацию…")
-    await call.message.answer_document(
-        BufferedInputFile(plugins().documentation().encode("utf-8"), filename="PLUGINS_FOR_AI.md"),
-        caption="📘 Документация API плагинов. Её можно отправить в ИИ для генерации собственного плагина.",
+async def plugins_docs_menu(call: CallbackQuery) -> None:
+    await call.answer()
+    b = InlineKeyboardBuilder()
+    b.button(text="🚀 Быстрый старт", callback_data="plugins:doc:quickstart")
+    b.button(text="📋 Структура PLUGIN_META", callback_data="plugins:doc:meta")
+    b.button(text="⚡ События и хуки", callback_data="plugins:doc:hooks")
+    b.button(text="⚙️ Типы настроек", callback_data="plugins:doc:settings")
+    b.button(text="🛡 Безопасность и правила", callback_data="plugins:doc:security")
+    b.button(text="💾 Скачать PLUGINS_FOR_AI.md", callback_data="plugins:docs_download")
+    b.button(text="⬅️ Плагины", callback_data="menu:plugins")
+    b.adjust(1)
+    await edit(
+        call,
+        "📚 <b>Документация Playerok Plugin SDK</b>\n\n"
+        "Плагины позволяют расширять возможности бота: создавать автоответы, интеграции с внешними сервисами, "
+        "дополнительные уведомления, калькуляторы и автовыдачу.\n\n"
+        "Выберите интересующий раздел или скачайте полный MD-файл для отправки в ИИ:",
+        b.as_markup(),
     )
+
+
+@router.callback_query(F.data.startswith("plugins:doc:"))
+async def plugins_doc_section(call: CallbackQuery) -> None:
+    sec = call.data.split(":", 2)[2]
+    await call.answer()
+    sections = {
+        "quickstart": (
+            "🚀 <b>Быстрый старт</b>\n\n"
+            "Плагин — это один файл на Python (.py) размером до 256 КБ.\n"
+            "1. Создайте файл плагина с объявлением <code>PLUGIN_META</code>.\n"
+            "2. Реализуйте нужные функции (<code>on_message</code>, <code>on_deal</code> и др.).\n"
+            "3. Загрузите файл через <b>➕ Загрузить плагин</b> или используйте <b>✨ Создать плагин (AI)</b>.\n"
+            "4. Включите плагин в <b>🧩 Мои плагины</b>."
+        ),
+        "meta": (
+            "📋 <b>Структура PLUGIN_META</b>\n\n"
+            "Каждый плагин обязан содержать словарь:\n"
+            "<pre>PLUGIN_META = {\n"
+            '    "id": "my_plugin",\n'
+            '    "name": "Название",\n'
+            '    "version": "1.0.0",\n'
+            '    "author": "Автор",\n'
+            '    "description": "Описание",\n'
+            '    "settings": {...}\n'
+            "}</pre>\n"
+            "ID должен состоять из латинских букв, цифр, символов <code>_</code>, <code>-</code>, <code>.</code> (до 32 символов)."
+        ),
+        "hooks": (
+            "⚡ <b>События и хуки</b>\n\n"
+            "Функции вызываются автоматически при событиях Playerok:\n"
+            "• <code>async def on_message(ctx, chat, message):</code> — новое сообщение в чате\n"
+            "• <code>async def on_deal(ctx, deal):</code> — новый заказ/сделка\n"
+            "• <code>async def on_deal_changed(ctx, deal, prev_status):</code> — изменение статуса сделки\n"
+            "• <code>async def on_review(ctx, review):</code> — новый отзыв покупателя\n"
+            "• <code>async def on_schedule(ctx):</code> — периодический запуск\n"
+            "• <code>async def on_action(ctx, action, payload):</code> — ручные действия"
+        ),
+        "settings": (
+            "⚙️ <b>Типы настроек в PLUGIN_META</b>\n\n"
+            "Поддерживаемые типы полей:\n"
+            "• <code>bool</code> — переключатель (вкл/выкл)\n"
+            "• <code>str</code> — строка/текст\n"
+            "• <code>int</code> — целое число\n"
+            "• <code>choice</code> — выпадающий список (выбор из вариантов)"
+        ),
+        "security": (
+            "🛡 <b>Безопасность</b>\n\n"
+            "• Запрещены модули <code>subprocess</code> и <code>ctypes</code>.\n"
+            "• Запрещены функции <code>eval</code>, <code>exec</code>, <code>compile</code>.\n"
+            "• Никогда не читайте и не логируйте переменные окружения и токены бота.\n"
+            "• Все ключи внешних API настраиваются через <code>PLUGIN_META['settings']</code>."
+        ),
+    }
+    content = sections.get(sec, "Раздел не найден")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку разделов", callback_data="plugins:docs")],
+        [InlineKeyboardButton(text="⬅️ Меню плагинов", callback_data="menu:plugins")],
+    ])
+    await edit(call, content, markup)
+
+
+@router.callback_query(F.data == "plugins:docs_download")
+async def plugins_docs_download(call: CallbackQuery) -> None:
+    await call.answer("Отправляю документ…")
+    await call.message.answer_document(
+        BufferedInputFile(plugins().documentation().encode("utf-8"), filename="PLAYEROK_PLUGINS_FOR_AI.md"),
+        caption="📘 <b>Документация Playerok Plugin SDK</b>\nОтправьте этот файл в Claude/ChatGPT вместе с описанием нужного плагина.",
+        parse_mode="HTML",
+    )
+
+
+# --- Upload with Warning ---
+
+@router.callback_query(F.data == "plugins:upload_warning")
+async def plugins_upload_warning(call: CallbackQuery) -> None:
+    await call.answer()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Я понимаю риски, продолжить", callback_data="plugins:upload_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:plugins")],
+    ])
+    await edit(
+        call,
+        "⚠️ <b>Предупреждение о безопасности</b>\n\n"
+        "Плагины выполняются с правами процесса бота. Сторонний непроверенный код может получить доступ к вашему аккаунту.\n\n"
+        "Устанавливайте только собственные плагины либо плагины из официального каталога бота. Вы уверены, что хотите продолжить?",
+        markup,
+    )
+
+
+@router.callback_query(F.data == "plugins:upload_confirm")
+async def plugins_upload_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginUpload.file)
+    await call.answer()
+    await edit(call, "📤 <b>Загрузка плагина</b>\n\nПришлите файл плагина с расширением <code>.py</code> документом в чат.", back_menu("plugins"))
+
+
+# --- AI Plugin Builder ---
+
+@router.callback_query(F.data == "plugins:ai_builder")
+async def ai_builder_menu(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    account = await require_account(call)
+    if not account:
+        return
+    await call.answer()
+    cfg = settings_for_ai(account)
+    configured = bool(cfg.get("api_key") and cfg.get("model_id"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Описать и создать плагин", callback_data="ai_builder:create")],
+        [InlineKeyboardButton(text="⚙️ Настройки API (Ключ / Модель)", callback_data="ai_builder:settings")],
+        [InlineKeyboardButton(text="⬅️ Плагины", callback_data="menu:plugins")],
+    ])
+    await edit(
+        call,
+        "✨ <b>AI-конструктор плагинов Playerok</b>\n\n"
+        "Опишите нужный плагин простыми словами на русском языке. ИИ сгенерирует исходный код строго по документации SDK, "
+        "проверит синтаксис и правила безопасности, после чего плагин автоматически появится в ваших установленных плагинах.\n\n"
+        f"API: <b>{'✅ Настроено' if configured else '❌ Не настроено'}</b>\n"
+        f"Модель: <code>{html.escape(cfg.get('model_id', 'claude-3-5-sonnet-20241022'))}</code>",
+        markup,
+    )
+
+
+def settings_for_ai(account: PlayerokAccount) -> dict[str, Any]:
+    cfg = dict(account.settings or {})
+    return cfg.get("ai_builder", {
+        "api_base_url": AI_BUILDER_DEFAULT_BASE_URL,
+        "api_key": "",
+        "model_id": "claude-3-5-sonnet-20241022",
+    })
+
+
+@router.callback_query(F.data == "ai_builder:settings")
+async def ai_builder_settings_view(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await call.answer()
+    cfg = settings_for_ai(account)
+    key_mask = (cfg.get("api_key")[:6] + "..." + cfg.get("api_key")[-4:]) if len(cfg.get("api_key", "")) > 10 else ("задан" if cfg.get("api_key") else "не задан")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Изменить API Key", callback_data="ai_builder:set:key")],
+        [InlineKeyboardButton(text="🧠 Изменить ID модели", callback_data="ai_builder:set:model")],
+        [InlineKeyboardButton(text="🌐 Изменить Base URL", callback_data="ai_builder:set:base")],
+        [InlineKeyboardButton(text="⬅️ Назад в AI-конструктор", callback_data="plugins:ai_builder")],
+    ])
+    await edit(
+        call,
+        "⚙️ <b>Настройки AI-конструктора</b>\n\n"
+        f"Base URL: <code>{html.escape(cfg.get('api_base_url', AI_BUILDER_DEFAULT_BASE_URL))}</code>\n"
+        f"API Key: <code>{html.escape(key_mask)}</code>\n"
+        f"Модель: <code>{html.escape(cfg.get('model_id', 'claude-3-5-sonnet-20241022'))}</code>\n\n"
+        "<i>Поддерживается Anthropic Messages API, а также любые совместимые прокси (OpenRouter, Proxies и т.д.).</i>",
+        markup,
+    )
+
+
+@router.callback_query(F.data.startswith("ai_builder:set:"))
+async def ai_builder_set_field(call: CallbackQuery, state: FSMContext) -> None:
+    field = call.data.split(":", 2)[2]
+    await call.answer()
+    if field == "key":
+        await state.set_state(AIPluginBuilderState.api_token)
+        await edit(call, "🔑 <b>Введите API-токен (API Key)</b>:\n\nСообщение с токеном будет удалено для безопасности. Для отмены: /cancel", back_menu("plugins"))
+    elif field == "model":
+        await state.set_state(AIPluginBuilderState.model_id)
+        await edit(call, "🧠 <b>Введите точный ID модели</b> (например, <code>claude-3-5-sonnet-20241022</code>):\n\nДля отмены: /cancel", back_menu("plugins"))
+    elif field == "base":
+        await state.set_state(AIPluginBuilderState.api_base_url)
+        await edit(call, f"🌐 <b>Введите HTTPS Base URL</b> (по умолчанию <code>{AI_BUILDER_DEFAULT_BASE_URL}</code>):\n\nДля отмены: /cancel", back_menu("plugins"))
+
+
+@router.message(AIPluginBuilderState.api_token, F.text)
+async def ai_builder_save_key(message: Message, state: FSMContext) -> None:
+    account = await active_account(message.from_user.id)
+    if not account:
+        await state.clear()
+        return
+    token = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if len(token) < 5:
+        await message.answer("Токен слишком короткий.")
+        return
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        s = dict(row.settings or {})
+        if "ai_builder" not in s:
+            s["ai_builder"] = {}
+        s["ai_builder"]["api_key"] = token
+        row.settings = copy.deepcopy(s)
+        await session.commit()
+        account.settings = s
+    await state.clear()
+    await message.answer("✅ API-токен успешно сохранён.", reply_markup=main_menu())
+
+
+@router.message(AIPluginBuilderState.model_id, F.text)
+async def ai_builder_save_model(message: Message, state: FSMContext) -> None:
+    account = await active_account(message.from_user.id)
+    if not account:
+        await state.clear()
+        return
+    model = (message.text or "").strip()
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        s = dict(row.settings or {})
+        if "ai_builder" not in s:
+            s["ai_builder"] = {}
+        s["ai_builder"]["model_id"] = model
+        row.settings = copy.deepcopy(s)
+        await session.commit()
+        account.settings = s
+    await state.clear()
+    await message.answer(f"✅ ID модели установлен: <code>{html.escape(model)}</code>", parse_mode="HTML", reply_markup=main_menu())
+
+
+@router.message(AIPluginBuilderState.api_base_url, F.text)
+async def ai_builder_save_base(message: Message, state: FSMContext) -> None:
+    account = await active_account(message.from_user.id)
+    if not account:
+        await state.clear()
+        return
+    url = (message.text or "").strip()
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        s = dict(row.settings or {})
+        if "ai_builder" not in s:
+            s["ai_builder"] = {}
+        s["ai_builder"]["api_base_url"] = url
+        row.settings = copy.deepcopy(s)
+        await session.commit()
+        account.settings = s
+    await state.clear()
+    await message.answer(f"✅ Base URL установлен: <code>{html.escape(url)}</code>", parse_mode="HTML", reply_markup=main_menu())
+
+
+@router.callback_query(F.data == "ai_builder:create")
+async def ai_builder_create_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    cfg = settings_for_ai(account)
+    if not cfg.get("api_key"):
+        await call.answer("Сначала укажите API Key в настройках!", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(AIPluginBuilderState.request)
+    await edit(
+        call,
+        "✨ <b>Создание нового плагина через ИИ</b>\n\n"
+        "Подробно опишите, что должен делать плагин. Например:\n"
+        "<i>«Создай плагин автоответа на частые вопросы покупателей. Если покупатель спрашивает про гарантию или привязку, отвечать подробной инструкцией. Добавь настройки для текста ответов и включения автоответа.»</i>\n\n"
+        "Отправьте ваш запрос текстовым сообщением (для отмены: /cancel):",
+        back_menu("plugins"),
+    )
+
+
+@router.message(AIPluginBuilderState.request, F.text)
+async def ai_builder_handle_request(message: Message, state: FSMContext) -> None:
+    account = await active_account(message.from_user.id)
+    if not account:
+        await state.clear()
+        return
+    req_text = (message.text or "").strip()
+    if len(req_text) < 15:
+        await message.answer("Пожалуйста, опишите задачу подробнее (минимум 15 символов).")
+        return
+    await state.clear()
+    cfg = settings_for_ai(account)
+    api_key = cfg.get("api_key")
+    base_url = cfg.get("api_base_url") or AI_BUILDER_DEFAULT_BASE_URL
+    model_id = cfg.get("model_id") or "claude-3-5-sonnet-20241022"
+
+    status_msg = await message.answer("🤖 <b>ИИ создаёт плагин…</b>\n1/2 · Генерация кода по SDK Playerok")
+    try:
+        builder = AnthropicPluginBuilder(api_key, base_url, model_id)
+        docs = plugins().documentation()
+        draft = await builder.create_draft(req_text, docs)
+        try:
+            await status_msg.edit_text("🤖 <b>ИИ проверяет плагин…</b>\n2/2 · Проверка синтаксиса и контракта")
+        except Exception:
+            pass
+        reviewed = await builder.review_draft(req_text, docs, draft)
+        meta = inspect_generated_source(reviewed.source)
+        filename = generated_filename(meta["name"], meta["id"])
+        plugin = plugins().install(filename, reviewed.source.encode("utf-8"))
+        await plugins().set_enabled(account.id, plugin, True)
+
+        await status_msg.edit_text(
+            f"✅ <b>Плагин успешно создан и установлен!</b>\n\n"
+            f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+            f"ID: <code>{html.escape(plugin.id)}</code>\n\n"
+            f"📝 <b>Что сделано:</b>\n{html.escape(reviewed.summary[:1500])}",
+            reply_markup=main_menu(),
+        )
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ <b>Не удалось создать плагин</b>:\n\n<code>{html.escape(str(exc))[:1500]}</code>",
+            reply_markup=main_menu(),
+        )
 
 
 @router.callback_query(F.data == "plugins:reload")

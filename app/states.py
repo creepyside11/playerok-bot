@@ -54,3 +54,11 @@ class PluginSettingEdit(StatesGroup):
 
 class DeliveryStockAdd(StatesGroup):
     content = State()
+
+
+class AIPluginBuilderState(StatesGroup):
+    api_base_url = State()
+    api_token = State()
+    model_id = State()
+    request = State()
+    edit_request = State()

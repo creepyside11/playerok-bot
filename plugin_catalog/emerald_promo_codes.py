@@ -4,7 +4,6 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from playerokapi.enums import ItemDealDirections
 

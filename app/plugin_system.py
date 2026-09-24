@@ -184,6 +184,48 @@ class PluginManager:
             config.update(row.config)
         return bool(row.enabled) if row else False, config
 
+    async def set_enabled(self, account_id: Any, plugin: PluginSpec, enabled: bool) -> None:
+        async with self.db() as session:
+            row = await session.scalar(
+                select(PluginState).where(
+                    PluginState.account_id == account_id, PluginState.plugin_id == plugin.id
+                )
+            )
+            if not row:
+                row = PluginState(
+                    account_id=account_id,
+                    plugin_id=plugin.id,
+                    enabled=enabled,
+                    config=plugin.defaults(),
+                )
+                session.add(row)
+            else:
+                row.enabled = enabled
+            await session.commit()
+
+    async def set_setting(self, account_id: Any, plugin: PluginSpec, key: str, value: Any) -> None:
+        async with self.db() as session:
+            row = await session.scalar(
+                select(PluginState).where(
+                    PluginState.account_id == account_id, PluginState.plugin_id == plugin.id
+                )
+            )
+            if not row:
+                config = plugin.defaults()
+                config[key] = value
+                row = PluginState(
+                    account_id=account_id,
+                    plugin_id=plugin.id,
+                    enabled=False,
+                    config=config,
+                )
+                session.add(row)
+            else:
+                current_config = dict(row.config or {})
+                current_config[key] = value
+                row.config = current_config
+            await session.commit()
+
     async def count_enabled(self, account_id: Any) -> int:
         total = 0
         for plugin in self.ordered():
@@ -196,6 +238,12 @@ class PluginManager:
 
     async def dispatch_deal(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any) -> None:
         await self._dispatch("on_deal", account, client, bot, deal)
+
+    async def dispatch_deal_changed(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any, previous_status: str | None) -> None:
+        await self._dispatch("on_deal_changed", account, client, bot, deal, previous_status)
+
+    async def dispatch_review(self, account: PlayerokAccount, client: Any, bot: Any, review: Any) -> None:
+        await self._dispatch("on_review", account, client, bot, review)
 
     async def dispatch_command(self, account: PlayerokAccount, client: Any, bot: Any, command: str, args: list[str]) -> None:
         await self._dispatch("on_command", account, client, bot, command, args)
@@ -216,6 +264,19 @@ class PluginManager:
     async def _dispatch(self, hook_name: str, account: PlayerokAccount, client: Any, bot: Any, *args: Any) -> None:
         for plugin in self.ordered():
             hook = getattr(plugin.module, hook_name, None)
+            # Also check alternative names from contract:
+            if not hook and hook_name == "on_deal_changed":
+                hook = getattr(plugin.module, "BIND_TO_DEAL_CHANGED", None)
+                if isinstance(hook, list) and hook:
+                    hook = hook[0]
+                elif not callable(hook):
+                    hook = None
+            elif not hook and hook_name == "on_review":
+                hook = getattr(plugin.module, "BIND_TO_NEW_REVIEW", None)
+                if isinstance(hook, list) and hook:
+                    hook = hook[0]
+                elif not callable(hook):
+                    hook = None
             if not hook:
                 continue
             enabled, config = await self.resolved_state(account.id, plugin)

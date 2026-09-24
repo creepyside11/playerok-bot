@@ -13,9 +13,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "new_message": True,
         "new_deal": True,
         "deal_status": True,
+        "new_review": True,
         "errors": True,
     },
     "auto_confirm": False,
+    "ai_builder": {
+        "api_base_url": "https://api.anthropic.com",
+        "api_key": "",
+        "model_id": "claude-3-5-sonnet-20241022",
+    },
 }
 
 
@@ -23,6 +29,7 @@ def fresh_settings() -> dict[str, Any]:
     return {
         "notifications": dict(DEFAULT_SETTINGS["notifications"]),
         "auto_confirm": False,
+        "ai_builder": dict(DEFAULT_SETTINGS["ai_builder"]),
     }
 
 

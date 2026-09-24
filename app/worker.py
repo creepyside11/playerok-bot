@@ -135,14 +135,22 @@ class WorkerManager:
 
     async def _poll(self, account: PlayerokAccount) -> None:
         client = await self.gateway.get_client(account)
-        # Fetch deals (outgoing sales and incoming purchases) + chats (PM, Notifications, Support)
-        deals_out_page, deals_in_page, chats_page = await asyncio.gather(
-            client.get_deals(direction=ItemDealDirections.OUT, count=24),
-            client.get_deals(direction=ItemDealDirections.IN, count=24),
-            client.get_chats(count=24),
+        # Fetch deals (outgoing sales and incoming purchases) + chats + reviews
+        deals_out_res, deals_in_res, chats_res, reviews_res = await asyncio.gather(
+            asyncio.to_thread(client.get_deals, direction=ItemDealDirections.OUT, count=24),
+            asyncio.to_thread(client.get_deals, direction=ItemDealDirections.IN, count=24),
+            asyncio.to_thread(client.get_chats, count=24),
+            asyncio.to_thread(client.get_my_reviews, count=24),
+            return_exceptions=True,
         )
+        deals_out_page = deals_out_res if not isinstance(deals_out_res, Exception) else None
+        deals_in_page = deals_in_res if not isinstance(deals_in_res, Exception) else None
+        chats_page = chats_res if not isinstance(chats_res, Exception) else None
+        reviews_page = reviews_res if not isinstance(reviews_res, Exception) else None
+
         deals = list(getattr(deals_out_page, "deals", []) or []) + list(getattr(deals_in_page, "deals", []) or [])
         chats = list(getattr(chats_page, "chats", []) or [])
+        reviews = list(getattr(reviews_page, "reviews", []) or [])
 
         # Deduplicate deals by ID if any overlap
         seen_deals: set[str] = set()
@@ -165,6 +173,10 @@ class WorkerManager:
                 message = getattr(chat, "last_message", None)
                 if message:
                     await claim_event(self.db, account.id, "message", message.id)
+            for review in reviews:
+                rid = getattr(review, "id", None)
+                if rid:
+                    await claim_event(self.db, account.id, "review", str(rid))
             async with self.db() as session:
                 row = await session.get(PlayerokAccount, account.id)
                 if row:
@@ -176,6 +188,38 @@ class WorkerManager:
             await self._deal(account, client, deal)
         for chat in reversed(chats):
             await self._chat(account, client, chat)
+        for review in reversed(reviews):
+            await self._review(account, client, review)
+
+    async def _review(self, account: PlayerokAccount, client: Any, review: Any) -> None:
+        rid = getattr(review, "id", None)
+        if not rid or not await claim_event(self.db, account.id, "review", str(rid)):
+            return
+
+        creator = getattr(review, "creator", None)
+        deal = getattr(review, "deal", None)
+        item = getattr(deal, "item", None) if deal else None
+        rating = int(getattr(review, "rating", 0) or 0)
+        review_text = getattr(review, "text", None) or "Без комментария"
+        deal_id = getattr(deal, "id", None)
+
+        if self.plugins:
+            await self.plugins.dispatch_review(account, client, self.bot, review)
+
+        cfg = settings_for(account)
+        if cfg.get("notifications", {}).get("new_review", True):
+            buttons = []
+            if deal_id:
+                buttons.append([InlineKeyboardButton(text="📦 К сделке", callback_data=f"deal:view:{deal_id}")])
+            await self._notify(
+                account.tg_user_id,
+                "⭐ <b>Новый отзыв покупателя</b>\n\n"
+                f"👤 Автор: <b>{html.escape(str(getattr(creator, 'username', '—')))}</b>\n"
+                f"🌟 Оценка: <b>{'⭐' * rating} ({rating}/5)</b>\n"
+                f"🏷 Товар: <b>{html.escape(str(getattr(item, 'name', '—')))}</b>\n\n"
+                f"<pre>{html.escape(str(review_text)[:1200])}</pre>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+            )
 
     async def _deal(self, account: PlayerokAccount, client: Any, deal: Any) -> None:
         cfg = settings_for(account)
@@ -188,6 +232,8 @@ class WorkerManager:
 
         item = getattr(deal, "item", None)
         buyer = getattr(deal, "user", None)
+        chat = getattr(deal, "chat", None)
+        chat_id = getattr(chat, "id", None)
         item_name = getattr(item, "name", None) or "Товар"
         item_id = str(getattr(item, "id", "") or "")
         buyer_name = getattr(buyer, "username", None) or "покупатель"
@@ -195,24 +241,55 @@ class WorkerManager:
 
         if new_deal and self.plugins:
             await self.plugins.dispatch_deal(account, client, self.bot, deal)
+        if new_status and not new_deal and self.plugins:
+            await self.plugins.dispatch_deal_changed(account, client, self.bot, deal, None)
+
+        action_buttons = []
+        if status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}:
+            action_buttons.append([InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"deal:sent_ask:{deal.id}")])
+        if chat_id:
+            action_buttons.append([InlineKeyboardButton(text="💬 Чат с покупателем", callback_data=f"chat:open:{chat_id}")])
+        action_buttons.append([InlineKeyboardButton(text="📦 Подробности", callback_data=f"deal:view:{deal.id}")])
+        deal_markup = InlineKeyboardMarkup(inline_keyboard=action_buttons)
 
         if new_deal and cfg["notifications"]["new_deal"]:
-            amount = f"\nСумма: <b>{html.escape(str(price))} ₽</b>" if price is not None else ""
+            amount = f"\n💰 Сумма: <b>{html.escape(str(price))} ₽</b>" if price is not None else ""
             await self._notify(
                 account.tg_user_id,
-                "🛒 <b>Новый заказ</b>\n"
-                f"Аккаунт: <b>{html.escape(account.username)}</b>\n"
-                f"Товар: {html.escape(str(item_name))}\n"
-                f"Покупатель: {html.escape(str(buyer_name))}{amount}\n"
-                f"Deal ID: <code>{html.escape(str(deal.id))}</code>",
+                "🛒 <b>Новый заказ Playerok</b>\n\n"
+                f"🆔 Сделка: <code>{html.escape(str(deal.id))}</code>\n"
+                f"📌 Статус: <b>Ожидает выполнения продавцом</b>\n"
+                f"👤 Покупатель: <b>{html.escape(str(buyer_name))}</b>\n"
+                f"🏷 Товар: <b>{html.escape(str(item_name))}</b>"
+                f"{amount}\n\n"
+                "<i>Покупатель оплатил товар. Выполните передачу и нажмите «Отметить выполненным».</i>",
+                reply_markup=deal_markup,
             )
-        if new_status and not new_deal and cfg["notifications"]["deal_status"]:
+        elif new_status and not new_deal and cfg["notifications"]["deal_status"]:
+            # Конкретное сообщение о событии сделки в стиле FunPay
+            if status == ItemDealStatuses.SENT:
+                status_title = "✅ <b>Заказ выполнен продавцом</b>"
+                status_desc = "Товар отправлен покупателю. Ожидается подтверждение получения от покупателя."
+            elif status in {ItemDealStatuses.CONFIRMED, ItemDealStatuses.CONFIRMED_AUTOMATICALLY}:
+                status_title = "🤝 <b>Заказ подтверждён покупателем</b>"
+                status_desc = "Покупатель подтвердил успешное получение товара! Средства переведены на баланс."
+            elif status == ItemDealStatuses.ROLLED_BACK:
+                status_title = "↩️ <b>Возврат средств по сделке</b>"
+                status_desc = "Сделка отменена, средства возвращены покупателю."
+            else:
+                status_title = "🔄 <b>Статус сделки изменён</b>"
+                status_desc = f"Текущий статус: <b>{html.escape(status_name)}</b>"
+
+            amount = f"\n💰 Сумма: <b>{html.escape(str(price))} ₽</b>" if price is not None else ""
             await self._notify(
                 account.tg_user_id,
-                "🔄 <b>Статус заказа изменён</b>\n"
-                f"{html.escape(str(item_name))}\n"
-                f"Статус: <code>{html.escape(status_name)}</code>\n"
-                f"Deal ID: <code>{html.escape(str(deal.id))}</code>",
+                f"{status_title}\n\n"
+                f"🆔 Сделка: <code>{html.escape(str(deal.id))}</code>\n"
+                f"👤 Покупатель: <b>{html.escape(str(buyer_name))}</b>\n"
+                f"🏷 Товар: <b>{html.escape(str(item_name))}</b>"
+                f"{amount}\n\n"
+                f"ℹ️ {status_desc}",
+                reply_markup=deal_markup,
             )
 
         if status not in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}:
@@ -230,7 +307,7 @@ class WorkerManager:
                 if cfg["notifications"]["deal_status"]:
                     await self._notify(
                         account.tg_user_id,
-                        f"✅ Заказ <code>{html.escape(action_id)}</code> автоматически отмечен выполненным.",
+                        f"✅ <b>Автовыполнение</b>\nЗаказ <code>{html.escape(action_id)}</code> автоматически отмечен выполненным после отправки данных покупателю.",
                     )
 
     async def _delivery(
