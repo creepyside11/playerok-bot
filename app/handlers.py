@@ -947,21 +947,51 @@ async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
     try:
         client = await svc().gateway.get_client(account)
         category = await client.call("get_game_category", id=data["category_id"])
-        fields_page = await client.call(
-            "get_game_category_data_fields",
-            data["category_id"],
-            obtaining_id,
-            count=24,
-            type=GameCategoryDataFieldTypes.ITEM_DATA,
-        )
+        
+        # Запрашиваем ВСЕ поля категории (включая логин, пароль, почту, формат выдачи)
+        fields = []
+        try:
+            fields_page = await client.call(
+                "get_game_category_data_fields",
+                data["category_id"],
+                obtaining_id,
+                count=50,
+                type=None,
+            )
+            fields = list(getattr(fields_page, "data_fields", []) or [])
+        except Exception:
+            pass
+
+        if not fields:
+            # Fallback: объединяем ITEM_DATA и OBTAINING_DATA
+            try:
+                p1 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.ITEM_DATA)
+                p2 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.OBTAINING_DATA)
+                seen_fids = set()
+                for f in (getattr(p1, "data_fields", []) or []) + (getattr(p2, "data_fields", []) or []):
+                    fid = str(getattr(f, "id", ""))
+                    if fid and fid not in seen_fids:
+                        seen_fids.add(fid)
+                        fields.append(f)
+            except Exception:
+                pass
     except Exception as exc:
         await call.answer("Ошибка API", show_alert=True)
         await call.message.answer(f"<code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
         return
-    fields = list(getattr(fields_page, "data_fields", []) or [])
+
     options = list(getattr(category, "options", []) or [])
-    field_meta = [(str(f.id), str(f.label), bool(f.required)) for f in fields]
-    
+    field_meta = [
+        (
+            str(f.id),
+            str(f.label),
+            bool(f.required),
+            bool(getattr(f, "hidden", False)),
+            str(getattr(getattr(f, "type", None), "name", "")),
+        )
+        for f in fields
+    ]
+
     # Группируем опции по их полю и названию группы
     groups_dict: dict[str, dict[str, Any]] = {}
     for o in options:
@@ -1026,6 +1056,22 @@ async def _show_attribute_group(call_or_msg: Any, state: FSMContext) -> None:
         await call_or_msg.answer(prompt, reply_markup=b.as_markup(), parse_mode="HTML")
 
 
+async def _format_field_prompt(field_tuple: tuple[str, str, bool, bool, str], current_index: int, total_count: int) -> str:
+    _fid, label, required, is_hidden, type_name = field_tuple
+    lbl_lower = label.lower()
+    is_obtaining = type_name == "OBTAINING_DATA" or any(k in lbl_lower for k in ("логин", "login", "почт", "email", "пароль", "password", "ключ", "выдач", "аккаунт", "токен", "код"))
+    
+    if is_obtaining or is_hidden:
+        header = f"🔐 <b>Данные выдачи {current_index}/{total_count} (для покупателя):</b>\n"
+        hint = "\n<i>(Эти данные передаются покупателю автоматически после оплаты)</i>"
+    else:
+        header = f"🧾 <b>Поле товара {current_index}/{total_count}:</b>\n"
+        hint = ""
+
+    req_str = " <b>(обязательно)</b>" if required else " <i>(можно пропустить, отправив «-»)</i>"
+    return f"{header}Поле: «<b>{html.escape(label)}</b>»{req_str}{hint}\n\nВведите значение:"
+
+
 async def _start_item_fields(target: Message, state: FSMContext) -> None:
     data = await state.get_data()
     fields = data.get("field_meta") or []
@@ -1036,9 +1082,8 @@ async def _start_item_fields(target: Message, state: FSMContext) -> None:
         return
     await state.update_data(field_index=0, data_field_values={})
     await state.set_state(ItemCreate.data_fields)
-    _field_id, label, required = fields[0]
-    suffix = " (обязательно)" if required else " (можно пропустить: —)"
-    await target.answer(f"🧾 Введите значение поля «{html.escape(label)}»{suffix}:", parse_mode="HTML")
+    prompt = await _format_field_prompt(fields[0], 1, len(fields))
+    await target.answer(prompt, parse_mode="HTML")
 
 
 @router.callback_query(ItemCreate.attributes, F.data.startswith("itemopt:"))
@@ -1082,7 +1127,7 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     if index >= len(fields):
         await _start_item_fields(message, state)
         return
-    field_id, label, required = fields[index]
+    field_id, label, required, _hidden, _type_name = fields[index]
     raw_value = (message.text or "").strip()
     # Если поле обязательно, не разрешаем пустой ввод или пропуск через "-"
     if required and (not raw_value or raw_value in {"-", "—", "пропуск", "skip"}):
@@ -1094,13 +1139,12 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     index += 1
     if index < len(fields):
         await state.update_data(data_field_values=values, field_index=index)
-        _next_id, next_label, next_required = fields[index]
-        suffix = " (обязательно)" if next_required else " (можно пропустить: —)"
-        await message.answer(f"🧾 Введите значение поля «{html.escape(next_label)}»{suffix}:", parse_mode="HTML")
+        prompt = await _format_field_prompt(fields[index], index + 1, len(fields))
+        await message.answer(prompt, parse_mode="HTML")
         return
     await state.update_data(data_field_values=values)
     await state.set_state(ItemCreate.name)
-    await message.answer("Название товара:")
+    await message.answer("🏷 <b>Название товара:</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.name)
@@ -1110,46 +1154,77 @@ async def item_name(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(item_name=value)
     await state.set_state(ItemCreate.price)
-    await message.answer("Цена в ₽ (целое число):")
+    await message.answer("💰 <b>Цена в ₽ (целое число от 1 до 10 000 000):</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.price)
 async def item_price(message: Message, state: FSMContext) -> None:
     try:
-        value = int((message.text or "").strip())
+        clean_val = (message.text or "").strip().replace(" ", "").replace("₽", "").replace("руб", "").replace("р", "")
+        value = int(clean_val)
         if value <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Введите положительное целое число.")
+        await message.answer("⚠️ Введите положительное целое число от 1 до 10 000 000 ₽:")
         return
     await state.update_data(item_price=value)
     await state.set_state(ItemCreate.description)
-    await message.answer("Описание товара:")
+    await message.answer("📝 <b>Описание товара:</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.description)
 async def item_description(message: Message, state: FSMContext) -> None:
-    await state.update_data(item_description=(message.text or "").strip())
+    await state.update_data(item_description=(message.text or "").strip(), attachments_b64=[])
     await state.set_state(ItemCreate.image)
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Без изображения", callback_data="itemimage:skip")]
+        [InlineKeyboardButton(text="⏭ Без фотографий (создать)", callback_data="itemimage:skip")]
     ])
-    await message.answer("Пришлите одно изображение или пропустите.", reply_markup=markup)
+    await message.answer(
+        "📸 <b>Фотографии товара</b>\n\n"
+        "Отправьте фотографии (обложку, скриншоты лота) прямо в этот чат.\n"
+        "Вы можете отправить до 10 фотографий по очереди или нажать кнопку ниже, чтобы выставить без фото:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(ItemCreate.image, F.data == "itemimage:skip")
 async def item_image_skip(call: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(attachment_b64=None)
+    await call.answer()
+    await create_draft(call.message, state, call.from_user.id)
+
+
+@router.callback_query(ItemCreate.image, F.data == "itemimage:done")
+async def item_image_done(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     await create_draft(call.message, state, call.from_user.id)
 
 
 @router.message(ItemCreate.image, F.photo)
 async def item_image(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    current_list = list(data.get("attachments_b64") or [])
+    if len(current_list) >= 10:
+        await message.answer("⚠️ Достигнут лимит 10 фотографий на лот. Нажмите кнопку создания лота ниже:")
+        return
+
     buffer = io.BytesIO()
     await bot.download(message.photo[-1], destination=buffer)
-    await state.update_data(attachment_b64=base64.b64encode(buffer.getvalue()).decode())
-    await create_draft(message, state, message.from_user.id)
+    b64_str = base64.b64encode(buffer.getvalue()).decode()
+    current_list.append(b64_str)
+    await state.update_data(attachments_b64=current_list)
+
+    count = len(current_list)
+    b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Завершить и создать лот ({count} фото)", callback_data="itemimage:done")
+    b.adjust(1)
+
+    await message.answer(
+        f"📸 <b>Фото #{count} добавлено!</b>\n\n"
+        "Вы можете отправить следующее фото или завершить создание лота:",
+        reply_markup=b.as_markup(),
+        parse_mode="HTML",
+    )
 
 
 async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
@@ -1159,36 +1234,34 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
     if not account or account.tg_user_id != tg_id:
         await state.clear()
         return
+
+    wait_msg = await target.answer("⏳ Создаю товар на Playerok…")
     try:
         client = await svc().gateway.get_client(account)
-        fields_page = await client.call(
-            "get_game_category_data_fields",
-            data["category_id"],
-            data["obtaining_id"],
-            count=24,
-            type=GameCategoryDataFieldTypes.ITEM_DATA,
-        )
-        fields = list(getattr(fields_page, "data_fields", []) or [])
+
+        # Собираем ВСЕ поля (параметры товара + логин/пароль/формат выдачи)
         values = data.get("data_field_values") or {}
-        for field in fields:
-            if str(field.id) in values:
-                field.value = str(values[str(field.id)])
+        payload_fields = [{"fieldId": str(fid), "value": str(fval)} for fid, fval in values.items()]
+
+        # Декодируем все загруженные фотографии
         attachments = []
-        if data.get("attachment_b64"):
-            attachments.append(base64.b64decode(data["attachment_b64"]))
-        item = await client.call(
-            "create_item",
+        for b64 in (data.get("attachments_b64") or []):
+            if b64:
+                attachments.append(base64.b64decode(b64))
+
+        item = await client.create_item(
             game_category_id=data["category_id"],
             obtaining_type_id=data["obtaining_id"],
             name=data["item_name"],
             price=data["item_price"],
             description=data["item_description"],
             options=data.get("attributes") or {},
-            data_fields=fields,
+            data_fields=payload_fields,
             attachments=attachments,
         )
-        priorities = await client.call("get_item_priority_statuses", str(item.id), data["item_price"])
+        priorities = await client.get_item_priority_statuses(str(item.id), data["item_price"])
     except Exception as exc:
+        await wait_msg.delete()
         await target.answer(
             f"❌ Не удалось создать черновик:\n<code>{html.escape(str(exc))[:1800]}</code>",
             parse_mode="HTML",
@@ -1196,6 +1269,8 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
         )
         await state.clear()
         return
+
+    await wait_msg.delete()
     packed = [(str(p.id), str(p.name), int(p.price or 0)) for p in priorities]
     await state.update_data(new_item_id=str(item.id), priorities=packed)
     await state.set_state(ItemCreate.priority)

@@ -1271,8 +1271,37 @@ class Account:
         :return: Объект созданного предмета.
         :rtype: `playerokapi.types.Item`
         """
-        payload_attributes = options if isinstance(options, dict) else {option.field: option.value for option in options}
-        payload_data_fields = [{"fieldId": field.id, "value": field.value} for field in data_fields]
+        if isinstance(options, dict):
+            payload_attributes = options
+        elif isinstance(options, (list, tuple)):
+            payload_attributes = {}
+            for opt in options:
+                if isinstance(opt, dict):
+                    fld = opt.get("field") or opt.get("id")
+                    val = opt.get("value")
+                    if fld is not None:
+                        payload_attributes[str(fld)] = val
+                elif hasattr(opt, "field"):
+                    payload_attributes[str(opt.field)] = opt.value
+        else:
+            payload_attributes = {}
+
+        payload_data_fields = []
+        if isinstance(data_fields, dict):
+            for f_id, f_val in data_fields.items():
+                if f_val is not None:
+                    payload_data_fields.append({"fieldId": str(f_id), "value": str(f_val)})
+        elif isinstance(data_fields, (list, tuple)):
+            for f in data_fields:
+                if isinstance(f, dict):
+                    fid = f.get("fieldId") or f.get("id") or f.get("field_id")
+                    fval = f.get("value")
+                    if fid is not None and fval is not None:
+                        payload_data_fields.append({"fieldId": str(fid), "value": str(fval)})
+                elif hasattr(f, "id"):
+                    val = getattr(f, "value", None)
+                    if val is not None:
+                        payload_data_fields.append({"fieldId": str(f.id), "value": str(val)})
 
         headers = {"accept": "*/*"}
         operations = {
@@ -1288,24 +1317,24 @@ class Account:
                     "attributes": payload_attributes,
                     "dataFields": payload_data_fields
                 },
-                "attachments": [None] * len(attachments)
+                "attachments": [None] * len(attachments or [])
             }
         }
-        
+
         map = {}
         files = {}
-        
-        for i, att in enumerate(attachments, start=1):
+
+        for i, att in enumerate(attachments or [], start=1):
             filename, file_obj, content_type = self._resolve_image_file(att)
             map[str(i)] = [f"variables.attachments.{i-1}"]
             files[str(i)] = (filename, file_obj, content_type)
-        
+
         payload = {
             "operations": json.dumps(operations),
             "map": json.dumps(map)
         }
 
-        r = self.request("post", f"{self.base_url}/graphql", headers, payload, files).json()
+        r = self.request("post", f"{self.base_url}/graphql", headers, payload if files else operations, files if files else None).json()
         return item(r["data"]["createItem"])
     
     def update_item(

@@ -110,3 +110,83 @@ def test_update_item_graphql_payload():
     filename, file_bytes, content_type = files["1"]
     assert content_type == "image/png"
     assert file_bytes == fake_png
+
+
+def test_create_item_with_credentials_and_multiple_photos():
+    account = Account.__new__(Account)
+    account.base_url = "https://playerok.com"
+    account.requests_timeout = 10
+    account.user_agent = "TestAgent"
+
+    captured_requests = []
+
+    def mock_request(method, url, headers, payload, files=None):
+        captured_requests.append({
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "payload": payload,
+            "files": files,
+        })
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "data": {
+                "createItem": {
+                    "__typename": "MyItem",
+                    "id": "new-item-777",
+                    "name": "Аккаунт с отлегой",
+                    "price": 1500,
+                    "description": "Полный доступ",
+                    "status": "APPROVED",
+                    "attachments": [],
+                }
+            }
+        }
+        return mock_resp
+
+    account.request = mock_request
+
+    # Создание с данными выдачи (логин и пароль в виде словаря) и 2 фотографиями
+    photo1 = b"\x89PNG\r\n\x1a\nphoto1-png"
+    photo2 = b"\xff\xd8\xffphoto2-jpg"
+
+    account.create_item(
+        game_category_id="cat-100",
+        obtaining_type_id="obt-200",
+        name="Аккаунт с отлегой",
+        price=1500,
+        description="Полный доступ, почта перепривязана",
+        options={"server": "EU", "level": "80"},
+        data_fields={
+            "login_field_id": "player_user@mail.com",
+            "password_field_id": "SuperSecretPass123",
+        },
+        attachments=[photo1, photo2],
+    )
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    operations = json.loads(req["payload"]["operations"])
+    map_data = json.loads(req["payload"]["map"])
+    files = req["files"]
+
+    assert operations["operationName"] == "createItem"
+    inp = operations["variables"]["input"]
+    assert inp["gameCategoryId"] == "cat-100"
+    assert inp["obtainingTypeId"] == "obt-200"
+    assert inp["name"] == "Аккаунт с отлегой"
+    assert inp["price"] == 1500
+    assert inp["attributes"] == {"server": "EU", "level": "80"}
+
+    # Проверяем, что поля логина и пароля попали в dataFields
+    assert {"fieldId": "login_field_id", "value": "player_user@mail.com"} in inp["dataFields"]
+    assert {"fieldId": "password_field_id", "value": "SuperSecretPass123"} in inp["dataFields"]
+
+    # Проверяем фотографии
+    assert operations["variables"]["attachments"] == [None, None]
+    assert map_data["1"] == ["variables.attachments.0"]
+    assert map_data["2"] == ["variables.attachments.1"]
+    assert "1" in files and "2" in files
+    assert files["1"][2] == "image/png"
+    assert files["2"][2] == "image/jpeg"
+

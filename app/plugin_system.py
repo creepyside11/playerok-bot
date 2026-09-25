@@ -89,6 +89,29 @@ class PluginContext:
             remove_attachments=remove_attachments,
         )
 
+    async def create_item(
+        self,
+        game_category_id: str,
+        obtaining_type_id: str,
+        name: str,
+        price: int,
+        description: str,
+        options: Any = None,
+        data_fields: Any = None,
+        attachments: list[str | bytes] | None = None,
+    ) -> Any:
+        """Создать новый лот (товар) на Playerok."""
+        return await self.client.create_item(
+            game_category_id=game_category_id,
+            obtaining_type_id=obtaining_type_id,
+            name=name,
+            price=price,
+            description=description,
+            options=options or {},
+            data_fields=data_fields or [],
+            attachments=attachments or [],
+        )
+
 
 class PluginManager:
     def __init__(

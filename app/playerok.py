@@ -224,6 +224,29 @@ class PlayerokSession:
     async def publish_item(self, item_id: str, priority_status_id: str) -> Any:
         return await self.call("publish_item", item_id=item_id, priority_status_id=priority_status_id)
 
+    async def create_item(
+        self,
+        game_category_id: str,
+        obtaining_type_id: str,
+        name: str,
+        price: int,
+        description: str,
+        options: Any = None,
+        data_fields: Any = None,
+        attachments: list[str | bytes] | None = None,
+    ) -> Any:
+        return await self.call(
+            "create_item",
+            game_category_id=game_category_id,
+            obtaining_type_id=obtaining_type_id,
+            name=name,
+            price=price,
+            description=description,
+            options=options or {},
+            data_fields=data_fields or [],
+            attachments=attachments or [],
+        )
+
 
 class PlayerokGateway:
     def __init__(self, cipher: SecretCipher):

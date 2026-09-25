@@ -95,6 +95,30 @@ async def on_schedule(ctx):
     await ctx.notify("Цена лота 123456 обновлена до 490 ₽")
 ```
 
+## Пример создания лота с выдачей (аккаунт, логин/пароль, фото)
+
+```python
+async def publish_game_account(ctx):
+    # Создание лота с данными для автовыдачи покупателю
+    new_item = await ctx.create_item(
+        game_category_id="category_id_here",
+        obtaining_type_id="obtaining_type_id_here",
+        name="Личный аккаунт 80 LVL [Полный доступ]",
+        price=1500,
+        description="Продажа личного аккаунта. Почта перепривязана.",
+        options={"server": "EU", "level": "80"},
+        data_fields={
+            "login_field_id": "account_login@mail.com",
+            "password_field_id": "SecretPassword123",
+        },
+        attachments=["/path/to/screenshot1.png", b"...raw_image_bytes..."],
+    )
+    # Публикация лота на Playerok
+    statuses = await ctx.client.get_item_priority_statuses(str(new_item.id), 1500)
+    await ctx.client.publish_item(str(new_item.id), priority_status_id=str(statuses[0].id))
+    await ctx.notify(f"Лот создан и выставлен: {new_item.name} (#{new_item.id})")
+```
+
 ## Пример HTTP-запроса
 
 ```python
