@@ -1,12 +1,14 @@
 import pytest
 from app.emerald_promo_manager import (
+    TELEGRAPH_DOCS_URL,
+    fetch_models_text,
+    format_tokens,
+    free_message,
+    promo_prefix,
+    review_message,
+    sale_message,
     validate_api_url,
     validate_token_amount,
-    format_tokens,
-    promo_prefix,
-    free_message,
-    sale_message,
-    review_message,
 )
 
 def test_validate_api_url():
@@ -34,11 +36,32 @@ def test_messages():
     assert "50 000" in msg
     assert "100 000" in msg
     assert "#баланс" in msg
+    assert "#модели" in msg
+    assert TELEGRAPH_DOCS_URL in msg
+    # Проверяем, что нет ссылок на сторонние веб-сайты
+    assert "https://emeraldai.beer\n" not in msg
 
     msg_rev = review_message("sk-em-test123", 100000, is_key=True)
     assert "БОНУС ЗА ОТЗЫВ 5★" in msg_rev
     assert "sk-em-test123" in msg_rev
+    assert TELEGRAPH_DOCS_URL in msg_rev
+    assert "#баланс" in msg_rev
+    assert "#модели" in msg_rev
 
     msg_free = free_message("sk-em-free", 200000, is_key=True)
     assert "ВАШ БЕСПЛАТНЫЙ ДОСТУП" in msg_free
     assert "sk-em-free" in msg_free
+    assert TELEGRAPH_DOCS_URL in msg_free
+    assert "#баланс" in msg_free
+    assert "#модели" in msg_free
+
+
+def test_fetch_models_text():
+    text = fetch_models_text()
+    assert "СПИСОК МОДЕЛЕЙ И СТАТУС" in text
+    assert "claude-fable-5-1" in text
+    assert "gpt-5-6-sol" in text
+    assert "deepseek-v4" in text
+    assert TELEGRAPH_DOCS_URL in text
+    assert "#баланс" in text
+    assert "🟢" in text

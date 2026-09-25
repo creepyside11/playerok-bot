@@ -19,6 +19,7 @@ logger = logging.getLogger("emerald_promo")
 DEFAULT_API_URL = "https://www.emeraldai.sbs/seller/v1"
 ACTIVATION_URL = "https://emeraldai.beer"
 BEER_ACCOUNT_URL = "https://www.emeraldai.beer/v1/account"
+TELEGRAPH_DOCS_URL = "https://telegra.ph/Emerald-AI--Dokumentaciya-i-Podklyuchenie-09-25"
 MIN_TOKEN_AMOUNT = 10_000
 MAX_TOKEN_AMOUNT = 1_000_000_000
 DEFAULT_FREE_TOKENS = 200_000
@@ -216,17 +217,139 @@ class EmeraldClient:
         return None
 
 
+FALLBACK_MODELS = [
+    ("claude-fable-5-1", "Claude FABLE 5.1X Model", "Anthropic", "×14", "Работает"),
+    ("claude-fable-5", "Claude FABLE 5X Model", "Anthropic", "×11", "Работает"),
+    ("claude-opus-5", "Claude Opus 5", "Anthropic", "×5", "Работает"),
+    ("claude-opus-4-8", "Claude Opus 4.8", "Anthropic", "×5", "Работает"),
+    ("claude-sonnet-5", "Claude Sonnet 5", "Anthropic", "×3.5", "Работает"),
+    ("claude-opus-4-6", "Claude Opus 4.6", "Anthropic", "×2", "Работает"),
+    ("gpt-6-astra", "GPT 6 AstraX Model", "OpenAI", "×12", "Работает"),
+    ("gpt-5-6-sol", "GPT 5.6 SOL", "OpenAI", "×7", "Работает"),
+    ("gpt-5-5", "GPT 5.5", "OpenAI", "×1", "Работает"),
+    ("gpt-5-4-mini", "GPT 5.4 mini", "OpenAI", "×2.5", "Техработы"),
+    ("gpt-image-2", "GPT Image 2", "OpenAI", "", "Техработы"),
+    ("gpt-5-6-terra", "GPT 5.6 Terra", "OpenAI", "×1", "Отключена"),
+    ("gpt-5-6-luna", "GPT 5.6 Luna", "OpenAI", "×1", "Отключена"),
+    ("deepseek-v4-pro", "DeepSeek V4 Pro", "DeepSeek", "×1.5", "Техработы"),
+    ("deepseek-v4-flash", "DeepSeek V4 Flash", "DeepSeek", "×0.8", "Работает"),
+    ("deepseek-v4-1-flash", "DeepSeek V4.1 Flash", "DeepSeek", "×1", "Отключена"),
+    ("gemini-3-1-pro", "Gemini 3.1 Pro", "Google", "×3", "Работает"),
+    ("gemini-3-7-flash", "Gemini 3.7 Flash", "Google", "×4", "Работает"),
+    ("gemini-3-6-flash", "Gemini 3.6 Flash", "Google", "×3", "Работает"),
+    ("grok-4-6", "GROK 4.6X Model", "xAI", "×4", "Работает"),
+    ("grok-4-5", "GROK 4.5X Model", "xAI", "×3", "Работает"),
+    ("qwen-3-8-max", "Qwen 3.8 MAX", "Alibaba", "×6", "Работает"),
+    ("qwen-3-6", "Qwen 3.6", "Alibaba", "×3", "Техработы"),
+    ("step-3-7-flash", "Step 3.7 Flash", "Step", "×0.6", "Работает"),
+    ("kimi-k3", "Kimi K3", "Moonshot", "×5", "Техработы"),
+    ("minimax-m3", "MiniMax M3", "MiniMax", "×1.5", "Техработы"),
+    ("nemotron-free", "Nemotron (FREE)", "NVIDIA", "×0", "Работает"),
+    ("glm-5-3-flash", "GLM 5.3 Flash", "Zhipu", "×1", "Отключена"),
+    ("ox-alpha", "OX Alpha", "OX", "×0.2", "Отключена"),
+]
+
+_CACHED_MODELS_TEXT: str | None = None
+_CACHED_MODELS_TIME: float = 0.0
+
+
+def fetch_models_text(telegraph_url: str = TELEGRAPH_DOCS_URL) -> str:
+    """Возвращает актуальный список моделей с их статусом, множителем и документацией."""
+    global _CACHED_MODELS_TEXT, _CACHED_MODELS_TIME
+    import time
+    now = time.time()
+
+    if _CACHED_MODELS_TEXT and (now - _CACHED_MODELS_TIME) < 180:
+        return _CACHED_MODELS_TEXT
+
+    models: list[tuple[str, str, str, str, str]] = []
+    try:
+        req = requests.get(
+            "https://emeraldai.beer/",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=8,
+        )
+        if req.ok:
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(req.text, "html.parser")
+                for art in soup.find_all("article"):
+                    h4 = art.find("h4")
+                    if not h4:
+                        continue
+                    title = h4.get_text(strip=True)
+                    code_el = art.find("code")
+                    model_id = code_el.get_text(strip=True) if code_el else ""
+                    if not model_id:
+                        continue
+                    status_el = art.find("span", class_=lambda c: c and "public-model-state" in c)
+                    classes = status_el.get("class", []) if status_el else []
+                    status_raw = status_el.get_text(strip=True) if status_el else "Работает"
+                    meta = art.find("div", class_="product-model-meta")
+                    mult = ""
+                    if meta:
+                        strong = meta.find("strong")
+                        if strong:
+                            mult = strong.get_text(strip=True)
+                    provider_p = art.find("p")
+                    provider = provider_p.get_text(strip=True) if provider_p else ""
+
+                    if "offline" in classes or "откл" in status_raw.casefold():
+                        status = "Отключена"
+                    elif "maintenance" in classes or "тех" in status_raw.casefold():
+                        status = "Техработы"
+                    else:
+                        status = "Работает"
+
+                    models.append((model_id, title, provider, mult, status))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not models:
+        models = FALLBACK_MODELS
+
+    lines = [
+        "╔══════════════════════════╗",
+        "║  📋 СПИСОК МОДЕЛЕЙ И СТАТУС",
+        "╚══════════════════════════╝",
+        "🟢 Работает | 🟡 Техработы | 🔴 Отключена\n",
+    ]
+
+    for model_id, title, provider, mult, status in models:
+        s_lower = status.casefold()
+        if "работ" in s_lower:
+            icon = "🟢"
+        elif "тех" in s_lower:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        mult_str = f" · {mult}" if mult else ""
+        lines.append(f"{icon} {model_id}{mult_str} ({status})")
+
+    lines.append("\n" + "─" * 26)
+    lines.append(f"📖 Документация в Telegraph:\n{telegraph_url}\n")
+    lines.append("💡 Для проверки баланса ключа напишите: #баланс")
+
+    res_text = "\n".join(lines)
+    _CACHED_MODELS_TEXT = res_text
+    _CACHED_MODELS_TIME = now
+    return res_text
+
+
 def free_message(code: str, token_amount: int, *, repeated: bool = False, is_key: bool = False) -> str:
     heading = "ВАШ БЕСПЛАТНЫЙ ДОСТУП" if not repeated else "ВАШ ТЕСТОВЫЙ ДОСТУП"
     item_label = "🔑 API-ключ" if is_key else "🔑 Промокод"
     item_hint = (
-        f"🌐 Инструкция и проверка баланса: {ACTIVATION_URL}\n"
-        f"⚙️ Base URL для клиентов/SDK: {ACTIVATION_URL}/v1\n\n"
-        "Ключ уже готов к использованию без регистрации на сайте! "
-        "Для проверки остатка напишите в этот чат: #баланс"
+        f"📖 Документация в Telegraph:\n{TELEGRAPH_DOCS_URL}\n\n"
+        "⚙️ Base URL для клиентов: https://emeraldai.beer/v1\n\n"
+        "Ключ уже готов к использованию без регистрации!\n"
+        "💡 Для проверки остатка напишите: #баланс\n"
+        "📋 Список моделей и статус: #модели"
         if is_key else
-        f"🌐 Активировать: {ACTIVATION_URL}\n\n"
-        "Промокод одноразовый и предназначен для тестирования моделей EmeraldAI. "
+        f"📖 Инструкция в Telegraph:\n{TELEGRAPH_DOCS_URL}\n\n"
+        "Промокод одноразовый и предназначен для тестирования моделей EmeraldAI.\n"
         "Бесплатный доступ выдаётся покупателю только один раз."
     )
     return (
@@ -243,13 +366,14 @@ def sale_message(code: str, token_amount: int, purchased_units: int, review_bonu
     title = "💎 КЛЮЧ EMERALDAI" if is_key else "💎 ПРОМОКОД EMERALDAI"
     item_label = "🔑 Ваш API-ключ" if is_key else "🔑 Промокод"
     instructions = (
-        f"🌐 Портал и проверка баланса: {ACTIVATION_URL}\n"
-        f"⚙️ Base URL: {ACTIVATION_URL}/v1\n\n"
-        "Ключ активен сразу! Вы можете использовать его в любых OpenAI/Anthropic клиентах.\n"
-        "💡 Для проверки баланса ключа прямо в этом чате отправьте команду:\n"
-        "#баланс"
+        f"📖 Документация в Telegraph:\n{TELEGRAPH_DOCS_URL}\n\n"
+        "⚙️ Base URL: https://emeraldai.beer/v1\n\n"
+        "Ключ активен сразу! Вы можете использовать его в Cursor, Claude Code, Python SDK и любых совместимых клиентах.\n\n"
+        "💬 Команды в этом чате:\n"
+        "• #баланс — проверить остаток токенов\n"
+        "• #модели — актуальный список моделей и их статус"
         if is_key else
-        f"🌐 Активировать: {ACTIVATION_URL}\n\n"
+        f"📖 Инструкция по активации в Telegraph:\n{TELEGRAPH_DOCS_URL}\n\n"
         "Код можно активировать один раз. Никому не передавайте его до активации."
     )
     text = (
@@ -275,11 +399,12 @@ def sale_message(code: str, token_amount: int, purchased_units: int, review_bonu
 def review_message(code: str, token_amount: int, *, is_key: bool = False) -> str:
     item_label = "🔑 Ваш бонусный API-ключ" if is_key else "🔑 Бонусный промокод"
     hint = (
-        f"🌐 Проверка баланса: {ACTIVATION_URL}\n"
-        f"⚙️ Base URL: {ACTIVATION_URL}/v1\n"
-        "Для быстрой проверки баланса напишите: #баланс"
+        f"📖 Документация в Telegraph:\n{TELEGRAPH_DOCS_URL}\n"
+        "⚙️ Base URL: https://emeraldai.beer/v1\n\n"
+        "💡 Для быстрой проверки баланса напишите: #баланс\n"
+        "📋 Список моделей и статус: #модели"
         if is_key else
-        f"🌐 Активировать: {ACTIVATION_URL}\n"
+        f"📖 Инструкция в Telegraph:\n{TELEGRAPH_DOCS_URL}\n\n"
         "Промокод одноразовый."
     )
     return (

@@ -13,6 +13,8 @@ from app.emerald_promo_manager import (
     EmeraldPromoIssue,
     EmeraldPromoLotRule,
     EmeraldPromoSetting,
+    TELEGRAPH_DOCS_URL,
+    fetch_models_text,
     format_tokens,
     free_message,
     promo_prefix,
@@ -407,7 +409,11 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
 
         key = last_issue.promo_code.strip()
         if not key.startswith("sk-em-"):
-            await asyncio.to_thread(ctx.client.send_message, chat_id, f"ℹ️ Проверка баланса доступна для API-ключей. Промокоды активируются на сайте: {ACTIVATION_URL}")
+            await asyncio.to_thread(
+                ctx.client.send_message,
+                chat_id,
+                f"ℹ️ Проверка баланса доступна для API-ключей. Инструкция по промокодам в Telegraph:\n{TELEGRAPH_DOCS_URL}",
+            )
             return
 
         try:
@@ -422,10 +428,28 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
             await asyncio.to_thread(
                 ctx.client.send_message,
                 chat_id,
-                f"💳 <b>Информация о ключе:</b>\n"
-                f"🔑 Ключ: <code>{key[:8]}...{key[-4:]}</code>\n"
-                f"🪙 Текущий остаток: <b>{format_tokens(int(balance_val))}</b> токенов\n"
-                f"🌐 Портал: {ACTIVATION_URL}",
+                f"💳 Информация о ключе:\n"
+                f"🔑 Ключ: {key[:8]}...{key[-4:]}\n"
+                f"🪙 Текущий остаток: {format_tokens(int(balance_val))} токенов\n\n"
+                f"📋 Список моделей и статус: #модели\n"
+                f"📖 Документация в Telegraph:\n{TELEGRAPH_DOCS_URL}",
             )
         except Exception as exc:
             await asyncio.to_thread(ctx.client.send_message, chat_id, "⚠️ Не удалось получить баланс ключа.")
+
+    # Check for #модели / #models
+    elif text.strip().lower() in ("#модели", "#models", "#модель", "#model"):
+        models_text = await asyncio.to_thread(fetch_models_text, TELEGRAPH_DOCS_URL)
+        await asyncio.to_thread(ctx.client.send_message, chat_id, models_text)
+
+    # Check for #документация / #доки / #docs
+    elif text.strip().lower() in ("#документация", "#доки", "#инструкция", "#docs", "#руководство"):
+        docs_text = (
+            "📖 ОФИЦИАЛЬНАЯ ДОКУМЕНТАЦИЯ EMERALD AI:\n\n"
+            f"{TELEGRAPH_DOCS_URL}\n\n"
+            "⚙️ Base URL для клиентов: https://emeraldai.beer/v1\n\n"
+            "💬 Команды в чате:\n"
+            "• #модели — актуальный список моделей и их статус\n"
+            "• #баланс — проверить остаток токенов ключа"
+        )
+        await asyncio.to_thread(ctx.client.send_message, chat_id, docs_text)

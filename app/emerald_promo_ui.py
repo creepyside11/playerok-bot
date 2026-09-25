@@ -19,6 +19,7 @@ from .emerald_promo_manager import (
     EmeraldPromoIssue,
     EmeraldPromoLotRule,
     EmeraldPromoSetting,
+    TELEGRAPH_DOCS_URL,
     format_tokens,
     free_message,
     review_message,
@@ -96,7 +97,7 @@ async def render_emerald_settings(call: CallbackQuery, account: PlayerokAccount)
         "⚙️ <b>Emerald Promo</b>",
         "",
         f"Playerok-аккаунт: <b>{html.escape(account.username)}</b>",
-        f"Клиентский портал: <code>{ACTIVATION_URL}</code>",
+        f"Документация (Telegraph): <a href=\"{TELEGRAPH_DOCS_URL}\">открыть статью</a>",
         f"Base URL API: <code>{html.escape(setting.api_base_url)}</code>",
         f"API-токен продавца: <b>{html.escape(token_label(token))}</b>",
         f"Режим выдачи: <b>{issue_mode}</b>",
@@ -107,7 +108,7 @@ async def render_emerald_settings(call: CallbackQuery, account: PlayerokAccount)
         f"Привязки: <b>{active_rules}/{len(rules)} включено</b>",
         f"Выдано: <b>{total_sent}</b> · ошибок: <b>{total_failed}</b>",
         "",
-        "💡 Покупатели могут проверить баланс ключа командой <code>#баланс</code> в чате заказа.",
+        "💡 Покупатели могут проверить баланс ключа: <code>#баланс</code>, а список моделей: <code>#модели</code>.",
     ]
 
     if rules:
@@ -129,6 +130,7 @@ async def render_emerald_settings(call: CallbackQuery, account: PlayerokAccount)
     b.row(InlineKeyboardButton(text="➕ Добавить лот (выбор кнопкой)", callback_data="emp:lots"))
     b.row(InlineKeyboardButton(text="🧩 Управление лотами", callback_data="emp:rules"))
     b.row(InlineKeyboardButton(text="🧪 Проверить API и баланс", callback_data="emp:api"))
+    b.row(InlineKeyboardButton(text="📖 Документация в Telegraph ↗", url=TELEGRAPH_DOCS_URL))
     if total_failed > 0:
         b.row(InlineKeyboardButton(text="🔁 Повторить ошибки", callback_data="emp:retry"))
     b.row(
