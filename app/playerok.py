@@ -189,6 +189,41 @@ class PlayerokSession:
     async def update_deal(self, deal_id: str, status: ItemDealStatuses) -> Any:
         return await self.call("update_deal", deal_id=deal_id, new_status=status)
 
+    async def get_item(self, item_id: str, slug: str | None = None) -> Any:
+        return await self.call("get_item", id=item_id, slug=slug)
+
+    async def update_item(
+        self,
+        item_id: str,
+        name: str | None = None,
+        price: int | None = None,
+        description: str | None = None,
+        options: Any = None,
+        data_fields: Any = None,
+        remove_attachments: list[str] | None = None,
+        add_attachments: list[str | bytes] | None = None,
+    ) -> Any:
+        return await self.call(
+            "update_item",
+            id=item_id,
+            name=name,
+            price=price,
+            description=description,
+            options=options,
+            data_fields=data_fields,
+            remove_attachments=remove_attachments,
+            add_attachments=add_attachments,
+        )
+
+    async def remove_item(self, item_id: str) -> Any:
+        return await self.call("remove_item", id=item_id)
+
+    async def get_item_priority_statuses(self, item_id: str, item_price: int | str) -> Any:
+        return await self.call("get_item_priority_statuses", item_id=item_id, item_price=item_price)
+
+    async def publish_item(self, item_id: str, priority_status_id: str) -> Any:
+        return await self.call("publish_item", item_id=item_id, priority_status_id=priority_status_id)
+
 
 class PlayerokGateway:
     def __init__(self, cipher: SecretCipher):

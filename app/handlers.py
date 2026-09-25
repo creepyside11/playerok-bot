@@ -873,32 +873,6 @@ async def items_menu(call: CallbackQuery, state: FSMContext) -> None:
     await show_items(call)
 
 
-@router.callback_query(F.data == "items:list")
-async def items_list(call: CallbackQuery) -> None:
-    account = await require_account(call)
-    if not account:
-        return
-    await call.answer("Загружаю…")
-    try:
-        client = await svc().gateway.get_client(account)
-        page = await client.call("get_my_items", statuses=None, count=12)
-        items = list(getattr(page, "items", []) or [])
-        lines = [f"📋 <b>Товары — {html.escape(account.username)}</b>"]
-        for item in items:
-            status = getattr(getattr(item, "status", None), "name", "—")
-            lines.append(
-                f"\n• <b>{html.escape(clip(getattr(item, 'name', 'Товар'), 55))}</b>\n"
-                f"  <code>{html.escape(str(getattr(item, 'id', '')))}</code>\n"
-                f"  {html.escape(str(getattr(item, 'price', '—')))} ₽ · {html.escape(status)}"
-            )
-        if not items:
-            lines.append("\nТовары не найдены.")
-        text = "\n".join(lines)
-    except Exception as exc:
-        text = f"❌ Ошибка:\n<code>{html.escape(str(exc))[:1600]}</code>"
-    await edit(call, text, back_menu("items"))
-
-
 @router.callback_query(F.data == "items:create")
 async def item_create(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)

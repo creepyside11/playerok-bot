@@ -66,6 +66,29 @@ class PluginContext:
             reply_markup=reply_markup,
         )
 
+    async def get_item(self, item_id: str) -> Any:
+        """Получить полную информацию о товаре Playerok."""
+        return await self.client.get_item(item_id)
+
+    async def update_item(
+        self,
+        item_id: str,
+        name: str | None = None,
+        price: int | None = None,
+        description: str | None = None,
+        add_attachments: list[str | bytes] | None = None,
+        remove_attachments: list[str] | None = None,
+    ) -> Any:
+        """Обновить название, цену, описание или фотографии товара."""
+        return await self.client.update_item(
+            item_id=item_id,
+            name=name,
+            price=price,
+            description=description,
+            add_attachments=add_attachments,
+            remove_attachments=remove_attachments,
+        )
+
 
 class PluginManager:
     def __init__(

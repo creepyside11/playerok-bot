@@ -256,12 +256,13 @@ class Account:
                         )
                     elif method == "post":
                         if files:
+                            post_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
                             r = self.__tls_requests.post(
-                                url=url, 
-                                json=payload if not files else None, 
-                                data=payload if files else None, 
-                                headers=headers, 
-                                files=files, 
+                                url=url,
+                                json=payload if not files else None,
+                                data=payload if files else None,
+                                headers=post_headers,
+                                files=files,
                                 timeout=self.requests_timeout
                             )
                         else:
@@ -1364,19 +1365,19 @@ class Account:
                 "addedAttachments": [None] * len(add_attachments) if add_attachments else None
             }
         }
-        if name: operations["variables"]["input"]["name"] = name
-        if price: operations["variables"]["input"]["price"] = int(price)
-        if description: operations["variables"]["input"]["description"] = description
-        if options: operations["variables"]["input"]["attributes"] = payload_attributes
-        if data_fields: operations["variables"]["input"]["dataFields"] = payload_data_fields
-        if remove_attachments: operations["variables"]["input"]["removedAttachments"] = remove_attachments
+        if name is not None: operations["variables"]["input"]["name"] = name
+        if price is not None: operations["variables"]["input"]["price"] = int(price)
+        if description is not None: operations["variables"]["input"]["description"] = description
+        if options is not None: operations["variables"]["input"]["attributes"] = payload_attributes
+        if data_fields is not None: operations["variables"]["input"]["dataFields"] = payload_data_fields
+        if remove_attachments is not None: operations["variables"]["input"]["removedAttachments"] = remove_attachments
 
         map = {}
         files = {}
-        
+
         for i, att in enumerate(add_attachments or [], start=1):
             filename, file_obj, content_type = self._resolve_image_file(att)
-            map[str(i)] = [f"variables.attachments.{i-1}"]
+            map[str(i)] = [f"variables.addedAttachments.{i-1}"]
             files[str(i)] = (filename, file_obj, content_type)
         
         payload = {

@@ -76,8 +76,24 @@ async def on_unload(ctx):
 - `ctx.config` — настройки текущего аккаунта.
 - `await ctx.send_chat(chat_id, text)` — отправить сообщение в Playerok.
 - `await ctx.notify(text)` — отправить уведомление владельцу в Telegram.
+- `await ctx.get_item(item_id)` — получить полную информацию о лоте.
+- `await ctx.update_item(item_id, name=..., price=..., description=..., add_attachments=..., remove_attachments=...)` — обновить название, цену, описание или фотографии лота.
 - `ctx.external_api` — дополнительный HTTP-клиент, если он настроен.
 - `ctx.telethon` — менеджер пользовательских Telegram-сессий, если он настроен.
+
+## Пример работы с лотами (динамическая цена)
+
+```python
+async def on_schedule(ctx):
+    # Обновить цену и название лота
+    await ctx.update_item(
+        item_id="123456",
+        price=490,
+        name="Супер лот (Скидка!)",
+        description="Новое обновленное описание",
+    )
+    await ctx.notify("Цена лота 123456 обновлена до 490 ₽")
+```
 
 ## Пример HTTP-запроса
 

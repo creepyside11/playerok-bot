@@ -66,3 +66,12 @@ class AIPluginBuilderState(StatesGroup):
 
 class EmeraldPromoState(StatesGroup):
     input_value = State()
+
+
+class ItemEdit(StatesGroup):
+    item_id = State()
+    name = State()
+    price = State()
+    description = State()
+    add_photo = State()
+    replace_photo = State()
