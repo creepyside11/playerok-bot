@@ -287,11 +287,12 @@ class GameCategoryAgreementIconTypes(Enum):
 class GameCategoryOptionTypes(Enum):
     """Типы опции категории."""
 
-    # TODO: Доделать все типы опций категории
     SELECTOR = 0
     """Выбор типа."""
     SWITCH = 1
     """Переключатель."""
+    RANGE = 2
+    """Числовой диапазон."""
 
 
 class GameCategoryDataFieldTypes(Enum):

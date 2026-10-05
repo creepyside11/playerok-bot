@@ -924,10 +924,15 @@ async def item_category(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Ошибка API", show_alert=True)
         await call.message.answer(f"<code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
         return
-    if not values:
-        await call.answer("Нет способов получения", show_alert=True)
-        return
+
     await state.update_data(category_id=category_id, category_name=category_name, obtaining=values)
+
+    if not values:
+        # Для категорий без способов получения (например, "Другое" в Claude / ChatGPT)
+        await call.answer()
+        await _load_category_and_start_options(call, state, obtaining_id=None, obtaining_name="Стандартный")
+        return
+
     await state.set_state(ItemCreate.obtaining)
     b = InlineKeyboardBuilder()
     for i, (_id, name) in enumerate(values):
@@ -942,39 +947,50 @@ async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     idx = int(call.data.split(":", 1)[1])
     obtaining_id, obtaining_name = data["obtaining"][idx]
+    await _load_category_and_start_options(call, state, obtaining_id=obtaining_id, obtaining_name=obtaining_name)
+
+
+async def _load_category_and_start_options(
+    call: CallbackQuery,
+    state: FSMContext,
+    obtaining_id: str | None,
+    obtaining_name: str
+) -> None:
+    data = await state.get_data()
     async with svc().db() as session:
         account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
     try:
         client = await svc().gateway.get_client(account)
         category = await client.call("get_game_category", id=data["category_id"])
-        
+
         # Запрашиваем ВСЕ поля категории (включая логин, пароль, почту, формат выдачи)
         fields = []
-        try:
-            fields_page = await client.call(
-                "get_game_category_data_fields",
-                data["category_id"],
-                obtaining_id,
-                count=50,
-                type=None,
-            )
-            fields = list(getattr(fields_page, "data_fields", []) or [])
-        except Exception:
-            pass
-
-        if not fields:
-            # Fallback: объединяем ITEM_DATA и OBTAINING_DATA
+        if obtaining_id:
             try:
-                p1 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.ITEM_DATA)
-                p2 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.OBTAINING_DATA)
-                seen_fids = set()
-                for f in (getattr(p1, "data_fields", []) or []) + (getattr(p2, "data_fields", []) or []):
-                    fid = str(getattr(f, "id", ""))
-                    if fid and fid not in seen_fids:
-                        seen_fids.add(fid)
-                        fields.append(f)
+                fields_page = await client.call(
+                    "get_game_category_data_fields",
+                    data["category_id"],
+                    obtaining_id,
+                    count=50,
+                    type=None,
+                )
+                fields = list(getattr(fields_page, "data_fields", []) or [])
             except Exception:
                 pass
+
+            if not fields:
+                # Fallback: объединяем ITEM_DATA и OBTAINING_DATA
+                try:
+                    p1 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.ITEM_DATA)
+                    p2 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.OBTAINING_DATA)
+                    seen_fids = set()
+                    for f in (getattr(p1, "data_fields", []) or []) + (getattr(p2, "data_fields", []) or []):
+                        fid = str(getattr(f, "id", ""))
+                        if fid and fid not in seen_fids:
+                            seen_fids.add(fid)
+                            fields.append(f)
+                except Exception:
+                    pass
     except Exception as exc:
         await call.answer("Ошибка API", show_alert=True)
         await call.message.answer(f"<code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
@@ -992,19 +1008,34 @@ async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
         for f in fields
     ]
 
-    # Группируем опции по их полю и названию группы
+    # Группируем опции по их полю и названию группы с сохранением типа (RANGE или SELECTOR)
     groups_dict: dict[str, dict[str, Any]] = {}
     for o in options:
         fld = str(o.field)
         grp = str(o.group or fld)
+        opt_type = getattr(o, "type", None)
+        type_name = getattr(opt_type, "name", str(opt_type or "SELECTOR"))
+        range_limit = getattr(o, "value_range_limit", None)
+        min_val = getattr(range_limit, "min", None) if range_limit else None
+        max_val = getattr(range_limit, "max", None) if range_limit else None
+
         if fld not in groups_dict:
             groups_dict[fld] = {
                 "field": fld,
                 "group_name": grp,
+                "type": type_name,
+                "min": min_val,
+                "max": max_val,
                 "multiple": bool(getattr(o, "multiple", False)),
                 "choices": [],
             }
         groups_dict[fld]["choices"].append((str(o.value), str(o.label)))
+        if min_val is not None:
+            groups_dict[fld]["min"] = min_val
+        if max_val is not None:
+            groups_dict[fld]["max"] = max_val
+        if type_name == "RANGE":
+            groups_dict[fld]["type"] = "RANGE"
 
     option_groups = list(groups_dict.values())
 
@@ -1036,18 +1067,37 @@ async def _show_attribute_group(call_or_msg: Any, state: FSMContext) -> None:
 
     grp = groups[idx]
     group_name = grp["group_name"]
-    choices = grp["choices"]
+    grp_type = grp.get("type", "SELECTOR")
+    choices = grp.get("choices", [])
 
     b = InlineKeyboardBuilder()
-    for i, (_val, label) in enumerate(choices[:30]):
-        b.button(text=clip(label, 36), callback_data=f"itemopt:{idx}:{i}")
-    b.button(text="⏭ Пропустить этот атрибут", callback_data=f"itemopt:{idx}:skip")
-    b.adjust(1)
 
-    prompt = (
-        f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>\n"
-        "Выберите подходящее значение:"
-    )
+    if grp_type == "RANGE":
+        min_v = grp.get("min")
+        max_v = grp.get("max")
+        range_hint = ""
+        if min_v is not None and max_v is not None:
+            range_hint = f" (от {min_v} до {max_v})"
+        elif min_v is not None:
+            range_hint = f" (от {min_v})"
+
+        prompt = (
+            f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>\n\n"
+            f"Введите числовое значение{range_hint} сообщением в чат:\n"
+            f"<i>(Или нажмите кнопку ниже, чтобы пропустить)</i>"
+        )
+        b.button(text="⏭ Пропустить этот параметр", callback_data=f"itemopt:{idx}:skip")
+        b.adjust(1)
+    else:
+        for i, (_val, label) in enumerate(choices[:30]):
+            b.button(text=clip(label, 36), callback_data=f"itemopt:{idx}:{i}")
+        b.button(text="⏭ Пропустить этот атрибут", callback_data=f"itemopt:{idx}:skip")
+        b.adjust(1)
+        prompt = (
+            f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>\n"
+            "Выберите подходящее значение:"
+        )
+
     await state.set_state(ItemCreate.attributes)
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.answer()
@@ -1117,6 +1167,66 @@ async def item_option(call: CallbackQuery, state: FSMContext) -> None:
     else:
         await call.answer()
         await _start_item_fields(call.message, state)
+
+
+@router.message(ItemCreate.attributes)
+async def item_attribute_message(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    groups = data.get("option_groups") or []
+    idx = int(data.get("attribute_group_index", 0))
+
+    if idx >= len(groups):
+        await _start_item_fields(message, state)
+        return
+
+    grp = groups[idx]
+    grp_type = grp.get("type", "SELECTOR")
+    text = (message.text or "").strip()
+
+    if text in {"-", "⏭", "пропустить", "skip"}:
+        next_idx = idx + 1
+        await state.update_data(attribute_group_index=next_idx)
+        if next_idx < len(groups):
+            await _show_attribute_group(message, state)
+        else:
+            await _start_item_fields(message, state)
+        return
+
+    if grp_type == "RANGE":
+        clean_text = text.replace(" ", "").replace("_", "").replace(",", ".")
+        try:
+            val_num = int(float(clean_text))
+        except ValueError:
+            await message.answer("⚠️ Введите целое число (или нажмите «Пропустить»):")
+            return
+
+        min_v = grp.get("min")
+        max_v = grp.get("max")
+        if min_v is not None and val_num < min_v:
+            await message.answer(f"⚠️ Минимальное значение: {min_v}. Введите число не меньше {min_v}:")
+            return
+        if max_v is not None and val_num > max_v:
+            await message.answer(f"⚠️ Максимальное значение: {max_v}. Введите число не больше {max_v}:")
+            return
+
+        attributes = dict(data.get("attributes") or {})
+        attributes[grp["field"]] = val_num
+        next_idx = idx + 1
+        await state.update_data(attributes=attributes, attribute_group_index=next_idx)
+        if next_idx < len(groups):
+            await _show_attribute_group(message, state)
+        else:
+            await _start_item_fields(message, state)
+    else:
+        # Для текстового ввода строковых атрибутов, если введен вручную
+        attributes = dict(data.get("attributes") or {})
+        attributes[grp["field"]] = text
+        next_idx = idx + 1
+        await state.update_data(attributes=attributes, attribute_group_index=next_idx)
+        if next_idx < len(groups):
+            await _show_attribute_group(message, state)
+        else:
+            await _start_item_fields(message, state)
 
 
 @router.message(ItemCreate.data_fields)

@@ -1228,12 +1228,12 @@ class Account:
         return chat_message(r["data"]["createChatMessage"])
  
     def create_item(
-        self, 
-        game_category_id: str, 
-        obtaining_type_id: str, 
-        name: str, 
-        price: int, 
-        description: str, 
+        self,
+        game_category_id: str,
+        obtaining_type_id: str | None,
+        name: str,
+        price: int,
+        description: str,
         options: list[GameCategoryOption] | dict,
         data_fields: list[GameCategoryDataField],
         attachments: list[str | bytes]  # ← было: list[str]

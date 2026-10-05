@@ -190,3 +190,47 @@ def test_create_item_with_credentials_and_multiple_photos():
     assert files["1"][2] == "image/png"
     assert files["2"][2] == "image/jpeg"
 
+
+def test_create_item_without_obtaining_type_and_with_range_attributes():
+    captured_requests = []
+    account = Account.__new__(Account)
+    account.base_url = "https://playerok.com"
+    account.requests_timeout = 10
+    account.user_agent = "TestAgent"
+
+    def mock_request(method, url, headers=None, payload=None, files=None):
+        captured_requests.append({"method": method, "url": url, "payload": payload, "files": files})
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "data": {
+                "createItem": {
+                    "id": "item-without-obt",
+                    "name": "Тестовый товар Другое",
+                    "price": 500,
+                    "status": "EDITING",
+                    "attachments": [],
+                }
+            }
+        }
+        return mock_resp
+
+    account.request = mock_request
+
+    account.create_item(
+        game_category_id="cat-other",
+        obtaining_type_id=None,
+        name="Тестовый товар Другое",
+        price=500,
+        description="Описание",
+        options={"level": 25, "property": 5000000},
+        data_fields=[],
+        attachments=[],
+    )
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    inp = req["payload"]["variables"]["input"]
+    assert inp["obtainingTypeId"] is None
+    assert inp["attributes"] == {"level": 25, "property": 5000000}
+
+
