@@ -1525,11 +1525,13 @@ class Account:
         if obtaining_type_id:
             filter["obtainingTypeId"] = obtaining_type_id
             
+        # Playerok GraphQL rejects first > 24 with FORBIDDEN ("У вас нет доступа на выполнение данной операции")
+        safe_count = min(max(1, count), 24)
         payload = {
             "operationName": "items",
             "variables": json.dumps({
                 "pagination": {
-                    "first": count,
+                    "first": safe_count,
                     "after": after_cursor
                 },
                 "filter": filter,
@@ -1592,12 +1594,13 @@ class Account:
 
         if obtaining_type_id:
             filter["obtainingTypeId"] = obtaining_type_id
-            
+
+        safe_count = min(max(1, count), 24)
         payload = {
             "operationName": "items",
             "variables": json.dumps({
                 "pagination": {
-                    "first": count,
+                    "first": safe_count,
                     "after": after_cursor
                 },
                 "filter": filter

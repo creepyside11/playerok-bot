@@ -49,8 +49,8 @@ async def items_list_view(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer("Загружаю товары…")
     try:
         client = await svc().gateway.get_client(account)
-        # Загружаем товары продавца без фильтрации по статусу
-        res = await client.call("get_my_items", statuses=None, count=60)
+        # Загружаем товары продавца без фильтрации по статусу (макс. 24 на запрос в Playerok API)
+        res = await client.call("get_my_items", statuses=None, count=24)
         all_items = list(getattr(res, "items", []) or [])
     except Exception as exc:
         await edit(

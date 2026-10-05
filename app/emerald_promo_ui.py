@@ -224,7 +224,7 @@ async def emp_lots(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer("Загружаю товары…")
     try:
         client = await svc().gateway.get_client(account)
-        page = await client.call("get_my_items", statuses=None, count=40)
+        page = await client.call("get_my_items", statuses=None, count=24)
         items = list(getattr(page, "items", []) or [])
     except Exception as exc:
         await edit(call, f"❌ Ошибка загрузки товаров: <code>{html.escape(str(exc))[:600]}</code>", back_menu("plugins"))
@@ -277,7 +277,7 @@ async def emp_lot_selected(call: CallbackQuery, state: FSMContext) -> None:
     title = f"Лот {lot_id}"
     try:
         client = await svc().gateway.get_client(account)
-        page = await client.call("get_my_items", statuses=None, count=40)
+        page = await client.call("get_my_items", statuses=None, count=24)
         for it in list(getattr(page, "items", []) or []):
             if str(getattr(it, "id", "")) == lot_id:
                 title = getattr(it, "name", title) or title
