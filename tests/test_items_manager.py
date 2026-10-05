@@ -234,3 +234,33 @@ def test_create_item_without_obtaining_type_and_with_range_attributes():
     assert inp["attributes"] == {"level": 25, "property": 5000000}
 
 
+def test_selector_pagination_logic():
+    # Проверка алгоритма пагинации для селекторов (серверов/атрибутов)
+    page_size = 15
+    choices = [(f"srv_{i}", f"Сервер {i}") for i in range(35)]
+    total_choices = len(choices)
+    total_pages = max(1, (total_choices + page_size - 1) // page_size)
+
+    assert total_pages == 3
+
+    # Страница 0
+    p0 = choices[0 * page_size : 1 * page_size]
+    assert len(p0) == 15
+    assert p0[0] == ("srv_0", "Сервер 0")
+    assert p0[-1] == ("srv_14", "Сервер 14")
+
+    # Страница 1
+    p1 = choices[1 * page_size : 2 * page_size]
+    assert len(p1) == 15
+    assert p1[0] == ("srv_15", "Сервер 15")
+    assert p1[-1] == ("srv_29", "Сервер 29")
+
+    # Страница 2
+    p2 = choices[2 * page_size : 3 * page_size]
+    assert len(p2) == 5
+    assert p2[0] == ("srv_30", "Сервер 30")
+    assert p2[-1] == ("srv_34", "Сервер 34")
+
+
+
+

@@ -1056,7 +1056,10 @@ async def _load_category_and_start_options(
         await _start_item_fields(call.message, state)
 
 
-async def _show_attribute_group(call_or_msg: Any, state: FSMContext) -> None:
+PAGE_SIZE_OPTIONS = 15
+
+
+async def _show_attribute_group(call_or_msg: Any, state: FSMContext, page: int = 0) -> None:
     data = await state.get_data()
     groups = data.get("option_groups") or []
     idx = int(data.get("attribute_group_index", 0))
@@ -1089,12 +1092,33 @@ async def _show_attribute_group(call_or_msg: Any, state: FSMContext) -> None:
         b.button(text="⏭ Пропустить этот параметр", callback_data=f"itemopt:{idx}:skip")
         b.adjust(1)
     else:
-        for i, (_val, label) in enumerate(choices[:30]):
-            b.button(text=clip(label, 36), callback_data=f"itemopt:{idx}:{i}")
-        b.button(text="⏭ Пропустить этот атрибут", callback_data=f"itemopt:{idx}:skip")
+        total_choices = len(choices)
+        total_pages = max(1, (total_choices + PAGE_SIZE_OPTIONS - 1) // PAGE_SIZE_OPTIONS)
+        page = max(0, min(page, total_pages - 1))
+        start_i = page * PAGE_SIZE_OPTIONS
+        end_i = start_i + PAGE_SIZE_OPTIONS
+        page_choices = choices[start_i:end_i]
+
+        for rel_i, (_val, label) in enumerate(page_choices):
+            real_i = start_i + rel_i
+            b.button(text=clip(label, 36), callback_data=f"itemopt:{idx}:{real_i}")
         b.adjust(1)
+
+        # Пагинация для длинных списков серверов / атрибутов
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"itemoptpage:{idx}:{page - 1}"))
+            nav_row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+            if page + 1 < total_pages:
+                nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"itemoptpage:{idx}:{page + 1}"))
+            b.row(*nav_row)
+
+        b.row(InlineKeyboardButton(text="⏭ Пропустить этот атрибут", callback_data=f"itemopt:{idx}:skip"))
+
+        page_info = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
         prompt = (
-            f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>\n"
+            f"⚙️ <b>Параметр {idx + 1}/{len(groups)}: {html.escape(group_name)}</b>{page_info}\n"
             "Выберите подходящее значение:"
         )
 
@@ -1134,6 +1158,18 @@ async def _start_item_fields(target: Message, state: FSMContext) -> None:
     await state.set_state(ItemCreate.data_fields)
     prompt = await _format_field_prompt(fields[0], 1, len(fields))
     await target.answer(prompt, parse_mode="HTML")
+
+
+@router.callback_query(ItemCreate.attributes, F.data.startswith("itemoptpage:"))
+async def item_option_page(call: CallbackQuery, state: FSMContext) -> None:
+    parts = call.data.split(":")
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+        grp_idx = int(parts[1])
+        page = int(parts[2])
+        await state.update_data(attribute_group_index=grp_idx)
+        await _show_attribute_group(call, state, page=page)
+    else:
+        await call.answer()
 
 
 @router.callback_query(ItemCreate.attributes, F.data.startswith("itemopt:"))
