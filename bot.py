@@ -15,6 +15,7 @@ from app.advanced_handlers import configure_advanced
 from app.emerald_promo_ui import router as emerald_promo_router
 from app.items_manager_ui import router as items_manager_router
 from app.telegram_accounts_ui import router as telegram_accounts_router
+from app.bot_store_ui import router as bot_store_router
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
@@ -47,6 +48,7 @@ async def main() -> None:
     dispatcher.include_router(configure_advanced(plugin_manager))
     dispatcher.include_router(emerald_promo_router)
     dispatcher.include_router(telegram_accounts_router)
+    dispatcher.include_router(bot_store_router)
     dispatcher.include_router(items_manager_router)
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))
