@@ -84,6 +84,7 @@ class TelegramAccountsState(StatesGroup):
     add_password = State()
     add_raw_session = State()
     custom_country = State()
+    rule_country = State()
     api_id = State()
     api_hash = State()
 
