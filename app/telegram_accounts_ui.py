@@ -677,11 +677,14 @@ async def tgacc_lots_select(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("tgacc:lot:"))
-async def tgacc_lot_country_choose(call: CallbackQuery) -> None:
+async def tgacc_lot_country_choose(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)
     if not account:
         return
     lot_id = call.data.split(":", 2)[2]
+
+    # Сохраняем выбранный лот в FSM состояние для избежания переполнения callback_data (лимит 64 байта в Telegram)
+    await state.update_data(bind_lot_id=lot_id)
 
     # Получаем название лота
     try:
@@ -691,10 +694,12 @@ async def tgacc_lot_country_choose(call: CallbackQuery) -> None:
     except Exception:
         lot_title = f"Лот #{lot_id}"
 
+    await state.update_data(bind_lot_title=lot_title)
+
     b = InlineKeyboardBuilder()
-    for name, _ in COUNTRY_PRESETS:
-        b.button(text=name, callback_data=f"tgacc:bind:{lot_id}:{name}")
-    b.button(text="🌐 Другая страна", callback_data=f"tgacc:bind:{lot_id}:custom")
+    for idx, (name, _) in enumerate(COUNTRY_PRESETS):
+        b.button(text=name, callback_data=f"tgacc:bind:{idx}")
+    b.button(text="🌐 Другая страна", callback_data="tgacc:bind:custom")
     b.button(text="❌ Отмена", callback_data="tgacc:lots")
     b.adjust(2, 2, 2, 2, 1, 1)
 
@@ -712,23 +717,41 @@ async def tgacc_bind_lot_country(call: CallbackQuery, state: FSMContext) -> None
     account = await require_account(call)
     if not account:
         return
-    parts = call.data.split(":", 3)
-    lot_id = parts[2]
-    country = parts[3]
+    parts = call.data.split(":", 2)
+    choice = parts[2] if len(parts) > 2 else ""
 
-    if country == "custom":
-        await state.update_data(bind_lot_id=lot_id)
+    data = await state.get_data()
+    lot_id = data.get("bind_lot_id")
+
+    if not lot_id:
+        await call.answer("Сессия выбора лота устарела, выберите лот снова.", show_alert=True)
+        await tgacc_lots_select(call)
+        return
+
+    if choice == "custom":
         await state.set_state(TelegramAccountsState.rule_country)
         await call.answer()
-        await edit(call, "🌐 Введите название страны текстом:", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="tgacc:lots")]]))
+        await edit(
+            call,
+            "🌐 Введите название страны текстом:",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="tgacc:lots")]]),
+        )
         return
 
     try:
-        client = await svc().gateway.get_client(account)
-        item = await client.get_item(lot_id)
-        lot_title = getattr(item, "name", f"Лот #{lot_id}")
-    except Exception:
-        lot_title = f"Лот #{lot_id}"
+        idx = int(choice)
+        country = COUNTRY_PRESETS[idx][0]
+    except (ValueError, IndexError):
+        country = choice
+
+    lot_title = data.get("bind_lot_title")
+    if not lot_title:
+        try:
+            client = await svc().gateway.get_client(account)
+            item = await client.get_item(lot_id)
+            lot_title = getattr(item, "name", f"Лот #{lot_id}")
+        except Exception:
+            lot_title = f"Лот #{lot_id}"
 
     async with svc().db() as session:
         existing = await session.scalar(
