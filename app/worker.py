@@ -7,8 +7,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+try:
+    from aiogram import Bot
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+except ImportError:
+    Bot = Any  # type: ignore
+    InlineKeyboardButton = Any  # type: ignore
+    InlineKeyboardMarkup = Any  # type: ignore
+
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -36,6 +42,9 @@ def settings_for(account: PlayerokAccount) -> dict[str, Any]:
     return {
         "notifications": notifications,
         "auto_confirm": bool(raw.get("auto_confirm", False)),
+        "auto_confirm_mode": str(raw.get("auto_confirm_mode", "all")),
+        "auto_confirm_items": list(raw.get("auto_confirm_items") or []),
+        "auto_confirm_categories": list(raw.get("auto_confirm_categories") or []),
     }
 
 
@@ -296,7 +305,29 @@ class WorkerManager:
             return
 
         delivery = await self._delivery(account, client, deal, item_id)
+        
+        # Проверка условий автоподтверждения (все лоты / выбранные лоты / выбранные категории)
+        should_autoconfirm = False
         if cfg["auto_confirm"] and delivery is not False:
+            mode = cfg.get("auto_confirm_mode", "all")
+            if mode == "all":
+                should_autoconfirm = True
+            elif mode == "items":
+                selected_items = set(cfg.get("auto_confirm_items") or [])
+                should_autoconfirm = item_id in selected_items
+            elif mode == "categories":
+                selected_categories = set(cfg.get("auto_confirm_categories") or [])
+                cat_obj = getattr(item, "category", None)
+                cat_id = str(getattr(cat_obj, "id", "") or "")
+                cat_name = str(getattr(cat_obj, "name", "") or "")
+                cat_slug = str(getattr(cat_obj, "slug", "") or "")
+                should_autoconfirm = bool(
+                    (cat_id and cat_id in selected_categories)
+                    or (cat_name and cat_name in selected_categories)
+                    or (cat_slug and cat_slug in selected_categories)
+                )
+
+        if should_autoconfirm:
             action_id = str(deal.id)
             if await claim_event(self.db, account.id, "autoconfirm_action", action_id):
                 try:

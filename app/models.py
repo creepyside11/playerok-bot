@@ -17,6 +17,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "errors": True,
     },
     "auto_confirm": False,
+    "auto_confirm_mode": "all",
+    "auto_confirm_items": [],
+    "auto_confirm_categories": [],
     "ai_builder": {
         "api_base_url": "https://api.anthropic.com",
         "api_key": "",
@@ -29,6 +32,9 @@ def fresh_settings() -> dict[str, Any]:
     return {
         "notifications": dict(DEFAULT_SETTINGS["notifications"]),
         "auto_confirm": False,
+        "auto_confirm_mode": "all",
+        "auto_confirm_items": [],
+        "auto_confirm_categories": [],
         "ai_builder": dict(DEFAULT_SETTINGS["ai_builder"]),
     }
 

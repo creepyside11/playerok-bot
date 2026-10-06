@@ -1632,6 +1632,8 @@ async def plugin_view(call: CallbackQuery) -> None:
     ]
     if plugin.id == "emerald_promo":
         rows.insert(1, [InlineKeyboardButton(text="🎛 Панель Emerald Promo", callback_data="emp:open")])
+    elif plugin.id == "telegram_accounts":
+        rows.insert(1, [InlineKeyboardButton(text="📱 Панель Telegram Accounts", callback_data="tgacc:open")])
     if hasattr(plugin.module, "on_action"):
         rows.append([InlineKeyboardButton(text="🔌 Проверить соединение / Баланс", callback_data=f"plugin_action:test_connection:idx_{idx}")])
     rows.extend([

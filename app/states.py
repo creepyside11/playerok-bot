@@ -75,3 +75,15 @@ class ItemEdit(StatesGroup):
     description = State()
     add_photo = State()
     replace_photo = State()
+
+
+class TelegramAccountsState(StatesGroup):
+    add_country = State()
+    add_phone = State()
+    add_code = State()
+    add_password = State()
+    add_raw_session = State()
+    custom_country = State()
+    api_id = State()
+    api_hash = State()
+

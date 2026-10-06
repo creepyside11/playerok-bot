@@ -100,6 +100,9 @@ def settings(account: PlayerokAccount) -> dict[str, Any]:
     result = fresh_settings()
     raw = account.settings or {}
     result["auto_confirm"] = bool(raw.get("auto_confirm", False))
+    result["auto_confirm_mode"] = str(raw.get("auto_confirm_mode", "all"))
+    result["auto_confirm_items"] = list(raw.get("auto_confirm_items") or [])
+    result["auto_confirm_categories"] = list(raw.get("auto_confirm_categories") or [])
     result["notifications"].update(raw.get("notifications") or {})
     return result
 
@@ -532,19 +535,51 @@ async def notify_toggle(call: CallbackQuery) -> None:
 
 
 async def render_autoconfirm(call: CallbackQuery, account: PlayerokAccount) -> None:
-    enabled = settings(account)["auto_confirm"]
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    cfg = settings(account)
+    enabled = cfg["auto_confirm"]
+    mode = cfg.get("auto_confirm_mode", "all")
+    selected_items = cfg.get("auto_confirm_items") or []
+    selected_categories = cfg.get("auto_confirm_categories") or []
+
+    mode_names = {
+        "all": "🌐 Все лоты",
+        "items": f"🎯 Выбранные лоты ({len(selected_items)})",
+        "categories": f"🗂 По категориям ({len(selected_categories)})",
+    }
+    mode_label = mode_names.get(mode, "🌐 Все лоты")
+
+    rows = [
         [InlineKeyboardButton(
             text="✅ Включено" if enabled else "❌ Выключено",
             callback_data="autoconfirm:toggle",
         )],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
-    ])
+        [
+            InlineKeyboardButton(text="🌐 Все", callback_data="autoconfirm:set_mode:all"),
+            InlineKeyboardButton(text="🎯 По лотам", callback_data="autoconfirm:set_mode:items"),
+            InlineKeyboardButton(text="🗂 Категории", callback_data="autoconfirm:set_mode:categories"),
+        ],
+    ]
+
+    if mode == "items":
+        rows.append([InlineKeyboardButton(text=f"📦 Выбрать лоты ({len(selected_items)} выбрано)", callback_data="autoconfirm:items:0")])
+    elif mode == "categories":
+        rows.append([InlineKeyboardButton(text=f"🗂 Выбрать категории ({len(selected_categories)} выбрано)", callback_data="autoconfirm:categories")])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    desc_mode = {
+        "all": "Автоматически подтверждаются <b>все</b> оплаченные лоты.",
+        "items": f"Автоматически подтверждаются <b>только выбранные лоты</b> ({len(selected_items)} шт.). Остальные не подтверждаются автоматически.",
+        "categories": f"Автоматически подтверждаются <b>только выбранные категории</b> ({len(selected_categories)} шт.). Остальные не подтверждаются автоматически.",
+    }.get(mode, "")
+
     await edit(
         call,
-        "✅ <b>Автоподтверждение</b>\n\n"
-        "Новые продажи PAID/PENDING автоматически переводятся в SENT. "
-        "При пустом складе автовыдачи заказ не подтверждается.",
+        "✅ <b>Автоподтверждение сделок</b>\n\n"
+        "Переводит новые оплаченные заказы (PAID/PENDING) в статус SENT.\n\n"
+        f"Текущий режим: <b>{html.escape(mode_label)}</b>\n"
+        f"ℹ️ {desc_mode}",
         markup,
     )
 
@@ -572,6 +607,290 @@ async def autoconfirm_toggle(call: CallbackQuery) -> None:
         account.settings = cfg
     await call.answer("Сохранено")
     await render_autoconfirm(call, account)
+
+
+@router.callback_query(F.data.startswith("autoconfirm:set_mode:"))
+async def autoconfirm_set_mode(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    new_mode = call.data.split(":", 2)[2]
+    if new_mode not in ("all", "items", "categories"):
+        return
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cfg["auto_confirm_mode"] = new_mode
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+    await call.answer(f"Режим переключен: {new_mode}")
+    await render_autoconfirm(call, account)
+
+
+@router.callback_query(F.data.startswith("autoconfirm:items:"))
+async def autoconfirm_items_view(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+
+    parts = call.data.split(":")
+    page_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+
+    cfg = settings(account)
+    selected_items = set(cfg.get("auto_confirm_items") or [])
+
+    try:
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        all_items = list(getattr(res, "items", []) or [])
+    except Exception as exc:
+        await call.answer(f"Ошибка загрузки: {str(exc)[:100]}", show_alert=True)
+        return
+
+    page_size = 6
+    total_pages = max(1, (len(all_items) + page_size - 1) // page_size)
+    page_idx = max(0, min(page_idx, total_pages - 1))
+    page_items = all_items[page_idx * page_size : (page_idx + 1) * page_size]
+
+    b = InlineKeyboardBuilder()
+    for item in page_items:
+        iid = str(item.id)
+        is_sel = iid in selected_items
+        icon = "✅ " if is_sel else "▫️ "
+        b.button(
+            text=f"{icon}{clip(item.name, 22)}",
+            callback_data=f"autoconfirm:itoggle:{iid}:{page_idx}",
+        )
+    b.adjust(1)
+
+    nav = []
+    if page_idx > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"autoconfirm:items:{page_idx - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page_idx + 1}/{total_pages}", callback_data="noop"))
+    if page_idx < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"autoconfirm:items:{page_idx + 1}"))
+    if nav:
+        b.row(*nav)
+
+    b.row(
+        InlineKeyboardButton(text="✅ Выбрать все", callback_data="autoconfirm:items_all"),
+        InlineKeyboardButton(text="❌ Сбросить", callback_data="autoconfirm:items_clear"),
+    )
+    b.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:autoconfirm"))
+
+    await call.answer()
+    await edit(
+        call,
+        "🎯 <b>Выбор лотов для автовыполнения</b>\n\n"
+        "Отметьте товары, которые бот должен подтверждать автоматически.\n"
+        "<i>Невыбранные лоты (например, Telegram) подтверждаться не будут!</i>",
+        b.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("autoconfirm:itoggle:"))
+async def autoconfirm_item_toggle(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    parts = call.data.split(":")
+    item_id = parts[2]
+    page_idx = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        items_list = list(cfg.get("auto_confirm_items") or [])
+        if item_id in items_list:
+            items_list.remove(item_id)
+        else:
+            items_list.append(item_id)
+        cfg["auto_confirm_items"] = items_list
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Сохранено")
+    call.data = f"autoconfirm:items:{page_idx}"
+    await autoconfirm_items_view(call)
+
+
+@router.callback_query(F.data == "autoconfirm:items_all")
+async def autoconfirm_items_select_all(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    try:
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        all_items = list(getattr(res, "items", []) or [])
+    except Exception as exc:
+        await call.answer(f"Ошибка: {str(exc)[:100]}", show_alert=True)
+        return
+
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cfg["auto_confirm_items"] = [str(i.id) for i in all_items]
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Выбраны все лоты")
+    call.data = "autoconfirm:items:0"
+    await autoconfirm_items_view(call)
+
+
+@router.callback_query(F.data == "autoconfirm:items_clear")
+async def autoconfirm_items_clear(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cfg["auto_confirm_items"] = []
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Список очищен")
+    call.data = "autoconfirm:items:0"
+    await autoconfirm_items_view(call)
+
+
+@router.callback_query(F.data == "autoconfirm:categories")
+async def autoconfirm_categories_view(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+
+    cfg = settings(account)
+    selected_cats = set(cfg.get("auto_confirm_categories") or [])
+
+    try:
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        all_items = list(getattr(res, "items", []) or [])
+    except Exception as exc:
+        await call.answer(f"Ошибка загрузки: {str(exc)[:100]}", show_alert=True)
+        return
+
+    # Извлекаем категории, которые выставлены прямо сейчас
+    categories_map: dict[str, str] = {}
+    for it in all_items:
+        cat = getattr(it, "category", None)
+        if cat:
+            cid = str(getattr(cat, "id", "") or "")
+            cname = str(getattr(cat, "name", "") or "")
+            if cid and cname:
+                categories_map[cid] = cname
+
+    if not categories_map:
+        await call.answer("У вас нет активных категорий", show_alert=True)
+        await render_autoconfirm(call, account)
+        return
+
+    b = InlineKeyboardBuilder()
+    for cid, cname in categories_map.items():
+        is_sel = cid in selected_cats or cname in selected_cats
+        icon = "✅ " if is_sel else "▫️ "
+        b.button(
+            text=f"{icon}{clip(cname, 24)}",
+            callback_data=f"autoconfirm:ctoggle:{cid}",
+        )
+    b.adjust(1)
+
+    b.row(
+        InlineKeyboardButton(text="✅ Выбрать все", callback_data="autoconfirm:cats_all"),
+        InlineKeyboardButton(text="❌ Сбросить", callback_data="autoconfirm:cats_clear"),
+    )
+    b.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:autoconfirm"))
+
+    await call.answer()
+    await edit(
+        call,
+        "🗂 <b>Категории для автовыполнения</b>\n\n"
+        "Выберите категории из тех, которые выставлены у вас прямо сейчас:\n"
+        "<i>Остальные невыбранные категории автоматически выполняться не будут.</i>",
+        b.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("autoconfirm:ctoggle:"))
+async def autoconfirm_category_toggle(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    cat_id = call.data.split(":", 2)[2]
+
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cats_list = list(cfg.get("auto_confirm_categories") or [])
+        if cat_id in cats_list:
+            cats_list.remove(cat_id)
+        else:
+            cats_list.append(cat_id)
+        cfg["auto_confirm_categories"] = cats_list
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Сохранено")
+    await autoconfirm_categories_view(call)
+
+
+@router.callback_query(F.data == "autoconfirm:cats_all")
+async def autoconfirm_cats_all(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    try:
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        all_items = list(getattr(res, "items", []) or [])
+    except Exception as exc:
+        await call.answer(f"Ошибка: {str(exc)[:100]}", show_alert=True)
+        return
+
+    cats = []
+    for it in all_items:
+        cat = getattr(it, "category", None)
+        if cat:
+            cid = str(getattr(cat, "id", "") or "")
+            if cid and cid not in cats:
+                cats.append(cid)
+
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cfg["auto_confirm_categories"] = cats
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Выбраны все категории")
+    await autoconfirm_categories_view(call)
+
+
+@router.callback_query(F.data == "autoconfirm:cats_clear")
+async def autoconfirm_cats_clear(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    async with svc().db() as session:
+        row = await session.get(PlayerokAccount, account.id)
+        cfg = settings(row)
+        cfg["auto_confirm_categories"] = []
+        row.settings = copy.deepcopy(cfg)
+        await session.commit()
+        account.settings = cfg
+
+    await call.answer("Список очищен")
+    await autoconfirm_categories_view(call)
 
 
 async def show_autoreply(call: CallbackQuery) -> None:
