@@ -120,7 +120,7 @@ async def botstore_set_key_start(call: CallbackQuery, state: FSMContext) -> None
 async def botstore_set_key_save(message: Message, state: FSMContext) -> None:
     key_text = (message.text or "").strip()
     if not key_text:
-        await message.reply("❌ Ключ не может быть пустым.")
+        await message.answer("❌ Ключ не может быть пустым.", parse_mode="HTML")
         return
 
     account = await active_account(message.from_user.id)
@@ -140,8 +140,9 @@ async def botstore_set_key_save(message: Message, state: FSMContext) -> None:
         await session.commit()
 
     await state.clear()
-    await message.reply(
+    await message.answer(
         "✅ <b>API Key успешно сохранен и зашифрован!</b>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню плагина", callback_data="botstore:open")]]
         ),
@@ -168,7 +169,7 @@ async def botstore_set_url_start(call: CallbackQuery, state: FSMContext) -> None
 async def botstore_set_url_save(message: Message, state: FSMContext) -> None:
     url_text = (message.text or "").strip().rstrip("/")
     if not url_text.startswith("http"):
-        await message.reply("❌ URL должен начинаться с http:// или https://")
+        await message.answer("❌ URL должен начинаться с http:// или https://", parse_mode="HTML")
         return
 
     account = await active_account(message.from_user.id)
@@ -187,8 +188,9 @@ async def botstore_set_url_save(message: Message, state: FSMContext) -> None:
         await session.commit()
 
     await state.clear()
-    await message.reply(
+    await message.answer(
         f"✅ <b>API URL обновлен на:</b> <code>{html.escape(url_text)}</code>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню плагина", callback_data="botstore:open")]]
         ),
@@ -216,18 +218,23 @@ async def botstore_test_api(call: CallbackQuery) -> None:
             if resp.status_code == 200:
                 data = resp.json()
                 email = data.get("user", {}).get("email", "unknown")
-                await call.message.reply(
+                await call.message.answer(
                     f"✅ <b>Связь с API хостинга успешна!</b>\n\n"
                     f"🌐 Сервер: <code>{html.escape(api_url)}</code>\n"
                     f"👤 Аккаунт: <code>{html.escape(email)}</code>\n"
-                    f"🔑 Ключ: {html.escape(data.get('api_key', {}).get('name', 'ok'))}"
+                    f"🔑 Ключ: {html.escape(data.get('api_key', {}).get('name', 'ok'))}",
+                    parse_mode="HTML",
                 )
             else:
-                await call.message.reply(
-                    f"⚠️ Ошибка API (HTTP {resp.status_code}):\n<code>{html.escape(resp.text[:300])}</code>"
+                await call.message.answer(
+                    f"⚠️ Ошибка API (HTTP {resp.status_code}):\n<code>{html.escape(resp.text[:300])}</code>",
+                    parse_mode="HTML",
                 )
     except Exception as exc:
-        await call.message.reply(f"❌ Не удалось подключиться к API:\n<code>{html.escape(str(exc))}</code>")
+        await call.message.answer(
+            f"❌ Не удалось подключиться к API:\n<code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+        )
 
 
 # --- Управление привязкой лотов ---
@@ -323,17 +330,19 @@ async def botstore_rules_add_start(call: CallbackQuery, state: FSMContext) -> No
 
     await call.answer("Загружаем список лотов из Playerok...")
     try:
-        items = await svc().gateway.list_user_items(account)
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        items = list(getattr(res, "items", []) or [])
     except Exception as exc:
-        await call.message.reply(f"❌ Ошибка загрузки лотов Playerok: {exc}")
+        await edit(call, f"❌ <b>Ошибка загрузки лотов Playerok:</b>\n<code>{html.escape(str(exc))}</code>", back_menu("botstore:open"))
         return
 
     if not items:
-        await call.message.reply("❌ В вашем профиле Playerok не найдено активных лотов.")
+        await edit(call, "❌ <b>В вашем профиле Playerok не найдено активных лотов.</b>", back_menu("botstore:open"))
         return
 
     builder = InlineKeyboardBuilder()
-    for it in items[:40]:
+    for it in items[:24]:
         item_id = str(it.id)
         title = clip(str(it.name or item_id), 30)
         builder.row(InlineKeyboardButton(text=f"📦 {title}", callback_data=f"botstore:choose_item:{item_id}"))
@@ -355,9 +364,9 @@ async def botstore_rules_choose_item(call: CallbackQuery, state: FSMContext) -> 
 
     # Запрашиваем информацию о товаре
     try:
-        items = await svc().gateway.list_user_items(account)
-        found = next((i for i in items if str(i.id) == lot_id), None)
-        lot_title = str(found.name if found else f"Лот #{lot_id}")
+        client = await svc().gateway.get_client(account)
+        item = await client.get_item(lot_id)
+        lot_title = getattr(item, "name", f"Лот #{lot_id}")
     except Exception:
         lot_title = f"Лот #{lot_id}"
 

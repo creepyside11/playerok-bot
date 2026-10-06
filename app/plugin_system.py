@@ -60,11 +60,19 @@ class PluginContext:
         return await self.client.send_message(str(chat_id), str(text), mark_chat_as_read=True)
 
     async def notify(self, text: str, reply_markup: Any = None) -> Any:
-        return await self.bot.send_message(
-            self.account.tg_user_id,
-            str(text),
-            reply_markup=reply_markup,
-        )
+        try:
+            return await self.bot.send_message(
+                self.account.tg_user_id,
+                str(text),
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            return await self.bot.send_message(
+                self.account.tg_user_id,
+                str(text),
+                reply_markup=reply_markup,
+            )
 
     async def get_item(self, item_id: str) -> Any:
         """Получить полную информацию о товаре Playerok."""

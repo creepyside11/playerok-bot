@@ -295,6 +295,6 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
 async def complete_deal_in_playerok(ctx: Any, deal_id: str) -> None:
     """Подтверждение выполнения сделки продавцом."""
     try:
-        await ctx.gateway.set_deal_status(ctx.account, deal_id, ItemDealStatuses.SENT)
+        await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
     except Exception as e:
         logger.warning("Could not set deal status to SENT: %s", e)
