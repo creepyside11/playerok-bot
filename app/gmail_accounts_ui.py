@@ -597,15 +597,10 @@ async def gmail_choose_lot(call: CallbackQuery) -> None:
     if not account:
         return
 
-    client = svc().client(account.id)
     try:
-        user_info = await asyncio.to_thread(client.get_user)
-        user_id = user_info.id if hasattr(user_info, "id") else None
-        if not user_id:
-            await call.answer("Не удалось получить профиль Playerok", show_alert=True)
-            return
-        items_res = await asyncio.to_thread(client.get_user_items, user_id)
-        items = getattr(items_res, "items", []) or []
+        client = await svc().gateway.get_client(account)
+        res = await client.call("get_my_items", statuses=None, count=24)
+        items = list(getattr(res, "items", []) or [])
     except Exception as exc:
         logger.warning("Ошибка получения лотов Playerok: %s", exc)
         await call.answer(f"Ошибка загрузки лотов: {exc}", show_alert=True)
@@ -638,10 +633,10 @@ async def gmail_bind_lot_confirm(call: CallbackQuery) -> None:
         return
 
     lot_id = call.data.rsplit(":", 1)[-1]
-    client = svc().client(account.id)
     try:
-        item = await asyncio.to_thread(client.get_item, lot_id)
-        lot_title = item.name if hasattr(item, "name") else f"Лот {lot_id}"
+        client = await svc().gateway.get_client(account)
+        item = await client.get_item(lot_id)
+        lot_title = getattr(item, "name", f"Лот {lot_id}")
     except Exception:
         lot_title = f"Лот {lot_id}"
 
