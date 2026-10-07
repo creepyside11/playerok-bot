@@ -40,13 +40,24 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     account = ctx.account
     item = getattr(deal, "item", None)
     item_id = str(getattr(item, "id", "") or "")
-    if not item_id:
-        return
-
     deal_id = str(getattr(deal, "id", "") or "")
     chat = getattr(deal, "chat", None)
     chat_id = str(getattr(chat, "id", "") or "")
-    if not deal_id or not chat_id:
+
+    if (not chat_id or not item_id) and deal_id:
+        try:
+            full_deal = await ctx.get_deal(deal_id)
+            if full_deal:
+                if not item_id and getattr(full_deal, "item", None):
+                    item = full_deal.item
+                    item_id = str(getattr(item, "id", "") or "")
+                if not chat_id and getattr(full_deal, "chat", None):
+                    chat = full_deal.chat
+                    chat_id = str(getattr(chat, "id", "") or "")
+        except Exception as exc:
+            logger.debug("on_deal get_deal fallback error: %s", exc)
+
+    if not item_id or not deal_id or not chat_id:
         return
 
     async with ctx.db() as session:

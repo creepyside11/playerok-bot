@@ -194,7 +194,7 @@ class WorkerManager:
             return
 
         for deal in reversed(deals):
-            await self._deal(account, client, deal)
+            await self._deal(account, client, deal, chats)
         for chat in reversed(chats):
             await self._chat(account, client, chat)
         for review in reversed(reviews):
@@ -230,7 +230,7 @@ class WorkerManager:
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
             )
 
-    async def _deal(self, account: PlayerokAccount, client: Any, deal: Any) -> None:
+    async def _deal(self, account: PlayerokAccount, client: Any, deal: Any, chats: list[Any] | None = None) -> None:
         cfg = settings_for(account)
         status = getattr(deal, "status", None)
         status_name = getattr(status, "name", "UNKNOWN")
@@ -243,8 +243,39 @@ class WorkerManager:
         buyer = getattr(deal, "user", None)
         chat = getattr(deal, "chat", None)
         chat_id = getattr(chat, "id", None)
-        item_name = getattr(item, "name", None) or "Товар"
         item_id = str(getattr(item, "id", "") or "")
+
+        # Гарантируем заполнение chat_id и item_id, если get_deals вернул неполный объект
+        if not chat_id and chats:
+            for c in chats:
+                for d in getattr(c, "deals", []) or []:
+                    if str(getattr(d, "id", "")) == str(deal.id):
+                        chat = c
+                        chat_id = getattr(c, "id", None)
+                        deal.chat = c
+                        break
+                if chat_id:
+                    break
+
+        if (not chat_id or not item_id) and hasattr(client, "get_deal"):
+            try:
+                full_deal = await client.get_deal(deal.id)
+                if full_deal:
+                    if getattr(full_deal, "chat", None) and not chat_id:
+                        chat = full_deal.chat
+                        chat_id = getattr(chat, "id", None)
+                        deal.chat = chat
+                    if getattr(full_deal, "item", None) and not item_id:
+                        item = full_deal.item
+                        deal.item = item
+                        item_id = str(getattr(item, "id", "") or "")
+                    if getattr(full_deal, "user", None) and not buyer:
+                        buyer = full_deal.user
+                        deal.user = buyer
+            except Exception as exc:
+                logger.debug("Failed to fetch full deal %s: %s", deal.id, exc)
+
+        item_name = getattr(item, "name", None) or "Товар"
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)
 

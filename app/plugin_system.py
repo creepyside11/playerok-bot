@@ -78,6 +78,12 @@ class PluginContext:
         """Получить полную информацию о товаре Playerok."""
         return await self.client.get_item(item_id)
 
+    async def get_deal(self, deal_id: str) -> Any:
+        """Получить полную информацию о сделке Playerok."""
+        if hasattr(self.client, "get_deal"):
+            return await self.client.get_deal(deal_id)
+        return await self.client.call("get_deal", deal_id=deal_id)
+
     async def update_item(
         self,
         item_id: str,
@@ -318,6 +324,7 @@ class PluginManager:
     async def _dispatch(self, hook_name: str, account: PlayerokAccount, client: Any, bot: Any, *args: Any) -> None:
         for plugin in self.ordered():
             hook = getattr(plugin.module, hook_name, None)
+            deal_fallback = False
             # Also check alternative names from contract:
             if not hook and hook_name == "on_deal_changed":
                 hook = getattr(plugin.module, "BIND_TO_DEAL_CHANGED", None)
@@ -325,6 +332,14 @@ class PluginManager:
                     hook = hook[0]
                 elif not callable(hook):
                     hook = None
+                # If plugin has on_deal but not on_deal_changed, fallback for active/paid deals
+                if not hook and hasattr(plugin.module, "on_deal"):
+                    deal_obj = args[0] if args else None
+                    deal_status = getattr(deal_obj, "status", None)
+                    status_name = getattr(deal_status, "name", "")
+                    if status_name in ("PAID", "PENDING"):
+                        hook = plugin.module.on_deal
+                        deal_fallback = True
             elif not hook and hook_name == "on_review":
                 hook = getattr(plugin.module, "BIND_TO_NEW_REVIEW", None)
                 if isinstance(hook, list) and hook:
@@ -338,9 +353,10 @@ class PluginManager:
                 continue
             ctx = PluginContext(account, client, bot, self.db, config, self.telethon, self.external_api)
             try:
+                call_args = (ctx, args[0]) if deal_fallback else (ctx, *args)
                 if inspect.iscoroutinefunction(hook):
-                    await hook(ctx, *args)
+                    await hook(*call_args)
                 else:
-                    await asyncio.to_thread(hook, ctx, *args)
+                    await asyncio.to_thread(hook, *call_args)
             except Exception:
                 logger.exception("Plugin %s failed", plugin.id)

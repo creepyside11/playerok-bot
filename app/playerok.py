@@ -165,6 +165,9 @@ class PlayerokSession:
     async def get_deals(self, *args: Any, **kwargs: Any) -> Any:
         return await self.call("get_deals", *args, **kwargs)
 
+    async def get_deal(self, deal_id: str) -> Any:
+        return await self.call("get_deal", deal_id=deal_id)
+
     async def get_chats(self, *args: Any, **kwargs: Any) -> Any:
         return await self.call("get_chats", *args, **kwargs)
 
