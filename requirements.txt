@@ -22,3 +22,6 @@ certifi>=2024.8.30
 # Telegram MTProto / Telethon
 telethon>=1.36.0
 
+# 2FA TOTP (Google Authenticator)
+pyotp>=2.9.0
+

@@ -88,3 +88,11 @@ class TelegramAccountsState(StatesGroup):
     api_id = State()
     api_hash = State()
 
+
+class GmailSellerState(StatesGroup):
+    add_email = State()
+    add_password = State()
+    add_totp = State()
+    bulk_add = State()
+    generate_totp = State()
+
