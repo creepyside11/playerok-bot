@@ -1,13 +1,27 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import os
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+DEFAULT_WEBAPP_URL = "https://bot-1789913252-9852-dontmealertll.bothost.tech/"
 
-def main_menu() -> InlineKeyboardMarkup:
+
+def get_webapp_url() -> str:
+    return os.getenv("WEBAPP_URL", DEFAULT_WEBAPP_URL).strip() or DEFAULT_WEBAPP_URL
+
+
+def main_menu(webapp_url: str | None = None) -> InlineKeyboardMarkup:
+    url = (webapp_url or get_webapp_url()).strip()
     b = InlineKeyboardBuilder()
+
+    # Mini App WebApp Button in main menu
+    if url.startswith("https://"):
+        b.button(text="🌐 Открыть Mini App", web_app=WebAppInfo(url=url))
+    else:
+        b.button(text="🌐 Веб-панель", callback_data="menu:web")
+
     for text, data in [
-        ("🌐 Веб-панель", "menu:web"),
         ("👤 Профиль", "menu:profile"),
         ("💰 Баланс", "menu:balance"),
         ("💬 Чаты", "menu:chats"),

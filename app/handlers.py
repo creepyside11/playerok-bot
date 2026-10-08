@@ -12,7 +12,7 @@ from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -180,16 +180,21 @@ async def web_credentials_menu(call: CallbackQuery) -> None:
             login = db_user.web_login
             pwd_text = "•••••••• (уже сгенерирован)"
 
+    url = os.getenv("WEBAPP_URL", "https://bot-1789913252-9852-dontmealertll.bothost.tech/").strip()
     b = InlineKeyboardBuilder()
+    if url.startswith("https://"):
+        b.button(text="🚀 Запустить Mini App", web_app=WebAppInfo(url=url))
+        b.button(text="🔗 Открыть в браузере", url=url)
     b.button(text="🔄 Сгенерировать новый пароль", callback_data="web:reset_password")
     b.button(text="⬅️ Назад", callback_data="menu:accounts")
     b.adjust(1)
 
     text = (
         "🌐 <b>Доступ к Веб-панели управления</b>\n\n"
+        f"🔗 Ссылка: <code>{html.escape(url)}</code>\n"
         f"👤 Логин: <code>{html.escape(login)}</code>\n"
         f"🔑 Пароль: {pwd_text}\n\n"
-        "<i>Используйте эти данные для входа в веб-версию Playerok BOT. Все настройки синхронизируются в реальном времени через общую базу данных.</i>"
+        "<i>Вы можете запустить приложение прямо внутри Telegram по кнопке выше или открыть ссылку в любом браузере.</i>"
     )
     await edit(call, text, b.as_markup())
 
