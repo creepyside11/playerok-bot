@@ -473,12 +473,13 @@ async def gmail_totp_show_stock(call: CallbackQuery) -> None:
 # --- Склад аккаунтов (Список, просмотр, удаление) ---
 
 @router.callback_query(F.data.startswith("gmail:stock:list:"))
-async def gmail_stock_list(call: CallbackQuery) -> None:
+async def gmail_stock_list(call: CallbackQuery, page: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
 
-    page = int(call.data.rsplit(":", 1)[-1])
+    if page is None:
+        page = int(call.data.rsplit(":", 1)[-1])
     per_page = 8
 
     async with svc().db() as session:
@@ -585,8 +586,7 @@ async def gmail_stock_delete(call: CallbackQuery) -> None:
         await session.commit()
 
     await call.answer("Аккаунт удален")
-    call.data = f"gmail:stock:list:{page}"
-    await gmail_stock_list(call)
+    await gmail_stock_list(call, page=page)
 
 
 # --- Привязка лотов Playerok к автовыдаче ---

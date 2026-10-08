@@ -176,8 +176,10 @@ class WorkerManager:
                 status = getattr(getattr(deal, "status", None), "name", "UNKNOWN")
                 await claim_event(self.db, account.id, "deal", deal.id)
                 await claim_event(self.db, account.id, "deal_status", f"{deal.id}:{status}")
-                await claim_event(self.db, account.id, "delivery_action", deal.id)
-                await claim_event(self.db, account.id, "autoconfirm_action", deal.id)
+                # Для завершённых/отменённых сделок помечаем delivery/autoconfirm как обработанные
+                if status not in {"PAID", "PENDING"}:
+                    await claim_event(self.db, account.id, "delivery_action", deal.id)
+                    await claim_event(self.db, account.id, "autoconfirm_action", deal.id)
             for chat in chats:
                 message = getattr(chat, "last_message", None)
                 if message:
@@ -279,7 +281,7 @@ class WorkerManager:
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)
 
-        if new_deal and self.plugins:
+        if (new_deal or status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}) and self.plugins:
             await self.plugins.dispatch_deal(account, client, self.bot, deal)
         if new_status and not new_deal and self.plugins:
             await self.plugins.dispatch_deal_changed(account, client, self.bot, deal, None)

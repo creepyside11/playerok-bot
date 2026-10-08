@@ -879,7 +879,7 @@ async def show_deals_menu(call: CallbackQuery) -> None:
     await call.answer("Загружаю сделки…")
     try:
         client = await svc().gateway.get_client(account)
-        page = await asyncio.to_thread(client.get_deals, direction=ItemDealDirections.OUT, count=24)
+        page = await client.get_deals(direction=ItemDealDirections.OUT, count=24)
         deals = list(getattr(page, "deals", []) or [])
     except Exception as exc:
         await edit(call, f"❌ Ошибка загрузки сделок: <code>{html.escape(str(exc))[:600]}</code>", back_menu("main"))
@@ -928,7 +928,7 @@ async def deal_view(call: CallbackQuery) -> None:
     await call.answer("Загружаю…")
     try:
         client = await svc().gateway.get_client(account)
-        deal = await asyncio.to_thread(client.get_deal, deal_id)
+        deal = await client.get_deal(deal_id)
     except Exception as exc:
         await edit(call, f"❌ Сделка недоступна: <code>{html.escape(str(exc))[:600]}</code>", back_menu("deals"))
         return
@@ -996,7 +996,7 @@ async def deal_sent_do(call: CallbackQuery) -> None:
     try:
         from playerokapi.enums import ItemDealStatuses
         client = await svc().gateway.get_client(account)
-        await asyncio.to_thread(client.update_deal, deal_id, ItemDealStatuses.SENT)
+        await client.update_deal(deal_id, ItemDealStatuses.SENT)
     except Exception as exc:
         await call.answer(f"❌ Не удалось: {str(exc)[:120]}", show_alert=True)
         return
@@ -1004,7 +1004,7 @@ async def deal_sent_do(call: CallbackQuery) -> None:
     await call.answer("✅ Сделка отмечена выполненной", show_alert=True)
     # Refresh deal view
     try:
-        deal = await asyncio.to_thread(client.get_deal, deal_id)
+        deal = await client.get_deal(deal_id)
         item = getattr(deal, "item", None)
         buyer = getattr(deal, "user", None)
         chat = getattr(deal, "chat", None)

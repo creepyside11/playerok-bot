@@ -540,11 +540,12 @@ async def tgacc_raw_session_entered(message: Message, state: FSMContext) -> None
 # --- Список номеров на складе ---
 
 @router.callback_query(F.data.startswith("tgacc:stock:list:"))
-async def tgacc_stock_list_view(call: CallbackQuery) -> None:
+async def tgacc_stock_list_view(call: CallbackQuery, page: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
-    page = int(call.data.split(":")[-1])
+    if page is None:
+        page = int(call.data.split(":")[-1])
 
     async with svc().db() as session:
         total = await session.scalar(
@@ -608,8 +609,7 @@ async def tgacc_stock_delete(call: CallbackQuery) -> None:
             await session.commit()
 
     await call.answer("Удалено")
-    call.data = f"tgacc:stock:list:{page}"
-    await tgacc_stock_list_view(call)
+    await tgacc_stock_list_view(call, page=page)
 
 
 @router.callback_query(F.data.startswith("tgacc:stock:view:"))
@@ -899,11 +899,12 @@ async def tgacc_rule_delete(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("tgacc:rule:view:"))
-async def tgacc_rule_view(call: CallbackQuery) -> None:
+async def tgacc_rule_view(call: CallbackQuery, rule_id: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
-    rule_id = int(call.data.split(":")[-1])
+    if rule_id is None:
+        rule_id = int(call.data.split(":")[-1])
     async with svc().db() as session:
         r = await session.get(TelegramAccountLotRule, rule_id)
         if not r or r.account_id != account.id:
@@ -940,8 +941,7 @@ async def tgacc_rule_toggle(call: CallbackQuery) -> None:
             r.enabled = not r.enabled
             await session.commit()
     await call.answer("Сохранено")
-    call.data = f"tgacc:rule:view:{rule_id}"
-    await tgacc_rule_view(call)
+    await tgacc_rule_view(call, rule_id=rule_id)
 
 
 # --- Настройки Telethon API ---

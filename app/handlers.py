@@ -629,13 +629,14 @@ async def autoconfirm_set_mode(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("autoconfirm:items:"))
-async def autoconfirm_items_view(call: CallbackQuery) -> None:
+async def autoconfirm_items_view(call: CallbackQuery, page_idx: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
 
-    parts = call.data.split(":")
-    page_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    if page_idx is None:
+        parts = call.data.split(":")
+        page_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
     cfg = settings(account)
     selected_items = set(cfg.get("auto_confirm_items") or [])
@@ -713,8 +714,7 @@ async def autoconfirm_item_toggle(call: CallbackQuery) -> None:
         account.settings = cfg
 
     await call.answer("Сохранено")
-    call.data = f"autoconfirm:items:{page_idx}"
-    await autoconfirm_items_view(call)
+    await autoconfirm_items_view(call, page_idx=page_idx)
 
 
 @router.callback_query(F.data == "autoconfirm:items_all")
@@ -739,8 +739,7 @@ async def autoconfirm_items_select_all(call: CallbackQuery) -> None:
         account.settings = cfg
 
     await call.answer("Выбраны все лоты")
-    call.data = "autoconfirm:items:0"
-    await autoconfirm_items_view(call)
+    await autoconfirm_items_view(call, page_idx=0)
 
 
 @router.callback_query(F.data == "autoconfirm:items_clear")
@@ -757,8 +756,7 @@ async def autoconfirm_items_clear(call: CallbackQuery) -> None:
         account.settings = cfg
 
     await call.answer("Список очищен")
-    call.data = "autoconfirm:items:0"
-    await autoconfirm_items_view(call)
+    await autoconfirm_items_view(call, page_idx=0)
 
 
 @router.callback_query(F.data == "autoconfirm:categories")
