@@ -68,7 +68,27 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     account = ctx.account
     item = getattr(deal, "item", None)
     item_id = str(getattr(item, "id", "") or "")
-    if not item_id:
+    deal_id = str(getattr(deal, "id", "") or "")
+    chat = getattr(deal, "chat", None)
+    chat_id = str(getattr(chat, "id", "") or "")
+
+    # Если chat_id или item_id не загружены в объекте сделки, подтягиваем через get_deal
+    if (not chat_id or not item_id) and deal_id:
+        try:
+            full_deal = await ctx.get_deal(deal_id)
+            if full_deal:
+                if not item_id and getattr(full_deal, "item", None):
+                    item = full_deal.item
+                    item_id = str(getattr(item, "id", "") or "")
+                if not chat_id and getattr(full_deal, "chat", None):
+                    chat = full_deal.chat
+                    chat_id = str(getattr(chat, "id", "") or "")
+                if not getattr(deal, "user", None) and getattr(full_deal, "user", None):
+                    deal.user = full_deal.user
+        except Exception as exc:
+            logger.debug("on_deal get_deal fallback error: %s", exc)
+
+    if not item_id or not deal_id or not chat_id:
         return
 
     async with ctx.db() as session:
@@ -89,7 +109,6 @@ async def on_deal(ctx: Any, deal: Any) -> None:
             return
 
         # Check existing issue
-        deal_id = str(getattr(deal, "id", ""))
         existing = await session.scalar(
             select(EmeraldPromoIssue).where(
                 EmeraldPromoIssue.account_id == account.id,
@@ -102,10 +121,6 @@ async def on_deal(ctx: Any, deal: Any) -> None:
 
         buyer = getattr(deal, "user", None)
         buyer_id = str(getattr(buyer, "id", "") or "")
-        chat = getattr(deal, "chat", None)
-        chat_id = str(getattr(chat, "id", "") or "")
-        if not chat_id:
-            return
 
         token = svc().cipher.decrypt(setting.api_token_enc)
         if not token:
@@ -165,8 +180,8 @@ async def on_deal(ctx: Any, deal: Any) -> None:
             is_key=is_key,
         )
 
-        # Send to buyer in Playerok chat
-        await asyncio.to_thread(ctx.client.send_message, chat_id, msg_text)
+        # Send to buyer in Playerok chat (асинхронно напрямую, без asyncio.to_thread)
+        await ctx.send_chat(chat_id, msg_text)
 
         async with ctx.db() as session:
             db_issue = await session.get(EmeraldPromoIssue, issue.id)
@@ -176,10 +191,18 @@ async def on_deal(ctx: Any, deal: Any) -> None:
                 db_issue.status = "sent"
                 await session.commit()
 
+        # Автоматическое подтверждение сделки продавцом (перевод в SENT)
+        try:
+            from playerokapi.enums import ItemDealStatuses
+            await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
+        except Exception as exc_deal:
+            logger.warning("Не удалось перевести сделку %s в SENT в emerald_promo: %s", deal_id, exc_deal)
+
         await ctx.notify(
             f"💎 <b>Emerald Promo: выдача по сделке #{deal_id[-6:]}</b>\n"
             f"Товар: <b>{html.escape(rule.lot_title)}</b>\n"
-            f"Выдано: <code>{html.escape(code)}</code> ({format_tokens(token_amount)} токенов)"
+            f"Выдано: <code>{html.escape(code)}</code> ({format_tokens(token_amount)} токенов)\n"
+            "✅ Заказ автоматически отмечен как выполненный."
         )
     except Exception as exc:
         logger.exception("Emerald issue failed")
@@ -281,7 +304,7 @@ async def on_review(ctx: Any, review: Any) -> None:
             promo_id = str(promo_data.get("id") or "")
 
         msg_text = review_message(code, token_amount, is_key=is_key)
-        await asyncio.to_thread(ctx.client.send_message, sale_issue.chat_id, msg_text)
+        await ctx.send_chat( sale_issue.chat_id, msg_text)
 
         async with ctx.db() as session:
             db_issue = await session.get(EmeraldPromoIssue, issue.id)
@@ -336,7 +359,7 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
                 # Resend existing
                 is_k = existing.promo_code.startswith("sk-em-") or setting.issue_type == "api_key"
                 msg = free_message(existing.promo_code, existing.token_amount, repeated=True, is_key=is_k)
-                await asyncio.to_thread(ctx.client.send_message, chat_id, msg)
+                await ctx.send_chat( chat_id, msg)
                 return
 
             token = svc().cipher.decrypt(setting.api_token_enc)
@@ -378,7 +401,7 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
                 promo_id = str(promo_data.get("id") or "")
 
             msg = free_message(code, token_amount, repeated=False, is_key=is_key)
-            await asyncio.to_thread(ctx.client.send_message, chat_id, msg)
+            await ctx.send_chat( chat_id, msg)
 
             async with ctx.db() as session:
                 db_issue = await session.get(EmeraldPromoIssue, issue.id)
@@ -404,7 +427,7 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
                 ).order_by(EmeraldPromoIssue.created_at.desc())
             )
         if not last_issue or not last_issue.promo_code:
-            await asyncio.to_thread(ctx.client.send_message, chat_id, "ℹ️ Для этого чата не найден выданный API-ключ.")
+            await ctx.send_chat( chat_id, "ℹ️ Для этого чата не найден выданный API-ключ.")
             return
 
         key = last_issue.promo_code.strip()
@@ -435,12 +458,12 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
                 f"📖 Документация в Telegraph:\n{TELEGRAPH_DOCS_URL}",
             )
         except Exception as exc:
-            await asyncio.to_thread(ctx.client.send_message, chat_id, "⚠️ Не удалось получить баланс ключа.")
+            await ctx.send_chat( chat_id, "⚠️ Не удалось получить баланс ключа.")
 
     # Check for #модели / #models
     elif text.strip().lower() in ("#модели", "#models", "#модель", "#model"):
         models_text = await asyncio.to_thread(fetch_models_text, TELEGRAPH_DOCS_URL)
-        await asyncio.to_thread(ctx.client.send_message, chat_id, models_text)
+        await ctx.send_chat( chat_id, models_text)
 
     # Check for #документация / #доки / #docs
     elif text.strip().lower() in ("#документация", "#доки", "#инструкция", "#docs", "#руководство"):
@@ -452,4 +475,4 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
             "• #модели — актуальный список моделей и их статус\n"
             "• #баланс — проверить остаток токенов ключа"
         )
-        await asyncio.to_thread(ctx.client.send_message, chat_id, docs_text)
+        await ctx.send_chat( chat_id, docs_text)
