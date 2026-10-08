@@ -25,7 +25,3 @@ telethon>=1.36.0
 # 2FA TOTP (Google Authenticator)
 pyotp>=2.9.0
 
-# Flask WebApp / Mini App
-Flask>=3.0.0
-
-

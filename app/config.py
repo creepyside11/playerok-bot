@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost/playerok"
-DEFAULT_WEBAPP_URL = "https://bot-1789913252-9852-dontmealertll.bothost.tech/"
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,7 +13,6 @@ class Settings:
     database_url: str = DEFAULT_DATABASE_URL
     poll_interval: float = 6.0
     log_level: str = "INFO"
-    webapp_url: str = DEFAULT_WEBAPP_URL
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -25,8 +23,6 @@ class Settings:
             or os.getenv("database_url")
             or DEFAULT_DATABASE_URL
         ).strip() or DEFAULT_DATABASE_URL
-
-        webapp_url = os.getenv("WEBAPP_URL", DEFAULT_WEBAPP_URL).strip() or DEFAULT_WEBAPP_URL
 
         if not bot_token:
             raise RuntimeError("BOT_TOKEN is required")
@@ -53,5 +49,4 @@ class Settings:
             database_url=database_url,
             poll_interval=poll_interval,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            webapp_url=webapp_url,
         )
