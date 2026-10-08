@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Playerok System Panel - Вход</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/css/liquid.css">
+  <style>
+    .login-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 80vh;
+      max-width: 400px;
+      margin: 0 auto;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <div class="login-container">
+      <div class="liquid-card" style="width: 100%; padding: 32px 26px;">
+        <div style="display: flex; flex-direction: column; align-items: center; margin-bottom: 24px; text-align: center;">
+          <div class="brand-glyph" style="width: 44px; height: 44px; margin-bottom: 12px;"></div>
+          <span class="brand-name" style="font-size: 18px;">PLAYEROK CONTROL</span>
+          <span class="brand-status" style="margin-top: 4px;">СИСТЕМА АВТОМАТИЗАЦИИ</span>
+        </div>
+
+        <form id="loginForm" onsubmit="handleLogin(event)">
+          <div class="form-group">
+            <label class="form-label">Логин доступа</label>
+            <input type="text" class="glass-input" id="loginUsername" placeholder="user_7973988177" required autocomplete="username">
+          </div>
+          <div class="form-group" style="margin-bottom: 22px;">
+            <label class="form-label">Пароль</label>
+            <input type="password" class="glass-input" id="loginPassword" placeholder="••••••••" required autocomplete="current-password">
+          </div>
+          <button type="submit" class="liquid-btn liquid-btn-primary" style="width: 100%; padding: 13px;">ВОЙТИ В ПАНЕЛЬ</button>
+        </form>
+
+        <div style="margin-top: 20px; text-align: center; font-size: 12px; color: var(--text-muted); line-height: 1.5;">
+          Данные авторизации генерируются в Telegram-боте через раздел <b>Аккаунты &gt; Веб-панель</b>.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function handleLogin(e) {
+      e.preventDefault();
+      const username = document.getElementById('loginUsername').value.trim();
+      const password = document.getElementById('loginPassword').value.trim();
+
+      try {
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          window.location.href = data.redirect || '/';
+        } else {
+          alert(data.error || 'Ошибка входа');
+        }
+      } catch (err) {
+        alert('Ошибка соединения с сервером');
+      }
+    }
+
+    // Auto-login if opened inside Telegram WebApp
+    document.addEventListener('DOMContentLoaded', async () => {
+      if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) {
+        try {
+          const res = await fetch('/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ init_data: window.Telegram.WebApp.initData })
+          });
+          const data = await res.json();
+          if (data.ok) {
+            window.location.href = data.redirect || '/';
+          }
+        } catch (e) {}
+      }
+    });
+  </script>
+</body>
+</html>
