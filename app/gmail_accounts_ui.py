@@ -658,6 +658,20 @@ async def gmail_bind_lot_confirm(call: CallbackQuery) -> None:
                 enabled=True,
             )
             session.add(rule)
+
+        # Автоматически активируем плагин gmail_seller в plugin_states
+        from .plugin_system import PluginState
+        p_state = await session.scalar(
+            select(PluginState).where(
+                PluginState.account_id == account.id,
+                PluginState.plugin_id == "gmail_seller",
+            )
+        )
+        if not p_state:
+            session.add(PluginState(account_id=account.id, plugin_id="gmail_seller", enabled=True, config={}))
+        else:
+            p_state.enabled = True
+
         await session.commit()
 
     markup = InlineKeyboardMarkup(inline_keyboard=[

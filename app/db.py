@@ -29,6 +29,8 @@ def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
+        # Импортируем все модели перед create_all, чтобы создались все таблицы
+        from . import accounts_manager, emerald_promo_manager, gmail_accounts_manager, telegram_accounts_manager  # noqa: F401
         await conn.run_sync(Base.metadata.create_all)
         # Auto-migrate: ensure newly added columns exist in existing PostgreSQL / SQLite tables
         try:

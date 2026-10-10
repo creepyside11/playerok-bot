@@ -8,7 +8,6 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.handlers import svc
 from app.gmail_accounts_manager import (
     GmailDeal,
     GmailLotRule,
@@ -64,14 +63,25 @@ async def on_deal(ctx: Any, deal: Any) -> None:
         return
 
     async with ctx.db() as session:
-        # Проверяем, привязан ли лот к автовыдаче Gmail
-        rule = await session.scalar(
+        # Проверяем, привязан ли лот к автовыдаче Gmail (по ID или по slug/title)
+        rules = (await session.scalars(
             select(GmailLotRule).where(
                 GmailLotRule.account_id == account.id,
-                GmailLotRule.lot_id == item_id,
                 GmailLotRule.enabled.is_(True),
             )
-        )
+        )).all()
+        rule = None
+        for r in rules:
+            if str(r.lot_id).strip() == str(item_id).strip():
+                rule = r
+                break
+        if not rule and getattr(deal, "item", None):
+            item_slug = str(getattr(deal.item, "slug", "") or "").strip()
+            item_title = str(getattr(deal.item, "name", "") or "").strip()
+            for r in rules:
+                if (item_slug and r.lot_id == item_slug) or (item_title and r.lot_title.lower() == item_title.lower()):
+                    rule = r
+                    break
         if not rule:
             return
 
@@ -124,8 +134,11 @@ async def on_deal(ctx: Any, deal: Any) -> None:
         stock_pwd_enc = stock.password_encrypted
         stock_totp_enc = stock.totp_secret_encrypted
 
-    # Дешифруем данные
-    cipher = svc().cipher
+    # Дешифруем данные через ctx.cipher или fallback к сервисам
+    cipher = ctx.cipher
+    if not cipher:
+        from app.handlers import svc
+        cipher = svc().cipher
     password = cipher.decrypt(stock_pwd_enc)
     totp_secret = cipher.decrypt(stock_totp_enc)
 
@@ -137,7 +150,7 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     auto_complete = bool(ctx.config.get("auto_complete", True))
     if auto_complete:
         try:
-            await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
+            await ctx.update_deal(deal_id, ItemDealStatuses.SENT)
             async with ctx.db() as session:
                 rec = await session.scalar(
                     select(GmailDeal).where(

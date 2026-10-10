@@ -428,7 +428,10 @@ async def _show_delivery(call: CallbackQuery) -> None:
             text=f"{'✅' if rule.enabled else '⏸'} {clip(rule.item_id, 22)}{extra}",
             callback_data=f"del:view:{rule.id}",
         )
-    b.button(text="➕ Новое правило", callback_data="delivery:add")
+    b.button(text="➕ Новое правило (текст/склад)", callback_data="delivery:add")
+    b.button(text="🎮 Универсальная автовыдача (BR, игры)", callback_data="uacc:open")
+    b.button(text="📧 Gmail 2FA автовыдача", callback_data="gmail:open")
+    b.button(text="📱 Telegram автовыдача", callback_data="tgacc:open")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     await edit(
@@ -1636,6 +1639,8 @@ async def plugin_view(call: CallbackQuery) -> None:
         rows.insert(1, [InlineKeyboardButton(text="📱 Панель Telegram Accounts", callback_data="tgacc:open")])
     elif plugin.id == "gmail_seller":
         rows.insert(1, [InlineKeyboardButton(text="📧 Панель Gmail Автовыдачи", callback_data="gmail:open")])
+    elif plugin.id == "universal_accounts":
+        rows.insert(1, [InlineKeyboardButton(text="🎮 Панель Автовыдачи Аккаунтов", callback_data="uacc:open")])
     elif plugin.id == "bot_hosting":
         rows.insert(1, [InlineKeyboardButton(text="🤖 Панель Автохостинга Ботов", callback_data="botstore:open")])
     if hasattr(plugin.module, "on_action"):

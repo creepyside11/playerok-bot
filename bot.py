@@ -16,6 +16,7 @@ from app.emerald_promo_ui import router as emerald_promo_router
 from app.items_manager_ui import router as items_manager_router
 from app.telegram_accounts_ui import router as telegram_accounts_router
 from app.gmail_accounts_ui import router as gmail_accounts_router
+from app.accounts_ui import router as universal_accounts_router
 from app.bot_store_ui import router as bot_store_router
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
@@ -40,6 +41,7 @@ async def main() -> None:
     email_auth = EmailAuthClient()
 
     plugin_manager = PluginManager(session_factory)
+    plugin_manager.set_cipher(cipher)
     plugin_manager.load()
 
     bot = Bot(settings.bot_token)
@@ -50,6 +52,7 @@ async def main() -> None:
     dispatcher.include_router(emerald_promo_router)
     dispatcher.include_router(telegram_accounts_router)
     dispatcher.include_router(gmail_accounts_router)
+    dispatcher.include_router(universal_accounts_router)
     dispatcher.include_router(bot_store_router)
     dispatcher.include_router(items_manager_router)
     dispatcher.include_router(

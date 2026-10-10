@@ -169,7 +169,10 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
         InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"item:edit:price:{item_id}"),
     )
     builder.row(
+        InlineKeyboardButton(text="🔥 Сделать скидку", callback_data=f"item:edit:discount:{item_id}"),
         InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"item:edit:desc:{item_id}"),
+    )
+    builder.row(
         InlineKeyboardButton(text=f"🖼 Фото ({photos_count})", callback_data=f"item:edit:photo:{item_id}"),
     )
 
@@ -313,6 +316,101 @@ async def item_save_price(message: Message, state: FSMContext) -> None:
         await wait_msg.delete()
         await message.answer(
             f"❌ <b>Ошибка при изменении цены:</b>\n<code>{html.escape(str(exc))[:1500]}</code>",
+            parse_mode="HTML",
+            reply_markup=back_menu(f"item:view:{item_id}"),
+        )
+
+
+# --- УСТАНОВКА ЦЕНЫ СО СКИДКОЙ ---
+
+@router.callback_query(F.data.startswith("item:edit:discount:"))
+async def item_edit_discount_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    item_id = call.data.split(":")[3]
+    await state.clear()
+    await state.set_state(ItemEdit.discount)
+    client = await svc().gateway.get_client(account)
+    try:
+        cur_item = await client.get_item(item_id)
+        current_price = int(getattr(cur_item, "price", 0) or 0)
+    except Exception:
+        current_price = 0
+
+    await state.update_data(item_id=item_id, account_id=str(account.id), current_price=current_price)
+    await call.answer()
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")]]
+    )
+    await edit(
+        call,
+        "🔥 <b>Установка цены со скидкой</b>\n\n"
+        f"Текущая цена лота: <b>{current_price} ₽</b>\n\n"
+        "Отправьте новую цену со скидкой (целое число меньше текущей цены, либо пару <code>старая_цена новая_цена</code>).\n"
+        "<i>На Playerok старая цена станет зачёркнутой (<code>prevPrice</code>), а новая цена станет текущей ценой продажи со скидкой!</i>\n\n"
+        "Для отмены нажмите кнопку ниже или введите /cancel.",
+        markup,
+    )
+
+
+@router.message(ItemEdit.discount, F.text)
+async def item_save_discount(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    current_price = int(data.get("current_price", 0))
+
+    account = await active_account(message.from_user.id)
+    if not account or not item_id:
+        await state.clear()
+        await message.answer("❌ Аккаунт не найден.")
+        return
+
+    text = (message.text or "").strip()
+    parts = text.replace("₽", "").replace("руб", "").replace("р", "").split()
+    try:
+        if len(parts) == 1:
+            disc_price = int(parts[0].replace(" ", ""))
+            base_price = current_price
+            if disc_price <= 0:
+                raise ValueError
+            if base_price > 0 and disc_price >= base_price:
+                await message.answer(f"⚠️ Цена со скидкой ({disc_price} ₽) должна быть меньше текущей ({base_price} ₽):")
+                return
+        elif len(parts) >= 2:
+            base_price = int(parts[0].replace(" ", ""))
+            disc_price = int(parts[1].replace(" ", ""))
+            if base_price <= 0 or disc_price <= 0 or disc_price >= base_price:
+                raise ValueError
+        else:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Введите число меньше текущей цены или формат: <code>1000 790</code> (старая и новая цена):", parse_mode="HTML")
+        return
+
+    await state.clear()
+    wait_msg = await message.answer("⏳ Устанавливаю цену со скидкой в Playerok…")
+    try:
+        client = await svc().gateway.get_client(account)
+        if len(parts) >= 2 and base_price != current_price:
+            # Сначала обновляем базовую цену, чтобы зафиксировать prevPrice
+            await client.update_item(item_id, price=base_price)
+        # Затем устанавливаем цену со скидкой
+        await client.update_item(item_id, price=disc_price)
+        await wait_msg.delete()
+        pct = round((1 - disc_price / max(1, base_price)) * 100) if base_price > disc_price else 0
+        await message.answer(
+            f"✅ <b>Скидка успешно установлена!</b>\n"
+            f"Старая цена: <s>{base_price} ₽</s>\n"
+            f"Новая цена со скидкой: <b>{disc_price} ₽</b> (-{pct}%)\n"
+            f"<i>Лот на Playerok обновлён с бейджем скидки!</i>",
+            parse_mode="HTML",
+        )
+        await render_item_card(message, account, client, item_id)
+    except Exception as exc:
+        await wait_msg.delete()
+        await message.answer(
+            f"❌ <b>Ошибка при установке скидки:</b>\n<code>{html.escape(str(exc))[:1500]}</code>",
             parse_mode="HTML",
             reply_markup=back_menu(f"item:view:{item_id}"),
         )

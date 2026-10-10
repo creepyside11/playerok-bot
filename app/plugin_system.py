@@ -55,6 +55,7 @@ class PluginContext:
     config: dict[str, Any]
     telethon: TelethonManager | None = None
     external_api: ExternalAPI | None = None
+    cipher: Any = None
 
     async def send_chat(self, chat_id: str, text: str) -> Any:
         return await self.client.send_message(str(chat_id), str(text), mark_chat_as_read=True)
@@ -83,6 +84,12 @@ class PluginContext:
         if hasattr(self.client, "get_deal"):
             return await self.client.get_deal(deal_id)
         return await self.client.call("get_deal", deal_id=deal_id)
+
+    async def update_deal(self, deal_id: str, new_status: Any) -> Any:
+        """Обновить статус сделки на Playerok (например, SENT / выполнен)."""
+        if hasattr(self.client, "update_deal"):
+            return await self.client.update_deal(deal_id, new_status)
+        return await self.client.call("update_deal", deal_id=deal_id, new_status=new_status)
 
     async def update_item(
         self,
@@ -141,6 +148,10 @@ class PluginManager:
         self.load_errors: dict[str, str] = {}
         self.telethon = TelethonManager()
         self.external_api: ExternalAPI | None = None
+        self.cipher: Any = None
+
+    def set_cipher(self, cipher: Any) -> None:
+        self.cipher = cipher
 
     def set_external_api(self, api: ExternalAPI) -> None:
         self.external_api = api
@@ -242,6 +253,56 @@ class PluginManager:
         config = plugin.defaults()
         if row and isinstance(row.config, dict):
             config.update(row.config)
+
+        # Если плагин явно включен в БД
+        if row and row.enabled:
+            return True, config
+
+        # Умный fallback: если плагин встроенный (например gmail_seller, telegram_accounts, universal_accounts)
+        # и у него в базе есть активные привязанные правила (лоты), считаем его активным
+        if plugin.id == "gmail_seller":
+            try:
+                from .gmail_accounts_manager import GmailLotRule
+                async with self.db() as session:
+                    has_rules = await session.scalar(
+                        select(func.count(GmailLotRule.id)).where(
+                            GmailLotRule.account_id == account_id,
+                            GmailLotRule.enabled.is_(True),
+                        )
+                    )
+                if has_rules and has_rules > 0:
+                    return True, config
+            except Exception:
+                pass
+        elif plugin.id == "telegram_accounts":
+            try:
+                from .telegram_accounts_manager import TelegramAccountLotRule
+                async with self.db() as session:
+                    has_rules = await session.scalar(
+                        select(func.count(TelegramAccountLotRule.id)).where(
+                            TelegramAccountLotRule.account_id == account_id,
+                            TelegramAccountLotRule.enabled.is_(True),
+                        )
+                    )
+                if has_rules and has_rules > 0:
+                    return True, config
+            except Exception:
+                pass
+        elif plugin.id == "universal_accounts":
+            try:
+                from .accounts_manager import UniversalAccountLotRule
+                async with self.db() as session:
+                    has_rules = await session.scalar(
+                        select(func.count(UniversalAccountLotRule.id)).where(
+                            UniversalAccountLotRule.account_id == account_id,
+                            UniversalAccountLotRule.enabled.is_(True),
+                        )
+                    )
+                if has_rules and has_rules > 0:
+                    return True, config
+            except Exception:
+                pass
+
         return bool(row.enabled) if row else False, config
 
     async def set_enabled(self, account_id: Any, plugin: PluginSpec, enabled: bool) -> None:
@@ -351,7 +412,7 @@ class PluginManager:
             enabled, config = await self.resolved_state(account.id, plugin)
             if not enabled:
                 continue
-            ctx = PluginContext(account, client, bot, self.db, config, self.telethon, self.external_api)
+            ctx = PluginContext(account, client, bot, self.db, config, self.telethon, self.external_api, self.cipher)
             try:
                 call_args = (ctx, args[0]) if deal_fallback else (ctx, *args)
                 if inspect.iscoroutinefunction(hook):

@@ -281,10 +281,17 @@ class WorkerManager:
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)
 
-        if (new_deal or status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}) and self.plugins:
-            await self.plugins.dispatch_deal(account, client, self.bot, deal)
-        if new_status and not new_deal and self.plugins:
-            await self.plugins.dispatch_deal_changed(account, client, self.bot, deal, None)
+        # Вызываем плагины для всех активных оплаченных заказов
+        if self.plugins and (new_deal or status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}):
+            try:
+                await self.plugins.dispatch_deal(account, client, self.bot, deal)
+            except Exception as p_exc:
+                logger.exception("Plugin dispatch_deal error: %s", p_exc)
+        if self.plugins and new_status and not new_deal:
+            try:
+                await self.plugins.dispatch_deal_changed(account, client, self.bot, deal, None)
+            except Exception as p_exc:
+                logger.exception("Plugin dispatch_deal_changed error: %s", p_exc)
 
         action_buttons = []
         if status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}:
