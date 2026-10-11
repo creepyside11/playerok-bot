@@ -17,6 +17,29 @@ from plugins.supercell_seller import on_deal, on_message
 from playerokapi.enums import ItemDealStatuses
 
 
+def test_extract_supercell_code_and_imap_candidates():
+    from app.supercell_manager import extract_supercell_code_from_text, get_imap_host_candidates
+
+    text1 = "Your Supercell ID verification code is 491029. Enter it in Brawl Stars."
+    assert extract_supercell_code_from_text(text1) == "491029"
+
+    text2 = "Код подтверждения: 123456"
+    assert extract_supercell_code_from_text(text2) == "123456"
+
+    # Проверка распознавания доменов Firstmail / eblanmail / notletters
+    hosts_firstmail = get_imap_host_candidates("acc1@firstmail.ltd")
+    assert "imap.firstmail.ltd" in hosts_firstmail
+
+    hosts_eblan = get_imap_host_candidates("acc2@eblanmail.com")
+    assert "imap.firstmail.ltd" in hosts_eblan
+
+    hosts_custom_eblan = get_imap_host_candidates("acc3@super-eblanmail-domain.xyz")
+    assert "imap.firstmail.ltd" in hosts_custom_eblan
+
+    hosts_notletters = get_imap_host_candidates("acc4@notletters.com")
+    assert "imap.notletters.com" in hosts_notletters
+
+
 def test_format_supercell_delivery_message():
     text = format_supercell_delivery_message(
         template=DEFAULT_SUPERCELL_DELIVERY_TEMPLATE,
@@ -187,12 +210,22 @@ async def test_supercell_on_deal_workflow():
         assert d_record.email == "bs_pro@gmail.com"
         assert d_record.deal_completed is True
 
-    # Проверяем команду #code в чате
+    # Проверяем команду #code в чате (мокаем автополучение кода с почты)
     help_message = DummyObj()
-    help_message.text = "#code"
+    help_message.text = "#код"
     chat_obj = DummyObj()
     chat_obj.id = "chat_999"
 
+    sent_messages.clear()
+    import unittest.mock as mock
+    with mock.patch("plugins.supercell_seller.fetch_supercell_auth_code", return_value="849201"):
+        await on_message(ctx, chat_obj, help_message)
+    assert len(sent_messages) == 1
+    assert "849201" in sent_messages[0][1]
+    assert "bs_pro@gmail.com" in sent_messages[0][1]
+
+    # Проверяем команду #help
+    help_message.text = "#help"
     sent_messages.clear()
     await on_message(ctx, chat_obj, help_message)
     assert len(sent_messages) == 1

@@ -12,6 +12,7 @@ from app.supercell_manager import (
     SupercellDeal,
     SupercellLotRule,
     SupercellStock,
+    fetch_supercell_auth_code,
     format_supercell_delivery_message,
 )
 from playerokapi.enums import ItemDealStatuses
@@ -246,60 +247,106 @@ async def on_deal(ctx: Any, deal: Any) -> None:
 
 
 async def on_message(ctx: Any, chat: Any, message: Any) -> None:
-    """Обрабатывает запросы покупателя в чате с командой помощи."""
+    """Обрабатывает запросы покупателя в чате с командой получения кода с почты (#код / #code)."""
     text = str(getattr(message, "text", "") or "").strip().lower()
     if not text:
         return
 
-    # Если покупатель пишет #help, #supercell или #код
-    if text in {"#supercell", "#help", "#помощь", "#код", "#code"}:
-        chat_id = str(getattr(chat, "id", "") or "")
-        if not chat_id:
+    # Распознаем триггеры получения кода Supercell ID
+    is_code_request = any(k in text for k in ("#код", "#code", "код", "code", "дай код", "скинь код"))
+    is_help_request = text in {"#supercell", "#help", "#помощь"}
+
+    if not (is_code_request or is_help_request):
+        return
+
+    chat_id = str(getattr(chat, "id", "") or "")
+    if not chat_id:
+        return
+
+    async with ctx.db() as session:
+        # Ищем последнюю сделку в этом чате
+        deal_record = await session.scalar(
+            select(SupercellDeal).where(
+                SupercellDeal.account_id == ctx.account.id,
+                SupercellDeal.chat_id == chat_id,
+            ).order_by(SupercellDeal.id.desc())
+        )
+        if not deal_record:
             return
 
-        async with ctx.db() as session:
-            # Ищем последнюю сделку в этом чате
-            deal_record = await session.scalar(
-                select(SupercellDeal).where(
-                    SupercellDeal.account_id == ctx.account.id,
-                    SupercellDeal.chat_id == chat_id,
-                ).order_by(SupercellDeal.id.desc())
-            )
-            if not deal_record:
-                return
+        stock = await session.get(SupercellStock, deal_record.stock_id)
+        if not stock:
+            return
 
-            stock = await session.get(SupercellStock, deal_record.stock_id)
-            if not stock:
-                return
+        game_name = SUPERCELL_GAMES.get(deal_record.game_key, "Supercell ID")
 
-            game_name = SUPERCELL_GAMES.get(deal_record.game_key, "игре")
+        cipher = getattr(ctx, "cipher", None)
+        try:
+            password = cipher.decrypt(stock.password_encrypted) if cipher else stock.password_encrypted
+        except Exception:
+            password = stock.password_encrypted
 
-            cipher = getattr(ctx, "cipher", None)
-            rec_codes = None
-            if stock.recovery_codes_encrypted and cipher:
-                try:
-                    rec_codes = cipher.decrypt(stock.recovery_codes_encrypted)
-                except Exception:
-                    rec_codes = stock.recovery_codes_encrypted
-            elif stock.recovery_codes_encrypted:
-                rec_codes = stock.recovery_codes_encrypted
-
-            extra_msg = ""
-            if rec_codes:
-                extra_msg = (
-                    f"\n🔐 <b>Коды восстановления Supercell ID:</b>\n"
-                    f"<code>{html.escape(rec_codes)}</code>\n"
-                    f"<i>(Используйте любой один неиспользованный код вместо кода из почты)</i>\n"
-                )
-
-            reply = (
-                f"ℹ️ <b>Памятка по входу в Supercell ID ({html.escape(game_name)}):</b>\n\n"
-                f"📧 Почта: <code>{html.escape(stock.email)}</code>\n"
-                f"{extra_msg}\n"
-                f"Если вам нужен код из письма, проверьте папку «Входящие» и «Спам» на выданной почте.\n"
-                f"При возникновении вопросов продавец ответит вам в ближайшее время!"
-            )
+        # Если запрошен код подтверждения
+        if is_code_request:
+            # 1. Пытаемся автоматически зайти на почту и прочесть письмо
             try:
-                await ctx.send_chat(chat_id, reply)
+                auth_code = await fetch_supercell_auth_code(stock.email, password)
             except Exception as exc:
-                logger.debug("Failed to send supercell help message: %s", exc)
+                logger.debug("fetch_supercell_auth_code error: %s", exc)
+                auth_code = None
+
+            if auth_code:
+                reply = (
+                    f"🔢 <b>Ваш код подтверждения {html.escape(game_name)}:</b>\n\n"
+                    f"👉 <code>{auth_code}</code> 👈\n\n"
+                    f"📧 Почта: <code>{html.escape(stock.email)}</code>\n"
+                    f"<i>Введите этот 6-значный код в игре для завершения входа.</i>"
+                )
+                try:
+                    await ctx.send_chat(chat_id, reply)
+                    logger.info("Sent Supercell OTP code %s to buyer in chat %s", auth_code, chat_id)
+                except Exception as exc:
+                    logger.debug("Failed to send OTP code to chat: %s", exc)
+                return
+            else:
+                # Если письмо ещё не дошло или задержка со стороны Supercell
+                reply = (
+                    f"⏳ <b>Код подтверждения пока не поступил на почту</b> <code>{html.escape(stock.email)}</code>.\n\n"
+                    f"1. Убедитесь, что вы нажали «Войти» в игре и отправили запрос на этот email.\n"
+                    f"2. Подождите 15-30 секунд и отправьте <code>#код</code> ещё раз.\n"
+                    f"3. Вы также можете самостоятельно зайти на почту с выданным паролем."
+                )
+                try:
+                    await ctx.send_chat(chat_id, reply)
+                except Exception as exc:
+                    logger.debug("Failed to send waiting reply: %s", exc)
+                return
+
+        # Памятка помощи #help / #supercell
+        rec_codes = None
+        if stock.recovery_codes_encrypted and cipher:
+            try:
+                rec_codes = cipher.decrypt(stock.recovery_codes_encrypted)
+            except Exception:
+                rec_codes = stock.recovery_codes_encrypted
+        elif stock.recovery_codes_encrypted:
+            rec_codes = stock.recovery_codes_encrypted
+
+        extra_msg = ""
+        if rec_codes:
+            extra_msg = (
+                f"\n🔐 <b>Коды восстановления Supercell ID:</b>\n"
+                f"<code>{html.escape(rec_codes)}</code>\n"
+            )
+
+        reply = (
+            f"ℹ️ <b>Памятка по входу в Supercell ID ({html.escape(game_name)}):</b>\n\n"
+            f"📧 Почта: <code>{html.escape(stock.email)}</code>\n"
+            f"🔑 Пароль: <code>{html.escape(password)}</code>\n"
+            f"{extra_msg}\n"
+            f"💡 <b>Чтобы получить свежий код из письма</b>, просто отправьте в этот чат команду <code>#код</code>!"
+        )
+        try:
+            await ctx.send_chat(chat_id, reply)
+        except Exception as exc:
+            logger.debug("Failed to send supercell help message: %s", exc)
