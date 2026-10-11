@@ -431,6 +431,7 @@ async def _show_delivery(call: CallbackQuery) -> None:
     b.button(text="➕ Новое правило (текст/склад)", callback_data="delivery:add")
     b.button(text="🎮 Универсальная автовыдача (BR, игры)", callback_data="uacc:open")
     b.button(text="🚀 KOSell Steam аренда (API)", callback_data="kosell:open")
+    b.button(text="⚡ AutoSMM накрутка (API)", callback_data="autosmm:open")
     b.button(text="📧 Gmail 2FA автовыдача", callback_data="gmail:open")
     b.button(text="📱 Telegram автовыдача", callback_data="tgacc:open")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
@@ -1040,21 +1041,31 @@ async def _show_my_plugins(call: CallbackQuery) -> None:
     manager = plugins()
     items = manager.ordered()
     b = InlineKeyboardBuilder()
-    for i, plugin in enumerate(items):
-        enabled, _ = await manager.resolved_state(account.id, plugin)
-        b.button(text=f"{'✅' if enabled else '⏸'} {clip(plugin.name, 26)}", callback_data=f"plugin:view:{i}")
-    b.button(text="🧭 Каталог плагинов", callback_data="plugins:catalog:0")
-    b.button(text="✨ Создать плагин (AI)", callback_data="plugins:ai_builder")
-    b.button(text="➕ Загрузить плагин (.py)", callback_data="plugins:upload_warning")
-    b.button(text="📚 Документация", callback_data="plugins:docs")
-    b.button(text="🔄 Перезагрузить плагины", callback_data="plugins:reload")
-    b.button(text="⬅️ Главное меню", callback_data="menu:main")
+
+    # 1. Список установленных плагинов
+    if items:
+        for i, plugin in enumerate(items):
+            enabled, _ = await manager.resolved_state(account.id, plugin)
+            status_dot = "🟢" if enabled else "⏸"
+            b.button(text=f"{status_dot} {clip(plugin.name, 26)}", callback_data=f"plugin:view:{i}")
+    else:
+        b.button(text="📥 Открыть каталог для установки", callback_data="plugins:catalog:0")
+
     b.adjust(1)
+
+    # 2. Быстрые действия внизу
+    b.row(
+        InlineKeyboardButton(text="🧭 Каталог", callback_data="plugins:catalog:0"),
+        InlineKeyboardButton(text="➕ Добавить / Создать", callback_data="plugins:tools_hub"),
+    )
+    b.row(InlineKeyboardButton(text="⬅️ Меню плагинов", callback_data="menu:plugins"))
+
     errors = f"\n⚠️ Ошибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
     await edit(
         call,
-        f"🧩 <b>Мои плагины</b>\nУстановлено: <b>{len(items)}</b>{errors}\n\n"
-        "Нажмите на плагин для просмотра карточки, настройки параметров или включения/выключения:",
+        f"🧩 <b>Установленные плагины ({len(items)})</b>{errors}\n\n"
+        "🟢 — Активен  |  ⏸ — Выключен\n"
+        "<i>Нажмите на нужный плагин, чтобы открыть его панель управления и настройки:</i>",
         b.as_markup(),
     )
 
@@ -1065,21 +1076,52 @@ async def _show_plugins(call: CallbackQuery) -> None:
         return
     manager = plugins()
     items = manager.ordered()
+    installed_count = len(items)
+    catalog_count = len(manager.catalog_plugins())
+
     b = InlineKeyboardBuilder()
-    b.button(text="🧭 Каталог плагинов", callback_data="plugins:catalog:0")
-    b.button(text=f"🧩 Мои плагины ({len(items)})", callback_data="plugins:mine")
-    b.button(text="✨ Создать плагин (AI)", callback_data="plugins:ai_builder")
-    b.button(text="➕ Загрузить плагин", callback_data="plugins:upload_warning")
-    b.button(text="📚 Документация", callback_data="plugins:docs")
-    b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(1)
-    errors = f"\nОшибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
+    b.row(
+        InlineKeyboardButton(text=f"🧩 Мои плагины ({installed_count})", callback_data="plugins:mine"),
+        InlineKeyboardButton(text=f"🧭 Каталог ({catalog_count})", callback_data="plugins:catalog:0"),
+    )
+    b.row(
+        InlineKeyboardButton(text="✨ AI-Конструктор", callback_data="plugins:ai_builder"),
+        InlineKeyboardButton(text="📥 Загрузить .py", callback_data="plugins:upload_warning"),
+    )
+    b.row(
+        InlineKeyboardButton(text="📚 Документация и API", callback_data="plugins:docs"),
+        InlineKeyboardButton(text="🔄 Перезагрузить", callback_data="plugins:reload"),
+    )
+    b.row(InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main"))
+
+    errors = f"\n⚠️ Ошибок загрузки: <b>{len(manager.load_errors)}</b>" if manager.load_errors else ""
     await edit(
         call,
-        "🧩 <b>Плагины Playerok</b>\n"
-        f"Установлено: <b>{len(items)}</b>{errors}\n\n"
-        "Каталог содержит готовые официальные расширения и скрипты. "
-        "Вы можете создать свой плагин с помощью ИИ или загрузить готовый Python-скрипт.",
+        "🧩 <b>Центр управления плагинами</b>\n\n"
+        f"• <b>Мои плагины</b>: управление установленными модулями ({installed_count})\n"
+        f"• <b>Каталог</b>: установка готовых плагинов автовыдачи и интеграций ({catalog_count})\n"
+        f"• <b>AI-Конструктор</b>: генерация плагина по описанию за секунды\n"
+        f"• <b>Документация</b>: руководства по написанию плагинов и хуков{errors}",
+        b.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "plugins:tools_hub")
+async def plugins_tools_hub(call: CallbackQuery) -> None:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🧭 Выбрать из Каталога", callback_data="plugins:catalog:0"))
+    b.row(InlineKeyboardButton(text="✨ Создать плагин через ИИ", callback_data="plugins:ai_builder"))
+    b.row(InlineKeyboardButton(text="📥 Загрузить свой .py файл", callback_data="plugins:upload_warning"))
+    b.row(InlineKeyboardButton(text="📚 Справка / Документация", callback_data="plugins:docs"))
+    b.row(InlineKeyboardButton(text="⬅️ К моим плагинам", callback_data="plugins:mine"))
+
+    await edit(
+        call,
+        "➕ <b>Добавление и разработка плагинов</b>\n\n"
+        "Выберите способ добавления расширения:\n"
+        "1. <b>Каталог</b> — готовые официальные модули (Steam, Gmail, SMM, Telegram, Roblox)\n"
+        "2. <b>AI-Конструктор</b> — напишет рабочий плагин по вашему текстовому запросу\n"
+        "3. <b>Загрузить .py</b> — установка своего файла плагина",
         b.as_markup(),
     )
 
@@ -1648,6 +1690,8 @@ async def plugin_view(call: CallbackQuery) -> None:
         rows.insert(1, [InlineKeyboardButton(text="🎙️ Панель Roblox Voice Chat", callback_data="roblox_vc:open")])
     elif plugin.id == "kosell_seller":
         rows.insert(1, [InlineKeyboardButton(text="🚀 Панель KOSell Аренды", callback_data="kosell:open")])
+    elif plugin.id == "autosmm":
+        rows.insert(1, [InlineKeyboardButton(text="⚡ Панель AutoSMM Накрутки", callback_data="autosmm:open")])
     elif plugin.id == "bot_hosting":
         rows.insert(1, [InlineKeyboardButton(text="🤖 Панель Автохостинга Ботов", callback_data="botstore:open")])
     if hasattr(plugin.module, "on_action"):
