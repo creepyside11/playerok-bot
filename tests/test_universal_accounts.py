@@ -25,16 +25,33 @@ def test_format_universal_delivery_message():
         password="SuperSecretPassword!",
         account_id="UID_998811",
         server="RED",
-        extra="Пин-код от банка: 1234",
+        extra="backup@mail.ru",
         comment="Вход через официальный лаунчер, привязка ВК свободна",
+        extra_field_name="Резервная почта",
+        enable_mail_codes=True,
     )
     assert "Black Russia" in msg
     assert "br_player777" in msg
     assert "SuperSecretPassword!" in msg
     assert "UID_998811" in msg
     assert "RED" in msg
-    assert "1234" in msg
-    assert "официальный лаунчер" in msg
+    assert "backup@mail.ru" in msg
+    assert "Резервная почта" in msg
+    assert "#код" in msg
+
+    # Проверяем выключение кодов почты
+    msg_no_mail = format_universal_delivery_message(
+        template=tmpl,
+        game_title="Black Russia",
+        lot_name="Аккаунт с геликом",
+        login="br_player777",
+        password="SuperSecretPassword!",
+        extra="backup@mail.ru",
+        extra_field_name="Резервная почта",
+        enable_mail_codes=False,
+    )
+    assert "Резервная почта" in msg_no_mail
+    assert "#код" not in msg_no_mail
 
 
 @pytest.mark.asyncio

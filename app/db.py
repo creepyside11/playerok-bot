@@ -37,8 +37,18 @@ async def init_db(engine: AsyncEngine) -> None:
             if str(engine.url).startswith("sqlite"):
                 await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN web_login VARCHAR(64)"))
                 await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN web_password_hash VARCHAR(128)"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN default_delivery_template TEXT"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN extra_field_name VARCHAR(64) DEFAULT 'Доп. данные'"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN enable_mail_codes BOOLEAN DEFAULT 1"))
+                await conn.execute(text("ALTER TABLE universal_account_lot_rules ADD COLUMN extra_field_name VARCHAR(64)"))
+                await conn.execute(text("ALTER TABLE universal_account_lot_rules ADD COLUMN enable_mail_codes BOOLEAN DEFAULT 1"))
             else:
                 await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN IF NOT EXISTS web_login VARCHAR(64)"))
                 await conn.execute(text("ALTER TABLE telegram_users ADD COLUMN IF NOT EXISTS web_password_hash VARCHAR(128)"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN IF NOT EXISTS default_delivery_template TEXT"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN IF NOT EXISTS extra_field_name VARCHAR(64) DEFAULT 'Доп. данные'"))
+                await conn.execute(text("ALTER TABLE universal_games ADD COLUMN IF NOT EXISTS enable_mail_codes BOOLEAN DEFAULT TRUE"))
+                await conn.execute(text("ALTER TABLE universal_account_lot_rules ADD COLUMN IF NOT EXISTS extra_field_name VARCHAR(64)"))
+                await conn.execute(text("ALTER TABLE universal_account_lot_rules ADD COLUMN IF NOT EXISTS enable_mail_codes BOOLEAN DEFAULT TRUE"))
         except Exception:
             pass

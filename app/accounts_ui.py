@@ -29,6 +29,8 @@ class UniversalAccStates(StatesGroup):
     game_custom_name = State()
     account_add_text = State()
     lot_template_edit = State()
+    game_template_edit = State()
+    game_extra_name_edit = State()
 
 
 # --- ГЛАВНОЕ МЕНЮ АВТОВЫДАЧИ АККАУНТОВ ---
@@ -273,17 +275,28 @@ async def _render_game_view(target: CallbackQuery | Message, account: Any, game_
         InlineKeyboardButton(text=f"📋 Привязанные лоты ({len(rules)})", callback_data=f"uacc:rules_game:{game_id}"),
     )
     builder.row(
+        InlineKeyboardButton(text="⚙️ Настройка шаблона & полей", callback_data=f"uacc:game:custom_cfg:{game_id}"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🗑 Удалить игру", callback_data=f"uacc:game:del_ask:{game_id}"),
         InlineKeyboardButton(text="⬅️ К списку игр", callback_data="uacc:games:0"),
     )
+
+    mail_codes_st = "✅ Включены" if (game.enable_mail_codes if game.enable_mail_codes is not None else True) else "❌ Выключены"
+    extra_name = game.extra_field_name or "Доп. данные"
+    tmpl_st = "Кастомный" if game.default_delivery_template else "По умолчанию"
 
     text = (
         f"🎮 <b>Управление игрой: {html.escape(game.title)}</b>\n\n"
         f"📊 <b>Склад:</b>\n"
         f"• В наличии для выдачи: <b>{avail} шт.</b>\n"
         f"• Успешно выдано покупателям: <b>{issued} шт.</b>\n\n"
+        f"⚙️ <b>Настройки автовыдачи игры:</b>\n"
+        f"• Шаблон выдачи: <b>{tmpl_st}</b>\n"
+        f"• Название доп. поля: <b>{html.escape(extra_name)}</b>\n"
+        f"• Коды с почт покупателю: <b>{mail_codes_st}</b>\n\n"
         f"🔗 <b>Привязанных лотов:</b> <b>{len(rules)}</b>\n\n"
-        "<i>Загрузите аккаунты на склад и привяжите лоты Playerok, чтобы бот автоматически выдавал их при покупке.</i>"
+        "<i>Загрузите аккаунты на склад и настройте шаблон под вашу игру (например, переименуйте доп. поле в «Резервная почта» или «Секретное слово»).</i>"
     )
 
     if isinstance(target, CallbackQuery):
@@ -714,6 +727,8 @@ async def uacc_rule_view(call: CallbackQuery) -> None:
 
     st_icon = "🟢 Включено" if rule.enabled else "🔴 Выключено"
     auto_sent_str = "Да (SENT)" if rule.auto_sent else "Нет"
+    extra_name = rule.extra_field_name or (game.extra_field_name if game else "Доп. данные") or "Доп. данные"
+    mail_st = "Да" if (rule.enable_mail_codes if rule.enable_mail_codes is not None else True) else "Нет"
 
     text = (
         f"⚙️ <b>Настройки автовыдачи лота</b>\n\n"
@@ -721,18 +736,331 @@ async def uacc_rule_view(call: CallbackQuery) -> None:
         f"🆔 ID лота: <code>{rule.lot_id}</code>\n"
         f"🎮 Игра: <b>{html.escape(game.title if game else '—')}</b>\n"
         f"📌 Статус: <b>{st_icon}</b>\n"
-        f"🚀 Авто-выполнение заказа: <b>{auto_sent_str}</b>\n\n"
+        f"🚀 Авто-выполнение заказа: <b>{auto_sent_str}</b>\n"
+        f"🏷 Доп. поле: <b>{html.escape(extra_name)}</b>\n"
+        f"📨 Коды с почт покупателю: <b>{mail_st}</b>\n\n"
         f"📝 <b>Шаблон сообщения:</b>\n"
         f"<pre>{html.escape(rule.delivery_template[:800])}</pre>"
     )
 
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔄 Переключить активность", callback_data=f"uacc:rule:toggle:{rule.id}"))
-    builder.row(InlineKeyboardButton(text="🚀 Переключить автовыполнение (SENT)", callback_data=f"uacc:rule:toggle_sent:{rule.id}"))
+    builder.row(InlineKeyboardButton(text="✏️ Изменить шаблон лота", callback_data=f"uacc:rule:edit_tmpl:{rule.id}"))
+    builder.row(
+        InlineKeyboardButton(text="🔄 Активность", callback_data=f"uacc:rule:toggle:{rule.id}"),
+        InlineKeyboardButton(text="🚀 SENT статус", callback_data=f"uacc:rule:toggle_sent:{rule.id}"),
+    )
+    builder.row(InlineKeyboardButton(text="📨 Вкл/Выкл коды почт", callback_data=f"uacc:rule:toggle_mail:{rule.id}"))
     builder.row(InlineKeyboardButton(text="🗑 Удалить привязку", callback_data=f"uacc:rule:del:{rule.id}"))
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"uacc:rules_game:{rule.game_id}"))
 
     await edit(call, text, builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("uacc:rule:toggle_mail:"))
+async def uacc_rule_toggle_mail(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    rid = int(call.data.split(":")[3])
+    async with svc().db() as session:
+        rule = await session.get(UniversalAccountLotRule, rid)
+        if rule and rule.account_id == account.id:
+            curr = rule.enable_mail_codes if rule.enable_mail_codes is not None else True
+            rule.enable_mail_codes = not curr
+            await session.commit()
+    await call.answer("Настройка кодов почты обновлена.")
+    call.data = f"uacc:rule:view:{rid}"
+    await uacc_rule_view(call)
+
+
+@router.callback_query(F.data.startswith("uacc:rule:edit_tmpl:"))
+async def uacc_rule_edit_tmpl_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    rid = int(call.data.split(":")[3])
+    await state.clear()
+    await state.set_state(UniversalAccStates.lot_template_edit)
+    await state.update_data(rule_id=rid)
+
+    async with svc().db() as session:
+        rule = await session.get(UniversalAccountLotRule, rid)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить к дефолтному", callback_data=f"uacc:rule:reset_tmpl:{rid}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"uacc:rule:view:{rid}")],
+    ])
+
+    text = (
+        "📝 <b>Редактирование шаблона выдачи для лота</b>\n\n"
+        "Отправьте новый текст шаблона в ответном сообщении.\n\n"
+        "<b>Доступные переменные:</b>\n"
+        "<code>{game}</code> — Название игры\n"
+        "<code>{lot_name}</code> — Название лота\n"
+        "<code>{login}</code> — Логин\n"
+        "<code>{password}</code> — Пароль\n"
+        "<code>{account_id}</code> — ID / Никнейм\n"
+        "<code>{server}</code> — Сервер\n"
+        "<code>{extra}</code> — Значение доп. поля (резервная почта/пин)\n"
+        "<code>{extra_label}</code> — Название доп. поля\n"
+        "<code>{comment}</code> — Инструкция\n"
+        "<code>{extra_block}</code> — Готовый блок доп. поля (если заполнено)\n"
+        "<code>{server_block}</code> — Готовый блок сервера\n"
+        "<code>{id_block}</code> — Готовый блок ID\n\n"
+        f"<b>Текущий шаблон:</b>\n<pre>{html.escape(rule.delivery_template if rule else '')}</pre>"
+    )
+    await edit(call, text, markup)
+
+
+@router.message(UniversalAccStates.lot_template_edit, F.text)
+async def uacc_rule_edit_tmpl_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    rid = int(data.get("rule_id", 0))
+    account = await active_account(message.from_user.id)
+    if not account or not rid:
+        await state.clear()
+        return
+
+    new_tmpl = (message.text or "").strip()
+    await state.clear()
+
+    async with svc().db() as session:
+        rule = await session.get(UniversalAccountLotRule, rid)
+        if rule and rule.account_id == account.id:
+            rule.delivery_template = new_tmpl
+            await session.commit()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ К настройкам лота", callback_data=f"uacc:rule:view:{rid}")],
+    ])
+    await message.answer("✅ <b>Шаблон выдачи лота успешно обновлён!</b>", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("uacc:rule:reset_tmpl:"))
+async def uacc_rule_reset_tmpl(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    rid = int(call.data.split(":")[3])
+    async with svc().db() as session:
+        rule = await session.get(UniversalAccountLotRule, rid)
+        if rule and rule.account_id == account.id:
+            rule.delivery_template = DEFAULT_DELIVERY_TEMPLATE
+            await session.commit()
+
+    await call.answer("Шаблон сброшен к стандартному")
+    call.data = f"uacc:rule:view:{rid}"
+    await uacc_rule_view(call)
+
+
+# --- ГЛУБОКАЯ НАСТРОЙКА ИГРЫ (ШАБЛОН, ДОП. ПОЛЕ, ПОЧТОВЫЕ КОДЫ) ---
+
+@router.callback_query(F.data.startswith("uacc:game:custom_cfg:"))
+async def uacc_game_custom_config(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    gid = int(call.data.split(":")[3])
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if not game or game.account_id != account.id:
+            await call.answer("Игра не найдена", show_alert=True)
+            return
+
+    mail_st = "✅ Включены (покупатель может запросить #код)" if (game.enable_mail_codes if game.enable_mail_codes is not None else True) else "❌ Выключены"
+    extra_label = game.extra_field_name or "Доп. данные"
+    has_custom_tmpl = "Кастомный" if game.default_delivery_template else "Стандартный"
+
+    text = (
+        f"⚙️ <b>Глубокая настройка игры: {html.escape(game.title)}</b>\n\n"
+        f"🏷 <b>Название дополнительного поля:</b>\n"
+        f"Текущее: <code>{html.escape(extra_label)}</code>\n"
+        f"<i>(Вы можете назвать его «Резервная почта», «Пин-код», «Секретный вопрос» и т.д. "
+        f"Оно будет выводиться покупателю именно под этим именем!)</i>\n\n"
+        f"📨 <b>Коды подтверждения с почты:</b> <b>{mail_st}</b>\n"
+        f"<i>(Если выключить — бот не будет писать покупателю про коды и команду #код)</i>\n\n"
+        f"📝 <b>Шаблон автовыдачи для всех лотов этой игры:</b> <b>{has_custom_tmpl}</b>\n\n"
+        "Выберите, что вы хотите настроить:"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🏷 Переименовать доп. поле (Резервная почта)", callback_data=f"uacc:game:edit_extra:{gid}"))
+    builder.row(InlineKeyboardButton(text="📨 Переключить коды почты", callback_data=f"uacc:game:toggle_mail:{gid}"))
+    builder.row(InlineKeyboardButton(text="📝 Настроить общий шаблон выдачи игры", callback_data=f"uacc:game:edit_tmpl:{gid}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к игре", callback_data=f"uacc:game:view:{gid}"))
+
+    await edit(call, text, builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("uacc:game:toggle_mail:"))
+async def uacc_game_toggle_mail(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    gid = int(call.data.split(":")[3])
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if game and game.account_id == account.id:
+            curr = game.enable_mail_codes if game.enable_mail_codes is not None else True
+            game.enable_mail_codes = not curr
+            await session.commit()
+
+    await call.answer("Настройка кодов почты обновлена.")
+    call.data = f"uacc:game:custom_cfg:{gid}"
+    await uacc_game_custom_config(call)
+
+
+@router.callback_query(F.data.startswith("uacc:game:edit_extra:"))
+async def uacc_game_edit_extra_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    gid = int(call.data.split(":")[3])
+    await state.clear()
+    await state.set_state(UniversalAccStates.game_extra_name_edit)
+    await state.update_data(game_id=gid)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="«Резервная почта»", callback_data=f"uacc:game:preset_extra:{gid}:Резервная почта")],
+        [InlineKeyboardButton(text="«Пин-код»", callback_data=f"uacc:game:preset_extra:{gid}:Пин-код")],
+        [InlineKeyboardButton(text="«Секретное слово»", callback_data=f"uacc:game:preset_extra:{gid}:Секретное слово")],
+        [InlineKeyboardButton(text="«Доп. данные» (по умолч.)", callback_data=f"uacc:game:preset_extra:{gid}:Доп. данные")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"uacc:game:custom_cfg:{gid}")],
+    ])
+
+    text = (
+        "🏷 <b>Как назвать дополнительное поле для этой игры?</b>\n\n"
+        "Выберите готовый вариант или напишите свой (например: <i>Резервная почта</i>):"
+    )
+    await edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("uacc:game:preset_extra:"))
+async def uacc_game_preset_extra_save(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    parts = call.data.split(":")
+    gid = int(parts[3])
+    name = parts[4]
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if game and game.account_id == account.id:
+            game.extra_field_name = name
+            await session.commit()
+
+    await call.answer(f"Поле названо: {name}")
+    call.data = f"uacc:game:custom_cfg:{gid}"
+    await uacc_game_custom_config(call)
+
+
+@router.message(UniversalAccStates.game_extra_name_edit, F.text)
+async def uacc_game_custom_extra_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    gid = int(data.get("game_id", 0))
+    account = await active_account(message.from_user.id)
+    if not account or not gid:
+        await state.clear()
+        return
+
+    name = (message.text or "").strip()[:64]
+    await state.clear()
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if game and game.account_id == account.id:
+            game.extra_field_name = name
+            await session.commit()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ К настройкам игры", callback_data=f"uacc:game:custom_cfg:{gid}")],
+    ])
+    await message.answer(f"✅ Дополнительное поле переименовано в <b>«{html.escape(name)}»</b>!", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("uacc:game:edit_tmpl:"))
+async def uacc_game_edit_tmpl_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    gid = int(call.data.split(":")[3])
+    await state.clear()
+    await state.set_state(UniversalAccStates.game_template_edit)
+    await state.update_data(game_id=gid)
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить к дефолтному", callback_data=f"uacc:game:reset_tmpl:{gid}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"uacc:game:custom_cfg:{gid}")],
+    ])
+
+    tmpl_cur = game.default_delivery_template if (game and game.default_delivery_template) else DEFAULT_DELIVERY_TEMPLATE
+    text = (
+        f"📝 <b>Редактирование общего шаблона автовыдачи для {html.escape(game.title if game else '')}</b>\n\n"
+        "Отправьте текст шаблона в ответном сообщении.\n\n"
+        "<b>Доступные переменные:</b>\n"
+        "<code>{game}</code> — Название игры\n"
+        "<code>{lot_name}</code> — Название лота\n"
+        "<code>{login}</code> — Логин\n"
+        "<code>{password}</code> — Пароль\n"
+        "<code>{account_id}</code> — ID / Никнейм\n"
+        "<code>{server}</code> — Сервер\n"
+        "<code>{extra}</code> — Доп. поле (резервная почта и т.д.)\n"
+        "<code>{extra_label}</code> — Название доп. поля\n"
+        "<code>{comment}</code> — Инструкция\n"
+        "<code>{extra_block}</code>, <code>{server_block}</code>, <code>{id_block}</code>\n\n"
+        f"<b>Текущий шаблон:</b>\n<pre>{html.escape(tmpl_cur)}</pre>"
+    )
+    await edit(call, text, markup)
+
+
+@router.message(UniversalAccStates.game_template_edit, F.text)
+async def uacc_game_edit_tmpl_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    gid = int(data.get("game_id", 0))
+    account = await active_account(message.from_user.id)
+    if not account or not gid:
+        await state.clear()
+        return
+
+    new_tmpl = (message.text or "").strip()
+    await state.clear()
+
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if game and game.account_id == account.id:
+            game.default_delivery_template = new_tmpl
+            await session.commit()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ К настройкам игры", callback_data=f"uacc:game:custom_cfg:{gid}")],
+    ])
+    await message.answer("✅ <b>Шаблон выдачи для игры успешно сохранён!</b>", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("uacc:game:reset_tmpl:"))
+async def uacc_game_reset_tmpl(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    gid = int(call.data.split(":")[3])
+    async with svc().db() as session:
+        game = await session.get(UniversalGame, gid)
+        if game and game.account_id == account.id:
+            game.default_delivery_template = None
+            await session.commit()
+
+    await call.answer("Шаблон игры сброшен к стандартному")
+    call.data = f"uacc:game:custom_cfg:{gid}"
+    await uacc_game_custom_config(call)
 
 
 @router.callback_query(F.data.startswith("uacc:rule:toggle:"))

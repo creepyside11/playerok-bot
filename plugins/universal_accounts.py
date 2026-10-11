@@ -165,9 +165,18 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     password = cipher.decrypt(stock_pwd_enc) if stock_pwd_enc else ""
     extra = cipher.decrypt(stock_extra_enc) if stock_extra_enc else ""
 
+    # Определяем название доп. поля и флаг кодов почты с приоритетом (правило лота -> игра)
+    extra_field_name = rule.extra_field_name or (game.extra_field_name if game else "Доп. данные") or "Доп. данные"
+    enable_mail_codes = rule.enable_mail_codes if rule.enable_mail_codes is not None else (game.enable_mail_codes if game else True)
+
+    # Шаблон выдачи: если в правиле лота дефолтный, проверяем нет ли кастомного шаблона у игры
+    effective_template = rule.delivery_template
+    if (not effective_template or effective_template == "DEFAULT_DELIVERY_TEMPLATE") and game and game.default_delivery_template:
+        effective_template = game.default_delivery_template
+
     # Формируем и отправляем сообщение покупателю в чат Playerok
     delivery_msg = format_universal_delivery_message(
-        template=rule.delivery_template,
+        template=effective_template,
         game_title=game_title,
         lot_name=rule.lot_title,
         login=stock_login,
@@ -176,6 +185,8 @@ async def on_deal(ctx: Any, deal: Any) -> None:
         server=stock_server,
         extra=extra,
         comment=stock_comment,
+        extra_field_name=extra_field_name,
+        enable_mail_codes=enable_mail_codes,
     )
     await ctx.send_chat(chat_id, delivery_msg)
 

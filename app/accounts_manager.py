@@ -29,6 +29,7 @@ DEFAULT_DELIVERY_TEMPLATE = (
     "{id_block}"
     "{server_block}"
     "{extra_block}"
+    "{mail_codes_block}"
     "\n{comment_block}"
     "🤝 <i>Спасибо за покупку! Проверьте данные и подтвердите получение заказа.</i>"
 )
@@ -59,6 +60,9 @@ class UniversalGame(Base):
     )
     title: Mapped[str] = mapped_column(String(128), nullable=False)
     slug: Mapped[str] = mapped_column(String(128), nullable=False)
+    default_delivery_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extra_field_name: Mapped[str] = mapped_column(String(64), default="Доп. данные", nullable=False)
+    enable_mail_codes: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -104,6 +108,8 @@ class UniversalAccountLotRule(Base):
     lot_id: Mapped[str] = mapped_column(String(128), nullable=False)
     lot_title: Mapped[str] = mapped_column(String(256), nullable=False)
     delivery_template: Mapped[str] = mapped_column(Text, default=DEFAULT_DELIVERY_TEMPLATE, nullable=False)
+    extra_field_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    enable_mail_codes: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     auto_sent: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -154,14 +160,22 @@ def format_universal_delivery_message(
     server: str | None = None,
     extra: str | None = None,
     comment: str | None = None,
+    extra_field_name: str | None = "Доп. данные",
+    enable_mail_codes: bool = True,
 ) -> str:
-    """Форматирует сообщение покупателю с подстановкой плейсхолдеров."""
+    """Форматирует сообщение покупателю с подстановкой плейсхолдеров и кастомных имен полей."""
     tmpl = template or DEFAULT_DELIVERY_TEMPLATE
+    field_label = extra_field_name.strip() if extra_field_name and extra_field_name.strip() else "Доп. данные"
 
     id_block = f"🆔 <b>ID / Никнейм:</b> <code>{html.escape(account_id)}</code>\n" if account_id else ""
     server_block = f"🌐 <b>Сервер:</b> <code>{html.escape(server)}</code>\n" if server else ""
-    extra_block = f"ℹ️ <b>Доп. данные:</b> <code>{html.escape(extra)}</code>\n" if extra else ""
+    extra_block = f"ℹ️ <b>{html.escape(field_label)}:</b> <code>{html.escape(extra)}</code>\n" if extra else ""
     comment_block = f"📝 <b>Инструкция / Комментарий:</b>\n{html.escape(comment)}\n" if comment else ""
+
+    mail_codes_block = (
+        "\n📨 <b>Код подтверждения с почты:</b>\n"
+        "Если для входа требуется код с почты, напишите в этот чат команду <code>#код</code>.\n"
+    ) if enable_mail_codes and (extra or "mail" in (comment or "").lower()) else ""
 
     text = tmpl.replace("{game}", html.escape(game_title))
     text = text.replace("{lot_name}", html.escape(lot_name))
@@ -170,9 +184,11 @@ def format_universal_delivery_message(
     text = text.replace("{account_id}", html.escape(account_id or "—"))
     text = text.replace("{server}", html.escape(server or "—"))
     text = text.replace("{extra}", html.escape(extra or "—"))
+    text = text.replace("{extra_label}", html.escape(field_label))
     text = text.replace("{comment}", html.escape(comment or ""))
     text = text.replace("{id_block}", id_block)
     text = text.replace("{server_block}", server_block)
     text = text.replace("{extra_block}", extra_block)
     text = text.replace("{comment_block}", comment_block)
+    text = text.replace("{mail_codes_block}", mail_codes_block)
     return text
