@@ -288,9 +288,11 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
 
         # Если запрошен код подтверждения
         if is_code_request:
-            # 1. Пытаемся автоматически зайти на почту и прочесть письмо
+            # 1. Пытаемся автоматически зайти на почту и прочесть письмо (с использованием проверенного imap_host, если записан)
             try:
-                auth_code = await fetch_supercell_auth_code(stock.email, password)
+                auth_code = await fetch_supercell_auth_code(
+                    stock.email, password, pinned_host=getattr(stock, "imap_host", None)
+                )
             except Exception as exc:
                 logger.debug("fetch_supercell_auth_code error: %s", exc)
                 auth_code = None

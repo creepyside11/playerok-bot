@@ -93,6 +93,29 @@ def test_parse_supercell_bulk_lines():
 
 
 @pytest.mark.asyncio
+async def test_detect_and_verify_email_host_order():
+    from app.supercell_manager import get_imap_host_candidates, detect_and_verify_email_host
+    import unittest.mock as mock
+
+    # Проверяем, что для неизвестного домена firstmail идет первым кандидатом, а notletters вторым
+    candidates = get_imap_host_candidates("custom_user@random-unregistered-domain.biz")
+    assert candidates[0] == "imap.firstmail.ltd"
+    assert candidates[1] == "imap.notletters.com"
+
+    # Мокаем проверку: на Firstmail неудача (False), на Notletters успех (True)
+    def mock_test_login(email, pwd, host, timeout):
+        if host == "imap.firstmail.ltd":
+            return False
+        if host == "imap.notletters.com":
+            return True
+        return False
+
+    with mock.patch("app.supercell_manager._test_imap_login_sync", side_effect=mock_test_login):
+        host = await detect_and_verify_email_host("test@eblanmail-custom.org", "pass123")
+        assert host == "imap.notletters.com"
+
+
+@pytest.mark.asyncio
 async def test_supercell_on_deal_workflow():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:

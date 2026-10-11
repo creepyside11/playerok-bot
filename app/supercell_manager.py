@@ -107,6 +107,9 @@ class SupercellStock(Base):
     email: Mapped[str] = mapped_column(String(256), nullable=False)
     password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     
+    # Автоопределенный проверенный IMAP сервер почты (firstmail, notletters и т.д.)
+    imap_host: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     # Характеристики аккаунта
     trophies: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Кубки
     town_hall: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Уровень ТХ (для CoC)
@@ -198,25 +201,32 @@ def extract_supercell_code_from_text(content: str) -> str | None:
 
 
 def get_imap_host_candidates(email_address: str) -> list[str]:
-    """Определяет список возможных IMAP серверов для домена почты."""
+    """
+    Определяет упорядоченный список IMAP серверов для проверки.
+    Правило: если домен неизвестный/кастомный, сначала ОБЯЗАТЕЛЬНО проверяется Firstmail (imap.firstmail.ltd),
+    затем Notletters (imap.notletters.com), а затем доменные mx/imap адреса.
+    """
     domain = email_address.split("@")[-1].lower() if "@" in email_address else ""
     hosts: list[str] = []
 
-    # Если домен есть в явном списке известных
+    # 1. Если домен явно известный в справочнике
     if domain in KNOWN_IMAP_DOMAINS:
         hosts.append(KNOWN_IMAP_DOMAINS[domain])
 
-    # Если в домене упоминается firstmail, fmail, eblanmail и т.д.
+    # 2. Если в домене упоминаются ключевые слова Firstmail / eblanmail
     if any(k in domain for k in ("firstmail", "fmail", "eblan", "first", "fm")):
         if "imap.firstmail.ltd" not in hosts:
             hosts.append("imap.firstmail.ltd")
 
-    # Если в домене упоминается notletter, notmail, letter
-    if any(k in domain for k in ("notletter", "notmail", "letters", "notl")):
-        if "imap.notletters.com" not in hosts:
-            hosts.append("imap.notletters.com")
+    # 3. Для любых незнакомых доменов ПЕРВЫМ делом ставим Firstmail!
+    if "imap.firstmail.ltd" not in hosts:
+        hosts.append("imap.firstmail.ltd")
 
-    # Стандартный DNS fallback: imap.domain и mail.domain
+    # 4. Если не подошел Firstmail — вторым пробуем Notletters
+    if "imap.notletters.com" not in hosts:
+        hosts.append("imap.notletters.com")
+
+    # 5. Затем проверяем прямые imap.{domain} и mail.{domain}
     if domain:
         d_imap = f"imap.{domain}"
         d_mail = f"mail.{domain}"
@@ -225,12 +235,44 @@ def get_imap_host_candidates(email_address: str) -> list[str]:
         if d_mail not in hosts:
             hosts.append(d_mail)
 
-    # Резервные пулы
+    # 6. Резервные пулы
     for cand in CANDIDATE_IMAP_HOSTS:
         if cand not in hosts:
             hosts.append(cand)
 
     return hosts
+
+
+def _test_imap_login_sync(email_address: str, password: str, host: str, timeout_sec: int = 5) -> bool:
+    """Проверяет возможность авторизации на IMAP сервере."""
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(host, timeout=timeout_sec)
+        res, _ = mail.login(email_address, password)
+        return res == "OK"
+    except Exception:
+        return False
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+async def detect_and_verify_email_host(email_address: str, password: str) -> str | None:
+    """
+    При добавлении аккаунта на склад проверяет, на каком почтовом сервере работает email.
+    Сначала тестирует Firstmail (imap.firstmail.ltd), если ошибка — пробует Notletters и другие.
+    Возвращает работающий imap_host или None, если сервер пока недоступен.
+    """
+    candidates = get_imap_host_candidates(email_address)
+    for host in candidates:
+        ok = await asyncio.to_thread(_test_imap_login_sync, email_address, password, host, 5)
+        if ok:
+            logger.info("Email %s successfully verified on IMAP host: %s", email_address, host)
+            return host
+    return None
 
 
 def _read_imap_sync(email_address: str, password: str, host: str, timeout_sec: int = 7) -> str | None:
@@ -301,10 +343,10 @@ def _read_imap_sync(email_address: str, password: str, host: str, timeout_sec: i
 
 
 async def fetch_supercell_code_via_imap(
-    email_address: str, password: str, timeout_sec: int = 15
+    email_address: str, password: str, pinned_host: str | None = None, timeout_sec: int = 15
 ) -> str | None:
-    """Асинхронно перебирает возможные IMAP хосты и извлекает код подтверждения Supercell ID."""
-    hosts = get_imap_host_candidates(email_address)
+    """Асинхронно перебирает возможные IMAP хосты (или использует проверенный pinned_host) и извлекает код подтверждения Supercell ID."""
+    hosts = [pinned_host] if pinned_host else get_imap_host_candidates(email_address)
 
     for host in hosts:
         code = await asyncio.to_thread(_read_imap_sync, email_address, password, host, 7)
@@ -343,10 +385,12 @@ async def fetch_supercell_code_via_api(email_address: str, password: str) -> str
     return None
 
 
-async def fetch_supercell_auth_code(email_address: str, password: str) -> str | None:
-    """Универсальная функция: сначала пробует IMAP (с автоопределением хостов Firstmail/Notletters/зеркал), затем Web API."""
+async def fetch_supercell_auth_code(
+    email_address: str, password: str, pinned_host: str | None = None
+) -> str | None:
+    """Универсальная функция: сначала пробует IMAP (проверенный хост или автоопределение Firstmail->Notletters), затем Web API."""
     # 1. IMAP проверка
-    code = await fetch_supercell_code_via_imap(email_address, password)
+    code = await fetch_supercell_code_via_imap(email_address, password, pinned_host=pinned_host)
     if code:
         return code
 

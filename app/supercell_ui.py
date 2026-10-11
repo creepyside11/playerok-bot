@@ -20,6 +20,7 @@ from .supercell_manager import (
     SupercellDeal,
     SupercellLotRule,
     SupercellStock,
+    detect_and_verify_email_host,
     format_supercell_delivery_message,
     parse_supercell_bulk_lines,
 )
@@ -245,6 +246,9 @@ async def supercell_add_process(message: Message, state: FSMContext) -> None:
 
     cipher = svc().cipher
     added_count = 0
+    verified_hosts: dict[str, str] = {}
+
+    status_msg = await message.answer("🔄 <i>Проверка почтовых серверов и добавление аккаунтов...</i>", parse_mode="HTML")
 
     async with svc().db() as session:
         for item in parsed:
@@ -266,6 +270,18 @@ async def supercell_add_process(message: Message, state: FSMContext) -> None:
                 else:
                     trophies = val
 
+            # Автоопределение почтового сервера при добавлении (Firstmail -> Notletters -> другие)
+            domain = email.split("@")[-1].lower() if "@" in email else ""
+            imap_host = verified_hosts.get(domain)
+            if not imap_host:
+                try:
+                    imap_host = await detect_and_verify_email_host(email, raw_pwd)
+                    if imap_host and domain:
+                        verified_hosts[domain] = imap_host
+                except Exception as exc:
+                    logger.debug("Host detection error for %s: %s", email, exc)
+                    imap_host = None
+
             pwd_enc = cipher.encrypt(raw_pwd) if cipher else raw_pwd
             rec_enc = cipher.encrypt(raw_rec) if (cipher and raw_rec) else raw_rec
 
@@ -274,6 +290,7 @@ async def supercell_add_process(message: Message, state: FSMContext) -> None:
                 game_key=game_key,
                 email=email,
                 password_encrypted=pwd_enc,
+                imap_host=imap_host,
                 recovery_codes_encrypted=rec_enc,
                 trophies=trophies,
                 town_hall=town_hall,
@@ -287,14 +304,19 @@ async def supercell_add_process(message: Message, state: FSMContext) -> None:
         await session.commit()
 
     await state.clear()
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🎮 В меню {game_name}", callback_data=f"sc_game:{game_key}")],
         [InlineKeyboardButton(text="⚡ Главная Supercell", callback_data="supercell:open")],
     ])
 
+    verified_info = f"\n🌐 <i>Определены почтовые серверы: {', '.join(set(verified_hosts.values()))}</i>" if verified_hosts else ""
     await message.answer(
-        f"✅ <b>Успешно добавлено {added_count} аккаунтов</b> в категорию <b>{html.escape(game_name)}</b>!",
+        f"✅ <b>Успешно добавлено {added_count} аккаунтов</b> в категорию <b>{html.escape(game_name)}</b>!{verified_info}",
         reply_markup=markup,
         parse_mode="HTML",
     )
