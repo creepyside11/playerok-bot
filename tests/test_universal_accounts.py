@@ -142,3 +142,87 @@ async def test_universal_accounts_on_deal():
     # Проверяем уведомление продавцу
     assert len(notified) == 1
     assert "Выдан аккаунт Black Russia" in notified[0]
+
+
+@pytest.mark.asyncio
+async def test_universal_accounts_match_by_item_id_and_fallback():
+    cipher = SecretCipher("dummy_bot_token_123456789")
+    pwd_enc = cipher.encrypt("Secret777")
+
+    ctx = MagicMock()
+    ctx.account = MagicMock(id=uuid.uuid4())
+    ctx.cipher = cipher
+    ctx.config = {"auto_complete": True, "notify_seller": True}
+
+    sent_messages = []
+    async def mock_send_chat(chat_id, text):
+        sent_messages.append((chat_id, text))
+    ctx.send_chat = mock_send_chat
+
+    updated_deals = []
+    async def mock_update_deal(deal_id, status):
+        updated_deals.append((deal_id, status))
+    ctx.update_deal = mock_update_deal
+    ctx.notify = AsyncMock()
+
+    # Сделка, где item_id совпадает точно со сохраненным lot_id
+    deal = MagicMock()
+    deal.id = "deal-exact-1"
+    deal.chat = MagicMock(id="chat-exact-1")
+    deal.item = MagicMock(id="lot-id-xyz", name="Кастомный товар")
+
+    game = UniversalGame(id=2, account_id=ctx.account.id, title="Steam", slug="steam")
+    rule = UniversalAccountLotRule(
+        id=20,
+        account_id=ctx.account.id,
+        game_id=2,
+        lot_id="lot-id-xyz",
+        lot_title="Кастомный товар",
+        delivery_template=DEFAULT_DELIVERY_TEMPLATE,
+        auto_sent=True,
+        enabled=True,
+    )
+    stock = UniversalAccountStock(
+        id=201,
+        account_id=ctx.account.id,
+        game_id=2,
+        login="steam_user",
+        password_encrypted=pwd_enc,
+        status="available",
+    )
+
+    class MockSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def scalars(self, stmt):
+            m = MagicMock()
+            m.all.return_value = [rule]
+            return m
+        async def scalar(self, stmt):
+            str_stmt = str(stmt).lower()
+            if "universal_account_deals" in str_stmt:
+                return None
+            elif "count(" in str_stmt:
+                return 0
+            elif "universal_account_stock" in str_stmt:
+                return stock
+            return None
+        async def get(self, model, ident):
+            if model == UniversalGame:
+                return game
+            return None
+        def add(self, obj):
+            pass
+        async def commit(self):
+            pass
+
+    ctx.db = lambda: MockSession()
+
+    await on_deal(ctx, deal)
+    assert len(sent_messages) == 1
+    assert "steam_user" in sent_messages[0][1]
+    assert len(updated_deals) == 1
+    assert updated_deals[0][0] == "deal-exact-1"
+

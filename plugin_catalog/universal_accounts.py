@@ -182,8 +182,23 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     # Автозавершение сделки (перевод в SENT / выполнен)
     auto_complete = rule.auto_sent if rule.auto_sent is not None else bool(ctx.config.get("auto_complete", True))
     if auto_complete:
+        sent_ok = False
         try:
             await ctx.update_deal(deal_id, ItemDealStatuses.SENT)
+            sent_ok = True
+        except Exception as exc:
+            logger.warning("Не удалось перевести сделку %s в SENT через enum: %s, пробуем строкой", deal_id, exc)
+            try:
+                if hasattr(ctx.client, "call"):
+                    await ctx.client.call("update_deal", deal_id=deal_id, new_status=ItemDealStatuses.SENT)
+                    sent_ok = True
+                elif hasattr(ctx.client, "update_deal"):
+                    await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
+                    sent_ok = True
+            except Exception as e2:
+                logger.warning("Повторная попытка перевода сделки %s в SENT не удалась: %s", deal_id, e2)
+
+        if sent_ok:
             async with ctx.db() as session:
                 rec = await session.scalar(
                     select(UniversalAccountDeal).where(
@@ -194,8 +209,6 @@ async def on_deal(ctx: Any, deal: Any) -> None:
                 if rec:
                     rec.deal_completed = True
                     await session.commit()
-        except Exception as exc:
-            logger.warning("Не удалось перевести сделку %s в SENT: %s", deal_id, exc)
 
     # Уведомляем продавца в Telegram
     notify_seller = bool(ctx.config.get("notify_seller", True))

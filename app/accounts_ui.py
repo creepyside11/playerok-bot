@@ -533,19 +533,40 @@ async def uacc_lot_bind_menu(call: CallbackQuery) -> None:
 
     await call.answer("Загружаю ваши лоты Playerok…")
     client = await svc().gateway.get_client(account)
+    items: list[Any] = []
     try:
-        raw_items = await client.viewer()
-        items = list(getattr(raw_items, "items", []) or [])
-    except Exception:
-        items = []
+        # Пытаемся получить до 96 лотов пользователя через get_my_items с пагинацией
+        cursor: str | None = None
+        for _ in range(4):  # до 4 страниц по 24 = 96 лотов
+            res = await client.call("get_my_items", statuses=None, count=24, after_cursor=cursor)
+            batch = list(getattr(res, "items", []) or [])
+            if not batch:
+                break
+            items.extend(batch)
+            page_info = getattr(res, "page_info", None)
+            if not page_info or not getattr(page_info, "has_next_page", False):
+                break
+            cursor = getattr(page_info, "end_cursor", None)
+            if not cursor:
+                break
+    except Exception as exc:
+        logger.warning("uacc get_my_items fallback to viewer: %s", exc)
+
+    # Если через get_my_items ничего не получили или произошла ошибка, пробуем viewer
+    if not items:
+        try:
+            raw_items = await client.viewer()
+            items = list(getattr(raw_items, "items", []) or [])
+        except Exception:
+            items = []
 
     builder = InlineKeyboardBuilder()
     start_idx = page * page_size
     page_items = items[start_idx : start_idx + page_size]
 
     for it in page_items:
-        it_id = getattr(it, "id", "")
-        it_name = getattr(it, "name", "Товар")
+        it_id = str(getattr(it, "id", "") or "")
+        it_name = str(getattr(it, "name", "Товар") or "Товар")
         builder.button(text=f"📦 {clip(it_name, 26)}", callback_data=f"uacc:lot:bind_confirm:{gid}:{it_id}")
     builder.adjust(1)
 
