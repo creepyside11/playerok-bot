@@ -302,6 +302,20 @@ class PluginManager:
                     return True, config
             except Exception:
                 pass
+        elif plugin.id == "supercell_seller":
+            try:
+                from .supercell_manager import SupercellLotRule
+                async with self.db() as session:
+                    has_rules = await session.scalar(
+                        select(func.count(SupercellLotRule.id)).where(
+                            SupercellLotRule.account_id == account_id,
+                            SupercellLotRule.enabled.is_(True),
+                        )
+                    )
+                if has_rules and has_rules > 0:
+                    return True, config
+            except Exception:
+                pass
 
         return bool(row.enabled) if row else False, config
 
