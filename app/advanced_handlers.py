@@ -1643,6 +1643,8 @@ async def plugin_view(call: CallbackQuery) -> None:
         rows.insert(1, [InlineKeyboardButton(text="🎮 Панель Автовыдачи Аккаунтов", callback_data="uacc:open")])
     elif plugin.id == "supercell_seller":
         rows.insert(1, [InlineKeyboardButton(text="⚡ Панель Supercell ID", callback_data="supercell:open")])
+    elif plugin.id == "roblox_vc_seller":
+        rows.insert(1, [InlineKeyboardButton(text="🎙️ Панель Roblox Voice Chat", callback_data="roblox_vc:open")])
     elif plugin.id == "bot_hosting":
         rows.insert(1, [InlineKeyboardButton(text="🤖 Панель Автохостинга Ботов", callback_data="botstore:open")])
     if hasattr(plugin.module, "on_action"):

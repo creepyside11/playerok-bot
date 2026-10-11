@@ -14,6 +14,7 @@ from app.db import init_db, make_engine, make_session_factory
 from app.advanced_handlers import configure_advanced
 from app.emerald_promo_ui import router as emerald_promo_router
 from app.items_manager_ui import router as items_manager_router
+from app.roblox_ui import router as roblox_router
 from app.supercell_ui import router as supercell_router
 from app.telegram_accounts_ui import router as telegram_accounts_router
 from app.gmail_accounts_ui import router as gmail_accounts_router
@@ -55,6 +56,7 @@ async def main() -> None:
     dispatcher.include_router(gmail_accounts_router)
     dispatcher.include_router(universal_accounts_router)
     dispatcher.include_router(supercell_router)
+    dispatcher.include_router(roblox_router)
     dispatcher.include_router(bot_store_router)
     dispatcher.include_router(items_manager_router)
     dispatcher.include_router(

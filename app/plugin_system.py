@@ -316,6 +316,20 @@ class PluginManager:
                     return True, config
             except Exception:
                 pass
+        elif plugin.id == "roblox_vc_seller":
+            try:
+                from .roblox_vc_manager import RobloxLotRule
+                async with self.db() as session:
+                    has_rules = await session.scalar(
+                        select(func.count(RobloxLotRule.id)).where(
+                            RobloxLotRule.account_id == account_id,
+                            RobloxLotRule.enabled.is_(True),
+                        )
+                    )
+                if has_rules and has_rules > 0:
+                    return True, config
+            except Exception:
+                pass
 
         return bool(row.enabled) if row else False, config
 
