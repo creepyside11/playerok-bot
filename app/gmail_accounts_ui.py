@@ -135,15 +135,27 @@ async def gmail_add_step2_msg(message: Message, state: FSMContext) -> None:
     await state.update_data(password=password)
     await state.set_state(GmailSellerState.add_totp)
 
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить 2FA (без кода)", callback_data="gmail:add:skip_totp")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gmail:open")],
+    ])
+
     await message.answer(
         "➕ <b>Шаг 3 из 3: Введите секретный ключ 2FA (TOTP):</b>\n\n"
         "<i>Это секретный ключ из букв и цифр, который выдаёт Google при включении "
-        "двухэтапной аутентификации (например: JBSWY3DPEHPK3PXP).\n"
-        "Бот сразу проверит его и рассчитает тестовый код!</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="gmail:open")]
-        ])
+        "двухэтапной аутентификации (например: JBSWY3DPEHPK3PXP).\n\n"
+        "💡 <b>Ключ не обязателен!</b> Если аккаунт без 2FA, нажмите кнопку «Пропустить 2FA» или отправьте «-».</i>",
+        reply_markup=markup,
     )
+
+
+@router.callback_query(F.data == "gmail:add:skip_totp")
+async def gmail_add_skip_totp_callback(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await _save_gmail_stock_entry(call.message, state, account, totp_clean=None)
+    await call.answer()
 
 
 @router.message(GmailSellerState.add_totp)
@@ -155,20 +167,36 @@ async def gmail_add_step3_msg(message: Message, state: FSMContext) -> None:
         return
 
     raw_totp = (message.text or "").strip()
+    if raw_totp in {"-", "—", "skip", "пропустить", "нет", "none", "0"}:
+        await _save_gmail_stock_entry(message, state, account, totp_clean=None)
+        return
+
     totp_clean = clean_totp_secret(raw_totp)
     code, rem = generate_totp_code(totp_clean)
 
     if not code:
         await message.answer(
             "❌ <b>Невалидный TOTP-ключ!</b>\n"
-            "Не удалось сгенерировать проверочный 6-значный код. "
-            "Проверьте ключ и попробуйте снова (или нажмите Отмена):",
+            "Не удалось сгенерировать проверочный 6-значный код.\n"
+            "Проверьте ключ, отправьте «-» (чтобы пропустить) или нажмите кнопку:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="gmail:open")]
+                [InlineKeyboardButton(text="⏭ Пропустить 2FA", callback_data="gmail:add:skip_totp")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="gmail:open")],
             ])
         )
         return
 
+    await _save_gmail_stock_entry(message, state, account, totp_clean=totp_clean, code=code, rem=rem)
+
+
+async def _save_gmail_stock_entry(
+    target_msg: Message,
+    state: FSMContext,
+    account: PlayerokAccount,
+    totp_clean: str | None = None,
+    code: str | None = None,
+    rem: int = 0,
+) -> None:
     data = await state.get_data()
     email_text = data.get("email")
     password = data.get("password")
@@ -176,7 +204,7 @@ async def gmail_add_step3_msg(message: Message, state: FSMContext) -> None:
 
     cipher = svc().cipher
     pwd_enc = cipher.encrypt(password)
-    totp_enc = cipher.encrypt(totp_clean)
+    totp_enc = cipher.encrypt(totp_clean) if totp_clean else None
 
     async with svc().db() as session:
         stock = GmailStock(
@@ -195,11 +223,18 @@ async def gmail_add_step3_msg(message: Message, state: FSMContext) -> None:
         [InlineKeyboardButton(text="📧 Меню плагина", callback_data="gmail:open")],
     ])
 
-    await message.answer(
+    if totp_clean:
+        extra_info = (
+            f"🔑 2FA ключ: <code>{html.escape(totp_clean)}</code>\n"
+            f"✅ Проверочный 2FA-код прямо сейчас: <code>{code}</code> (ещё {rem} сек.)\n\n"
+        )
+    else:
+        extra_info = "🔓 2FA ключ: <i>Не привязан (вход без кодов)</i>\n\n"
+
+    await target_msg.answer(
         "🎉 <b>Аккаунт успешно добавлен в базу!</b>\n\n"
         f"📧 Email: <code>{html.escape(email_text)}</code>\n"
-        f"🔑 2FA ключ: <code>{html.escape(totp_clean)}</code>\n"
-        f"✅ Проверочный 2FA-код прямо сейчас: <code>{code}</code> (ещё {rem} сек.)\n\n"
+        f"{extra_info}"
         "<i>Не забудьте выйти со своего устройства из этого Google-аккаунта перед продажей!</i>",
         reply_markup=markup,
     )
@@ -217,12 +252,13 @@ async def gmail_bulk_add_prompt(call: CallbackQuery, state: FSMContext) -> None:
     text = (
         "📥 <b>Массовая загрузка аккаунтов Gmail</b>\n\n"
         "Отправьте список аккаунтов сообщением. Каждый аккаунт с новой строки в одном из форматов:\n"
+        "<code>email:password</code> (без 2FA)\n"
         "<code>email:password:totp_secret</code>\n"
-        "или\n"
         "<code>email:password:totp_secret:recovery_email</code>\n\n"
         "<i>Пример:</i>\n"
-        "<code>ivan123@gmail.com:SecretPass1:JBSWY3DPEHPK3PXP</code>\n"
-        "<code>alex999@gmail.com:MyPassword2:MZXW6YTBOI======</code>"
+        "<code>ivan123@gmail.com:SecretPass1</code>\n"
+        "<code>alex999@gmail.com:MyPassword2:JBSWY3DPEHPK3PXP</code>\n"
+        "<code>user777@gmail.com:Pass3:JBSWY3DPEHPK3PXP:backup@mail.ru</code>"
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="gmail:open")]
@@ -251,32 +287,38 @@ async def gmail_bulk_add_process(message: Message, state: FSMContext) -> None:
     async with svc().db() as session:
         for idx, line in enumerate(lines, start=1):
             parts = line.split(":")
-            if len(parts) < 3:
+            if len(parts) < 2:
                 # Попробуем разделить по точке с запятой или табуляции
                 if ";" in line:
                     parts = line.split(";")
                 elif "\t" in line:
                     parts = line.split("\t")
 
-            if len(parts) < 3:
-                errors.append(f"Строка {idx}: неверный формат (нужно минимум 3 поля)")
+            if len(parts) < 2:
+                errors.append(f"Строка {idx}: неверный формат (нужно минимум email:password)")
                 continue
 
             mail = parts[0].strip()
             pwd = parts[1].strip()
-            totp = clean_totp_secret(parts[2].strip())
+            if not mail or not pwd:
+                errors.append(f"Строка {idx}: пустой email или пароль")
+                continue
+
+            raw_totp = parts[2].strip() if len(parts) > 2 else ""
+            totp = clean_totp_secret(raw_totp) if raw_totp and raw_totp not in {"-", "—", "none", "0"} else None
             recovery = parts[3].strip() if len(parts) > 3 else None
 
-            code, _ = generate_totp_code(totp)
-            if not code:
-                errors.append(f"Строка {idx} ({mail}): невалидный TOTP-секрет")
-                continue
+            if totp:
+                code, _ = generate_totp_code(totp)
+                if not code:
+                    errors.append(f"Строка {idx} ({mail}): невалидный TOTP-секрет")
+                    continue
 
             stock = GmailStock(
                 account_id=account.id,
                 email=mail,
                 password_encrypted=cipher.encrypt(pwd),
-                totp_secret_encrypted=cipher.encrypt(totp),
+                totp_secret_encrypted=cipher.encrypt(totp) if totp else None,
                 recovery_email=recovery,
                 status="available",
             )
@@ -544,8 +586,15 @@ async def gmail_stock_view(call: CallbackQuery) -> None:
 
     cipher = svc().cipher
     password = cipher.decrypt(stock.password_encrypted)
-    totp = cipher.decrypt(stock.totp_secret_encrypted)
-    code, rem = generate_totp_code(totp)
+    totp = cipher.decrypt(stock.totp_secret_encrypted) if stock.totp_secret_encrypted else None
+    if totp:
+        code, rem = generate_totp_code(totp)
+        totp_block = (
+            f"2FA Секрет: <code>{html.escape(totp)}</code>\n\n"
+            f"🔑 Текущий 2FA-код: <code>{code}</code> (ещё {rem} сек.)"
+        )
+    else:
+        totp_block = "2FA Секрет: <i>(не привязан, прямой вход)</i>"
 
     status_str = "🟢 В наличии (готов к продаже)" if stock.status == "available" else f"🔴 Выдан в сделке #{stock.issued_deal_id}"
 
@@ -554,15 +603,15 @@ async def gmail_stock_view(call: CallbackQuery) -> None:
         f"Статус: <b>{status_str}</b>\n"
         f"Почта: <code>{html.escape(stock.email)}</code>\n"
         f"Пароль: <code>{html.escape(password)}</code>\n"
-        f"2FA Секрет: <code>{html.escape(totp)}</code>\n\n"
-        f"🔑 Текущий 2FA-код: <code>{code}</code> (ещё {rem} сек.)"
+        f"{totp_block}"
     )
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Получить/Обновить 2FA", callback_data=f"gmail:totp:show_stock:{stock.id}")],
-        [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"gmail:stock:del:{stock.id}:0")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="gmail:stock:list:0")],
-    ])
+    buttons = []
+    if totp:
+        buttons.append([InlineKeyboardButton(text="🔑 Получить/Обновить 2FA", callback_data=f"gmail:totp:show_stock:{stock.id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"gmail:stock:del:{stock.id}:0")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="gmail:stock:list:0")])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     await edit(call, text, markup)
 
 

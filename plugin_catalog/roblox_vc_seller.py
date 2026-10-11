@@ -203,13 +203,29 @@ async def on_deal(ctx: Any, deal: Any) -> None:
         cfg = getattr(ctx, "config", {}) or {}
         auto_complete = cfg.get("auto_complete", True) and rule.auto_sent
         if auto_complete:
+            sent_ok = False
             try:
-                await ctx.client.set_deal_status(deal_id, ItemDealStatuses.SENT)
+                await ctx.update_deal(deal_id, ItemDealStatuses.SENT)
+                sent_ok = True
+            except Exception as exc:
+                logger.warning("Could not auto-complete deal %s via ctx.update_deal: %s, trying client fallback", deal_id, exc)
+                try:
+                    if hasattr(ctx.client, "update_deal"):
+                        await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
+                        sent_ok = True
+                    elif hasattr(ctx.client, "call"):
+                        await ctx.client.call("update_deal", deal_id=deal_id, new_status=ItemDealStatuses.SENT)
+                        sent_ok = True
+                    elif hasattr(ctx.client, "set_deal_status"):
+                        await ctx.client.set_deal_status(deal_id, ItemDealStatuses.SENT)
+                        sent_ok = True
+                except Exception as e2:
+                    logger.warning("Retry auto-complete deal %s failed: %s", deal_id, e2)
+
+            if sent_ok:
                 rbx_deal.deal_completed = True
                 await session.commit()
                 logger.info("Auto-completed Roblox deal %s with status SENT", deal_id)
-            except Exception as exc:
-                logger.warning("Could not auto-complete deal %s: %s", deal_id, exc)
 
         # Уведомляем продавца в Telegram
         notify_seller = cfg.get("notify_seller", True)

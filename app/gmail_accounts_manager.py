@@ -18,7 +18,7 @@ logger = logging.getLogger("gmail_accounts")
 
 
 class GmailStock(Base):
-    """Склад аккаунтов Gmail с TOTP-ключами."""
+    """Склад аккаунтов Gmail (с опциональным TOTP-ключом)."""
     __tablename__ = "gmail_stocks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -27,7 +27,7 @@ class GmailStock(Base):
     )
     email: Mapped[str] = mapped_column(String(190), nullable=False, index=True)
     password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
-    totp_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    totp_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     recovery_email: Mapped[str | None] = mapped_column(String(190), nullable=True)
     
     # Статус: 'available' (готов к продаже), 'issued' (выдан покупателю)
@@ -110,20 +110,28 @@ def generate_totp_code(secret: str) -> tuple[str | None, int]:
         return None, 0
 
 
-def format_delivery_message(email_addr: str, password: str, totp_secret: str) -> str:
+def format_delivery_message(email_addr: str, password: str, totp_secret: str | None = None) -> str:
     """
     Формирует сообщение автовыдачи для покупателя в чат Playerok.
     Нейтральный текст без триггерных стоп-слов.
     """
+    clean_totp = clean_totp_secret(totp_secret) if totp_secret else ""
+    if clean_totp:
+        totp_block = (
+            f"2FA Секрет: {clean_totp}\n\n"
+            "Для получения 6-значного кода подтверждения напишите в этот чат команду:\n"
+            "#2fa\n\n"
+            "(Также код можно сгенерировать самостоятельно на 2fa.live, вставив 2FA Секрет)."
+        )
+    else:
+        totp_block = "2FA (TOTP): Отключен (прямой вход без кодов)."
+
     return (
         "Здравствуйте! Спасибо за покупку.\n\n"
         "Ваши данные для авторизации:\n"
         f"Почта: {email_addr}\n"
         f"Пароль: {password}\n"
-        f"2FA Секрет: {clean_totp_secret(totp_secret)}\n\n"
-        "Для получения 6-значного кода подтверждения напишите в этот чат команду:\n"
-        "#2fa\n\n"
-        "(Также код можно сгенерировать самостоятельно на 2fa.live, вставив 2FA Секрет)."
+        f"{totp_block}"
     )
 
 

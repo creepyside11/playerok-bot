@@ -20,6 +20,7 @@ from app.telegram_accounts_ui import router as telegram_accounts_router
 from app.gmail_accounts_ui import router as gmail_accounts_router
 from app.accounts_ui import router as universal_accounts_router
 from app.bot_store_ui import router as bot_store_router
+from app.kosell_ui import router as kosell_router
 from app.handlers import Services, configure_handlers
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
@@ -58,6 +59,7 @@ async def main() -> None:
     dispatcher.include_router(supercell_router)
     dispatcher.include_router(roblox_router)
     dispatcher.include_router(bot_store_router)
+    dispatcher.include_router(kosell_router)
     dispatcher.include_router(items_manager_router)
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))

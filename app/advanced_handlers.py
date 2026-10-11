@@ -430,6 +430,7 @@ async def _show_delivery(call: CallbackQuery) -> None:
         )
     b.button(text="➕ Новое правило (текст/склад)", callback_data="delivery:add")
     b.button(text="🎮 Универсальная автовыдача (BR, игры)", callback_data="uacc:open")
+    b.button(text="🚀 KOSell Steam аренда (API)", callback_data="kosell:open")
     b.button(text="📧 Gmail 2FA автовыдача", callback_data="gmail:open")
     b.button(text="📱 Telegram автовыдача", callback_data="tgacc:open")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
@@ -1645,6 +1646,8 @@ async def plugin_view(call: CallbackQuery) -> None:
         rows.insert(1, [InlineKeyboardButton(text="⚡ Панель Supercell ID", callback_data="supercell:open")])
     elif plugin.id == "roblox_vc_seller":
         rows.insert(1, [InlineKeyboardButton(text="🎙️ Панель Roblox Voice Chat", callback_data="roblox_vc:open")])
+    elif plugin.id == "kosell_seller":
+        rows.insert(1, [InlineKeyboardButton(text="🚀 Панель KOSell Аренды", callback_data="kosell:open")])
     elif plugin.id == "bot_hosting":
         rows.insert(1, [InlineKeyboardButton(text="🤖 Панель Автохостинга Ботов", callback_data="botstore:open")])
     if hasattr(plugin.module, "on_action"):

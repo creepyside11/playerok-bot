@@ -139,8 +139,8 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     if not cipher:
         from app.handlers import svc
         cipher = svc().cipher
-    password = cipher.decrypt(stock_pwd_enc)
-    totp_secret = cipher.decrypt(stock_totp_enc)
+    password = cipher.decrypt(stock_pwd_enc) if stock_pwd_enc else ""
+    totp_secret = cipher.decrypt(stock_totp_enc) if stock_totp_enc else None
 
     # Отправляем сообщение покупателю в чат Playerok
     delivery_msg = format_delivery_message(stock_email, password, totp_secret)
@@ -149,8 +149,23 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     # Автозавершение сделки (перевод в статус SENT / выполнен продавцом)
     auto_complete = bool(ctx.config.get("auto_complete", True))
     if auto_complete:
+        sent_ok = False
         try:
             await ctx.update_deal(deal_id, ItemDealStatuses.SENT)
+            sent_ok = True
+        except Exception as exc:
+            logger.warning("Не удалось перевести сделку %s в SENT через ctx.update_deal: %s, пробуем клиентом", deal_id, exc)
+            try:
+                if hasattr(ctx.client, "call"):
+                    await ctx.client.call("update_deal", deal_id=deal_id, new_status=ItemDealStatuses.SENT)
+                    sent_ok = True
+                elif hasattr(ctx.client, "update_deal"):
+                    await ctx.client.update_deal(deal_id, ItemDealStatuses.SENT)
+                    sent_ok = True
+            except Exception as e2:
+                logger.warning("Повторная попытка перевода сделки %s в SENT не удалась: %s", deal_id, e2)
+
+        if sent_ok:
             async with ctx.db() as session:
                 rec = await session.scalar(
                     select(GmailDeal).where(
@@ -161,18 +176,17 @@ async def on_deal(ctx: Any, deal: Any) -> None:
                 if rec:
                     rec.deal_completed = True
                     await session.commit()
-        except Exception as exc:
-            logger.warning("Не удалось перевести сделку %s в SENT: %s", deal_id, exc)
 
     # Уведомляем продавца в Telegram
+    totp_line = f"2FA Секрет: <code>{html.escape(totp_secret)}</code>\n\n" if totp_secret else "2FA Секрет: <i>(не привязан)</i>\n\n"
     await ctx.notify(
         f"📧 <b>Выдан аккаунт Gmail покупателю</b>\n\n"
         f"Сделка: <code>{html.escape(deal_id)}</code>\n"
         f"Товар: <b>{html.escape(rule.lot_title)}</b>\n"
         f"Email: <code>{html.escape(stock_email)}</code>\n"
         f"Пароль: <code>{html.escape(password)}</code>\n"
-        f"2FA Секрет: <code>{html.escape(totp_secret)}</code>\n\n"
-        "✅ Заказ переведён в статус «Выполнен». Покупатель может получить код по команде <code>#2fa</code>."
+        f"{totp_line}"
+        "✅ Заказ переведён в статус «Выполнен»." + (" Покупатель может получить код по команде <code>#2fa</code>." if totp_secret else "")
     )
 
 
@@ -214,12 +228,22 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
             return
 
         stock = await session.get(GmailStock, deal_record.stock_id)
-        if not stock or not stock.totp_secret_encrypted:
-            await ctx.send_chat(chat_id, "⚠️ Данные 2FA не найдены. Обратитесь к продавцу.")
+        if not stock:
+            await ctx.send_chat(chat_id, "⚠️ Данные аккаунта не найдены. Обратитесь к продавцу.")
             return
 
-        cipher = svc().cipher
-        totp_secret = cipher.decrypt(stock.totp_secret_encrypted)
+        if not stock.totp_secret_encrypted:
+            await ctx.send_chat(
+                chat_id,
+                "ℹ️ Для данного аккаунта 2FA не включен. Вы можете войти по логину и паролю без кода подтверждения."
+            )
+            return
+
+        cipher = getattr(ctx, "cipher", None)
+        if not cipher:
+            from app.handlers import svc
+            cipher = svc().cipher
+        totp_secret = cipher.decrypt(stock.totp_secret_encrypted) if cipher else stock.totp_secret_encrypted
 
     code, rem = generate_totp_code(totp_secret)
     if not code:

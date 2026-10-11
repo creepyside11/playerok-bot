@@ -99,3 +99,11 @@ class GmailSellerState(StatesGroup):
     bulk_add = State()
     generate_totp = State()
 
+
+class KosellState(StatesGroup):
+    api_key = State()
+    search_product = State()
+    select_hours = State()
+    edit_template = State()
+
+
