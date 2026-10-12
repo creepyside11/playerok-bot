@@ -15,6 +15,7 @@ def main_menu() -> InlineKeyboardMarkup:
         ("📢 Товары", "menu:items"),
         ("⚡ Автовыдача", "menu:delivery"),
         ("🤖 Автоответчик", "menu:autoreply"),
+        ("🧠 Управление ИИ", "menu:ai_manager"),
         ("✅ Автоподтверждение", "menu:autoconfirm"),
         ("🧩 Плагины", "menu:plugins"),
         ("🔔 Уведомления", "menu:notifications"),

@@ -12,7 +12,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .handlers import active_account, clip, edit, require_account, svc
 from .keyboards import back_menu
+from .models import DeliveryRule, DeliveryStock
 from .states import ItemEdit
+from sqlalchemy import select
 
 logger = logging.getLogger("items_manager")
 router = Router(name="items_manager")
@@ -149,6 +151,21 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
     if attachments and hasattr(attachments[0], "url"):
         photos_note += f" · <a href=\"{attachments[0].url}\">Обложка ↗</a>"
 
+    # Проверяем наличие автовыдачи для этого товара в базе бота
+    delivery_info = "<i>Автовыдача не настроена</i>"
+    async with svc().db() as session:
+        deliv_rule = await session.scalar(
+            select(DeliveryRule).where(
+                DeliveryRule.account_id == account.id,
+                DeliveryRule.item_id == str(item_id),
+            )
+        )
+        if deliv_rule:
+            tmpl_preview = deliv_rule.message_template
+            if len(tmpl_preview) > 100:
+                tmpl_preview = tmpl_preview[:100] + "…"
+            delivery_info = f"<b>Включена</b> (<code>{html.escape(tmpl_preview)}</code>)"
+
     lines = [
         f"📦 <b>Лот: {html.escape(name)}</b>",
         "",
@@ -156,6 +173,7 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
         f"📊 Статус: <b>{status_label}</b>",
         f"🎮 Игра / Раздел: <b>{html.escape(game_name)}</b>",
         f"📂 Категория: <b>{html.escape(category_name)}</b>",
+        f"⚡ Автовыдача: {delivery_info}",
         f"🖼 Фотографий: {photos_note}",
         f"🆔 ID: <code>{html.escape(item_id)}</code>",
         "",
@@ -171,6 +189,9 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
     builder.row(
         InlineKeyboardButton(text="🔥 Сделать скидку", callback_data=f"item:edit:discount:{item_id}"),
         InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"item:edit:desc:{item_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔐 Данные выдачи / комментарий", callback_data=f"item:edit:delivery:{item_id}"),
     )
     builder.row(
         InlineKeyboardButton(text=f"🖼 Фото ({photos_count})", callback_data=f"item:edit:photo:{item_id}"),
@@ -470,6 +491,183 @@ async def item_save_description(message: Message, state: FSMContext) -> None:
             parse_mode="HTML",
             reply_markup=back_menu(f"item:view:{item_id}"),
         )
+
+
+# --- УПРАВЛЕНИЕ ДАННЫМИ ВЫДАЧИ И КОММЕНТАРИЕМ ---
+
+@router.callback_query(F.data.startswith("item:edit:delivery:"))
+async def item_edit_delivery_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    item_id = call.data.split(":")[3]
+    await state.clear()
+
+    async with svc().db() as session:
+        rule = await session.scalar(
+            select(DeliveryRule).where(
+                DeliveryRule.account_id == account.id,
+                DeliveryRule.item_id == str(item_id),
+            )
+        )
+
+    current_text = rule.message_template if rule else "<i>[Не настроена]</i>"
+
+    await state.set_state(ItemEdit.delivery_data)
+    await state.update_data(item_id=item_id, account_id=str(account.id))
+    await call.answer()
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Отключить автовыдачу", callback_data=f"item:deliv:clear:{item_id}")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")],
+        ]
+    )
+
+    await edit(
+        call,
+        "🔐 <b>Настройка автовыдачи и данных для выдачи</b>\n\n"
+        f"<b>Текущие данные выдачи:</b>\n<pre>{html.escape(current_text)}</pre>\n\n"
+        "Отправьте новые данные для выдачи покупателю (логин, пароль, ключ или ссылку).\n"
+        "<i>Следующим шагом можно будет указать комментарий/инструкцию.</i>\n\n"
+        "Для отмены нажмите кнопку ниже:",
+        markup,
+    )
+
+
+@router.callback_query(F.data.startswith("item:deliv:clear:"))
+async def item_delivery_clear(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    item_id = call.data.split(":")[3]
+    await state.clear()
+
+    async with svc().db() as session:
+        rule = await session.scalar(
+            select(DeliveryRule).where(
+                DeliveryRule.account_id == account.id,
+                DeliveryRule.item_id == str(item_id),
+            )
+        )
+        if rule:
+            await session.delete(rule)
+            await session.commit()
+
+    await call.answer("Автовыдача удалена")
+    client = await svc().gateway.get_client(account)
+    await render_item_card(call, account, client, item_id)
+
+
+@router.message(ItemEdit.delivery_data, F.text)
+async def item_save_delivery_data(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        return
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    await state.update_data(new_delivery_content=text)
+    await state.set_state(ItemEdit.delivery_comment)
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Без комментария (сохранить)", callback_data=f"item:delivcomment:skip:{item_id}")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")],
+        ]
+    )
+    await message.answer(
+        "📝 <b>Комментарий / инструкция для покупателя к выдаче:</b>\n\n"
+        "Напишите инструкцию (например: <i>«Не меняйте почту первые 24 часа. Гарантия на момент покупки.»</i>).\n\n"
+        "Или нажмите «Без комментария», чтобы сохранить только данные выдачи:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("item:delivcomment:skip:"))
+async def item_save_delivery_comment_skip(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_id = data.get("item_id") or call.data.split(":")[3]
+    content = data.get("new_delivery_content", "")
+    account = await require_account(call)
+    if not account or not item_id:
+        await state.clear()
+        return
+
+    async with svc().db() as session:
+        old = await session.scalar(
+            select(DeliveryRule).where(
+                DeliveryRule.account_id == account.id,
+                DeliveryRule.item_id == str(item_id),
+            )
+        )
+        if old:
+            await session.delete(old)
+            await session.flush()
+        rule = DeliveryRule(
+            account_id=account.id,
+            item_id=str(item_id),
+            mode="static",
+            message_template=content,
+            enabled=True,
+        )
+        session.add(rule)
+        await session.flush()
+        session.add(DeliveryStock(
+            rule_id=rule.id,
+            payload_encrypted=svc().cipher.encrypt(content),
+        ))
+        await session.commit()
+
+    await state.clear()
+    await call.answer("✅ Данные выдачи сохранены!", show_alert=True)
+    client = await svc().gateway.get_client(account)
+    await render_item_card(call, account, client, item_id)
+
+
+@router.message(ItemEdit.delivery_comment, F.text)
+async def item_save_delivery_comment(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    content = data.get("new_delivery_content", "")
+    comment = (message.text or "").strip()
+    account = await active_account(message.from_user.id)
+    if not account or not item_id:
+        await state.clear()
+        await message.answer("❌ Аккаунт не найден.")
+        return
+
+    full_template = f"{content}\n\n📝 Инструкция / Комментарий:\n{comment}" if comment and comment not in {"-", "—"} else content
+
+    async with svc().db() as session:
+        old = await session.scalar(
+            select(DeliveryRule).where(
+                DeliveryRule.account_id == account.id,
+                DeliveryRule.item_id == str(item_id),
+            )
+        )
+        if old:
+            await session.delete(old)
+            await session.flush()
+        rule = DeliveryRule(
+            account_id=account.id,
+            item_id=str(item_id),
+            mode="static",
+            message_template=full_template,
+            enabled=True,
+        )
+        session.add(rule)
+        await session.flush()
+        session.add(DeliveryStock(
+            rule_id=rule.id,
+            payload_encrypted=svc().cipher.encrypt(full_template),
+        ))
+        await session.commit()
+
+    await state.clear()
+    await message.answer("✅ <b>Данные автовыдачи и комментарий успешно сохранены!</b>", parse_mode="HTML")
+    client = await svc().gateway.get_client(account)
+    await render_item_card(message, account, client, item_id)
 
 
 # --- УПРАВЛЕНИЕ ФОТОГРАФИЯМИ ---

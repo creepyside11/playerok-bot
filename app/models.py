@@ -25,6 +25,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "api_key": "",
         "model_id": "claude-3-5-sonnet-20241022",
     },
+    "ai_manager": {
+        "llm_api_key": "",
+        "llm_base_url": "https://api.openai.com/v1",
+        "llm_model": "gpt-4o-mini",
+        "image_api_key": "",
+        "image_base_url": "https://api.openai.com/v1",
+        "image_model": "gpt-2.5-image",
+        "auto_delivery_enabled": False,
+        "auto_delivery_instruction": "Сгенерируй вежливое сообщение выдачи товара с инструкцией для покупателя.",
+    },
 }
 
 
@@ -36,6 +46,7 @@ def fresh_settings() -> dict[str, Any]:
         "auto_confirm_items": [],
         "auto_confirm_categories": [],
         "ai_builder": dict(DEFAULT_SETTINGS["ai_builder"]),
+        "ai_manager": dict(DEFAULT_SETTINGS.get("ai_manager", {})),
     }
 
 

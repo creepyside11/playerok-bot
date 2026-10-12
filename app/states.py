@@ -26,12 +26,13 @@ class ItemCreate(StatesGroup):
     obtaining = State()
     attributes = State()
     data_fields = State()
-    custom_credentials = State()
+    delivery_data = State()
+    delivery_comment = State()
     name = State()
     price = State()
-    discount_price = State()
     description = State()
     image = State()
+    discount_price = State()
     priority = State()
     template_name = State()
 
@@ -52,6 +53,18 @@ class ChatReply(StatesGroup):
 
 class PluginSettingEdit(StatesGroup):
     value = State()
+
+
+class AIManagerState(StatesGroup):
+    task = State()
+    task_photo = State()
+    llm_key = State()
+    llm_model = State()
+    llm_base_url = State()
+    image_key = State()
+    image_model = State()
+    image_base_url = State()
+    auto_delivery_instruction = State()
 
 
 class DeliveryStockAdd(StatesGroup):
@@ -76,6 +89,8 @@ class ItemEdit(StatesGroup):
     price = State()
     discount = State()
     description = State()
+    delivery_data = State()
+    delivery_comment = State()
     add_photo = State()
     replace_photo = State()
 

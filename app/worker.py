@@ -401,6 +401,48 @@ class WorkerManager:
                     )
                 )
         if not rule:
+            # Проверяем режим умной автономной автовыдачи ИИ (AI Autonomous Delivery)
+            cfg = dict(account.settings or {})
+            ai_cfg = cfg.get("ai_manager", {})
+            if ai_cfg.get("auto_delivery_enabled") and ai_cfg.get("llm_api_key"):
+                action_id = str(deal.id)
+                if not await claim_event(self.db, account.id, "delivery_action", action_id):
+                    return True
+                chat_id = getattr(getattr(deal, "chat", None), "id", None)
+                if not chat_id:
+                    await release_event(self.db, account.id, "delivery_action", action_id)
+                    return False
+
+                buyer = getattr(getattr(deal, "user", None), "username", "") or ""
+                item_name = getattr(getattr(deal, "item", None), "name", "") or ""
+                instruction = ai_cfg.get("auto_delivery_instruction") or "Ты продавец. Сгенерируй вежливое приветствие, данные выдачи и инструкцию для покупателя."
+
+                from .ai_manager import UniversalOpenAIClient
+                llm = UniversalOpenAIClient(
+                    api_key=ai_cfg.get("llm_api_key", ""),
+                    base_url=ai_cfg.get("llm_base_url", "https://api.openai.com/v1"),
+                    model=ai_cfg.get("llm_model", "gpt-4o-mini"),
+                )
+                try:
+                    ai_reply = await llm.chat_completion(
+                        messages=[
+                            {"role": "system", "content": f"Ты автономный ИИ-помощник продавца на Playerok.\nИнструкция: {instruction}"},
+                            {"role": "user", "content": f"Новый оплаченный заказ!\nТовар: {item_name}\nПокупатель: {buyer}\nСделка: {action_id}\n\nСгенерируй сообщение выдачи покупателю."},
+                        ],
+                        temperature=0.3,
+                    )
+                    await client.send_message(str(chat_id), ai_reply, mark_chat_as_read=True)
+                    await self._notify(
+                        account.tg_user_id,
+                        f"🤖 <b>ИИ Автовыдача отправлена</b> по заказу <code>{html.escape(action_id)}</code>:\n"
+                        f"<code>{html.escape(ai_reply[:500])}</code>",
+                    )
+                    return True
+                except Exception as ai_deliv_err:
+                    await release_event(self.db, account.id, "delivery_action", action_id)
+                    logger.warning("AI auto-delivery failed: %s", ai_deliv_err)
+                    return None
+
             return None
 
         action_id = str(deal.id)

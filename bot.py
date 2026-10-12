@@ -62,6 +62,9 @@ async def main() -> None:
     dispatcher.include_router(bot_store_router)
     dispatcher.include_router(kosell_router)
     dispatcher.include_router(autosmm_router)
+    from app.ai_manager_ui import router as ai_manager_router, set_plugin_manager as set_ai_plugin_manager
+    set_ai_plugin_manager(plugin_manager)
+    dispatcher.include_router(ai_manager_router)
     dispatcher.include_router(items_manager_router)
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))

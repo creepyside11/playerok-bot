@@ -1606,64 +1606,70 @@ async def item_fields(message: Message, state: FSMContext) -> None:
         await message.answer(prompt, parse_mode="HTML")
         return
     await state.update_data(data_field_values=values)
-    await _ask_custom_credentials_or_name(message, state)
+    await _ask_delivery_data_or_name(message, state)
 
 
-async def _ask_custom_credentials_or_name(target: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    # Проверяем, были ли уже заполнены поля логина/пароля в data_fields
-    values = data.get("data_field_values") or {}
-    field_meta = data.get("field_meta") or []
-    labels = [str(f[1]).lower() for f in field_meta if f[0] in values]
-    has_creds = any(any(k in lbl for k in ("логин", "login", "пароль", "password", "аккаунт", "account")) for lbl in labels)
-
-    if has_creds:
-        await state.set_state(ItemCreate.name)
-        await target.answer("🏷 <b>Название товара:</b>", parse_mode="HTML")
-        return
-
-    # Предлагаем ввести данные выдачи (логин, пароль, ID аккаунта, комментарий)
+async def _ask_delivery_data_or_name(target: Message, state: FSMContext) -> None:
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Пропустить (без автовыдачи)", callback_data="itemcreds:skip")]
+        [InlineKeyboardButton(text="⏭ Пропустить автовыдачу", callback_data="itemdelivery:skip")]
     ])
-    await state.set_state(ItemCreate.custom_credentials)
+    await state.set_state(ItemCreate.delivery_data)
     await target.answer(
-        "🔐 <b>Данные для выдачи покупателю (Black Russia, аккаунты, доступы)</b>\n\n"
-        "Отправьте данные аккаунта для автоматической выдачи после покупки в формате:\n"
-        "<code>Логин\nПароль\nID аккаунта / Никнейм\nКомментарий или инструкция для покупателя</code>\n\n"
-        "<i>Или отправьте данные в любом удобном виде. Если автовыдача для этого товара не требуется, нажмите «Пропустить»:</i>",
+        "🔐 <b>Данные для выдачи покупателю (логин, пароль, ключ, код)</b>\n\n"
+        "Отправьте данные, которые бот автоматически отправит покупателю сразу после оплаты.\n"
+        "<i>Пример: <code>логин:пароль</code> или <code>аккаунт:пароль:секрет</code></i>\n\n"
+        "Если автовыдача для этого товара не нужна, нажмите «Пропустить»:",
         reply_markup=markup,
         parse_mode="HTML",
     )
 
 
-@router.callback_query(ItemCreate.custom_credentials, F.data == "itemcreds:skip")
-async def item_custom_credentials_skip(call: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(ItemCreate.delivery_data, F.data == "itemdelivery:skip")
+async def item_delivery_data_skip(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
+    await state.update_data(delivery_content=None, delivery_comment=None)
     await state.set_state(ItemCreate.name)
     await edit(call, "🏷 <b>Название товара:</b>", parse_mode="HTML")
 
 
-@router.message(ItemCreate.custom_credentials)
-async def item_custom_credentials_input(message: Message, state: FSMContext) -> None:
+@router.message(ItemCreate.delivery_data)
+async def item_delivery_data_input(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if text in {"-", "—", "пропустить", "skip"}:
+    if text in {"-", "—", "пропустить", "skip", "нет"}:
+        await state.update_data(delivery_content=None, delivery_comment=None)
         await state.set_state(ItemCreate.name)
         await message.answer("🏷 <b>Название товара:</b>", parse_mode="HTML")
         return
 
-    # Сохраняем пользовательские данные выдачи
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    creds_data = {
-        "raw_text": text,
-        "login": lines[0] if len(lines) > 0 else "",
-        "password": lines[1] if len(lines) > 1 else "",
-        "account_id": lines[2] if len(lines) > 2 else "",
-        "comment": "\n".join(lines[3:]) if len(lines) > 3 else "",
-    }
-    await state.update_data(custom_credentials=creds_data)
+    await state.update_data(delivery_content=text)
+    await state.set_state(ItemCreate.delivery_comment)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Без комментария", callback_data="itemdelivcomment:skip")]
+    ])
+    await message.answer(
+        "📝 <b>Комментарий / инструкция к выдаче для покупателя:</b>\n\n"
+        "Напишите пояснение или инструкцию (например: <i>«Не меняйте почту первые 24 часа. Гарантия на момент покупки.»</i>).\n\n"
+        "Если комментарий не нужен, нажмите «Без комментария»:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(ItemCreate.delivery_comment, F.data == "itemdelivcomment:skip")
+async def item_delivery_comment_skip(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(delivery_comment=None)
     await state.set_state(ItemCreate.name)
-    await message.answer("✅ Данные выдачи сохранены!\n\n🏷 <b>Название товара:</b>", parse_mode="HTML")
+    await edit(call, "✅ Данные выдачи сохранены!\n\n🏷 <b>Название товара:</b>", parse_mode="HTML")
+
+
+@router.message(ItemCreate.delivery_comment)
+async def item_delivery_comment_input(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    comment = None if text in {"-", "—", "пропустить", "skip", "нет"} else text
+    await state.update_data(delivery_comment=comment)
+    await state.set_state(ItemCreate.name)
+    await message.answer("✅ Данные выдачи и комментарий сохранены!\n\n🏷 <b>Название товара:</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.name)
@@ -1687,57 +1693,9 @@ async def item_price(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Введите положительное целое число от 1 до 10 000 000 ₽:")
         return
     await state.update_data(item_price=value)
-    await state.set_state(ItemCreate.discount_price)
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Без скидки", callback_data="itemdiscount:skip")]
-    ])
-    await message.answer(
-        f"💰 Базовая цена: <b>{value} ₽</b>\n\n"
-        "🏷 <b>Хотите указать цену со скидкой?</b>\n"
-        "<i>На Playerok старая цена будет отображаться зачёркнутой (<code>prevPrice</code>), "
-        "а лот получит яркий шильдик со скидкой 🔥</i>\n\n"
-        f"Отправьте цену со скидкой (меньше {value} ₽) или нажмите «Без скидки»:",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(ItemCreate.discount_price, F.data == "itemdiscount:skip")
-async def item_discount_skip(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    await state.update_data(item_discount_price=None)
+    # Скидка теперь задается в самом конце перед публикацией или при редактировании лота
     await state.set_state(ItemCreate.description)
-    await edit(call, "📝 <b>Описание товара:</b>", parse_mode="HTML")
-
-
-@router.message(ItemCreate.discount_price)
-async def item_discount_price(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text in {"-", "—", "пропустить", "skip", "нет"}:
-        await state.update_data(item_discount_price=None)
-        await state.set_state(ItemCreate.description)
-        await message.answer("📝 <b>Описание товара:</b>", parse_mode="HTML")
-        return
-
-    data = await state.get_data()
-    base_price = int(data.get("item_price", 0))
-    try:
-        clean_val = text.replace(" ", "").replace("₽", "").replace("руб", "").replace("р", "")
-        disc_val = int(clean_val)
-        if disc_val <= 0 or disc_val >= base_price:
-            raise ValueError
-    except ValueError:
-        await message.answer(f"⚠️ Цена со скидкой должна быть целым числом больше 0 и меньше базовой ({base_price} ₽).\nПовторите ввод или отправьте «-» для пропуска:")
-        return
-
-    await state.update_data(item_discount_price=disc_val)
-    await state.set_state(ItemCreate.description)
-    pct = round((1 - disc_val / base_price) * 100)
-    await message.answer(
-        f"🔥 <b>Скидка настроена:</b> ~{pct}% (было {base_price} ₽ ➔ станет <b>{disc_val} ₽</b>)\n\n"
-        "📝 <b>Описание товара:</b>",
-        parse_mode="HTML",
-    )
+    await message.answer(f"💰 Цена: <b>{value} ₽</b>\n\n📝 <b>Описание товара:</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.description)
@@ -1845,11 +1803,88 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
     b = InlineKeyboardBuilder()
     for i, (_id, name, price) in enumerate(packed):
         b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
+    b.button(text="🔥 Указать цену со скидкой", callback_data="itemdiscount:prompt")
     b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
     b.button(text="Оставить черновиком", callback_data="itemprio:draft")
     b.adjust(1)
+    disc_info = ""
+    if data.get("item_discount_price"):
+        disc_info = f"\n🔥 Цена со скидкой: <b>{data['item_discount_price']} ₽</b> (базовая: {data['item_price']} ₽)"
     await target.answer(
-        f"✅ Черновик создан: <code>{html.escape(str(item.id))}</code>\nВыберите публикацию.",
+        f"✅ Черновик создан: <code>{html.escape(str(item.id))}</code>{disc_info}\nВыберите публикацию или задайте скидку:",
+        reply_markup=b.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(ItemCreate.priority, F.data == "itemdiscount:prompt")
+async def item_create_discount_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    base_price = int(data.get("item_price", 0))
+    await state.set_state(ItemCreate.discount_price)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад к публикации", callback_data="itemdiscount:cancel")]
+    ])
+    await edit(
+        call,
+        f"🔥 <b>Установка цены со скидкой для лота</b>\n\n"
+        f"Базовая цена: <b>{base_price} ₽</b>\n"
+        f"Отправьте цену со скидкой (целое число меньше {base_price} ₽):\n"
+        f"<i>На Playerok базовая цена станет зачёркнутой, а лот получит шильдик со скидкой!</i>",
+        markup,
+    )
+
+
+@router.callback_query(ItemCreate.discount_price, F.data == "itemdiscount:cancel")
+async def item_create_discount_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    packed = data.get("priorities", [])
+    await state.set_state(ItemCreate.priority)
+    b = InlineKeyboardBuilder()
+    for i, (_id, name, price) in enumerate(packed):
+        b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
+    b.button(text="🔥 Указать цену со скидкой", callback_data="itemdiscount:prompt")
+    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
+    b.button(text="Оставить черновиком", callback_data="itemprio:draft")
+    b.adjust(1)
+    disc_info = ""
+    if data.get("item_discount_price"):
+        disc_info = f"\n🔥 Цена со скидкой: <b>{data['item_discount_price']} ₽</b> (базовая: {data['item_price']} ₽)"
+    await edit(
+        call,
+        f"✅ Черновик: <code>{html.escape(str(data.get('new_item_id', '')))}</code>{disc_info}\nВыберите публикацию:",
+        b.as_markup(),
+    )
+
+
+@router.message(ItemCreate.discount_price)
+async def item_create_discount_value(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    base_price = int(data.get("item_price", 0))
+    text = (message.text or "").strip()
+    try:
+        clean_val = text.replace(" ", "").replace("₽", "").replace("руб", "").replace("р", "")
+        disc_val = int(clean_val)
+        if disc_val <= 0 or disc_val >= base_price:
+            raise ValueError
+    except ValueError:
+        await message.answer(f"⚠️ Цена со скидкой должна быть целым числом больше 0 и меньше базовой ({base_price} ₽).\nПовторите ввод:")
+        return
+
+    await state.update_data(item_discount_price=disc_val)
+    packed = data.get("priorities", [])
+    await state.set_state(ItemCreate.priority)
+    b = InlineKeyboardBuilder()
+    for i, (_id, name, price) in enumerate(packed):
+        b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
+    b.button(text="🔥 Изменить цену со скидкой", callback_data="itemdiscount:prompt")
+    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
+    b.button(text="Оставить черновиком", callback_data="itemprio:draft")
+    b.adjust(1)
+    pct = round((1 - disc_val / base_price) * 100)
+    await message.answer(
+        f"🔥 <b>Скидка установлена: {disc_val} ₽</b> (-{pct}% от {base_price} ₽)\n\n"
+        "Выберите публикацию на Playerok:",
         reply_markup=b.as_markup(),
         parse_mode="HTML",
     )
@@ -1910,23 +1945,34 @@ async def item_publish(call: CallbackQuery, state: FSMContext) -> None:
             except Exception as upd_exc:
                 logger.warning("Failed to apply discount price: %s", upd_exc)
 
-        # Если были указаны кастомные данные выдачи (логин, пароль, ID аккаунта, комментарий),
-        # автоматически привязываем автовыдачу к этому лоту
+        # Привязываем автовыдачу и комментарий к этому лоту, если были указаны
+        delivery_content = data.get("delivery_content")
+        delivery_comment = data.get("delivery_comment")
         custom_creds = data.get("custom_credentials")
-        if custom_creds and custom_creds.get("raw_text"):
+
+        final_delivery_text = None
+        if delivery_content:
+            if delivery_comment:
+                final_delivery_text = f"{delivery_content}\n\n📝 Инструкция / Комментарий:\n{delivery_comment}"
+            else:
+                final_delivery_text = delivery_content
+        elif custom_creds and custom_creds.get("raw_text"):
+            final_delivery_text = custom_creds["raw_text"]
+
+        if final_delivery_text:
             async with svc().db() as session:
                 rule = DeliveryRule(
                     account_id=account.id,
                     item_id=str(data["new_item_id"]),
-                    mode="single",
-                    message_template=custom_creds["raw_text"],
+                    mode="static",
+                    message_template=final_delivery_text,
                     enabled=True,
                 )
                 session.add(rule)
                 await session.flush()
                 session.add(DeliveryStock(
                     rule_id=rule.id,
-                    payload_encrypted=svc().cipher.encrypt(custom_creds["raw_text"])
+                    payload_encrypted=svc().cipher.encrypt(final_delivery_text)
                 ))
                 await session.commit()
     except Exception as exc:
