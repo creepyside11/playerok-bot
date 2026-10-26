@@ -9,7 +9,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from .crypto import SecretCipher
 from .emerald_promo_manager import (
@@ -148,6 +148,29 @@ async def emp_open(call: CallbackQuery, state: FSMContext) -> None:
     if not account:
         return
     await call.answer()
+    await render_emerald_settings(call, account)
+
+
+@router.callback_query(F.data == "emp:retry")
+async def emp_retry_failed(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    async with svc().db() as session:
+        result = await session.execute(
+            update(EmeraldPromoIssue)
+            .where(
+                EmeraldPromoIssue.account_id == account.id,
+                EmeraldPromoIssue.status == "failed",
+            )
+            .values(status="creating", error_text=None)
+        )
+        retried = int(result.rowcount or 0)
+        await session.commit()
+    await call.answer(
+        f"Повторная выдача запущена для {retried} заказ(ов)." if retried else "Ошибок для повтора нет.",
+        show_alert=True,
+    )
     await render_emerald_settings(call, account)
 
 

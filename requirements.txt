@@ -25,3 +25,6 @@ telethon>=1.36.0
 # 2FA TOTP (Google Authenticator)
 pyotp>=2.9.0
 
+# AI-конструктор плагинов (app/ai_plugin_builder.py)
+anthropic>=0.40.0,<1
+

@@ -77,7 +77,7 @@ async def uacc_main_menu(call: CallbackQuery, state: FSMContext) -> None:
     builder.row(InlineKeyboardButton(text="🎮 Мои игры и приложения", callback_data="uacc:games:0"))
     builder.row(InlineKeyboardButton(text="➕ Добавить игру / категорию", callback_data="uacc:game:add_menu"))
     builder.row(InlineKeyboardButton(text="📋 Привязанные лоты Playerok", callback_data="uacc:rules:0"))
-    builder.row(InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:root"))
+    builder.row(InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main"))
 
     text = (
         "🎮 <b>Универсальная автовыдача аккаунтов</b>\n\n"
@@ -95,11 +95,12 @@ async def uacc_main_menu(call: CallbackQuery, state: FSMContext) -> None:
 # --- СПИСОК ИГР ---
 
 @router.callback_query(F.data.startswith("uacc:games:"))
-async def uacc_games_list(call: CallbackQuery) -> None:
+async def uacc_games_list(call: CallbackQuery, page: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
-    page = int(call.data.split(":")[2])
+    if page is None:
+        page = int(call.data.split(":")[2])
     page_size = 6
 
     async with svc().db() as session:
@@ -414,13 +415,16 @@ async def uacc_stock_add_save(message: Message, state: FSMContext) -> None:
 # --- СПИСОК АККАУНТОВ СКЛАДА ---
 
 @router.callback_query(F.data.startswith("uacc:stock:list:"))
-async def uacc_stock_list_view(call: CallbackQuery) -> None:
+async def uacc_stock_list_view(
+    call: CallbackQuery, gid: int | None = None, page: int | None = None
+) -> None:
     account = await require_account(call)
     if not account:
         return
-    parts = call.data.split(":")
-    gid = int(parts[3])
-    page = int(parts[4])
+    if gid is None or page is None:
+        parts = call.data.split(":")
+        gid = int(parts[3])
+        page = int(parts[4])
     page_size = 6
 
     async with svc().db() as session:
@@ -491,8 +495,7 @@ async def uacc_stock_delete(call: CallbackQuery) -> None:
         await session.commit()
 
     await call.answer("Аккаунт удалён со склада.")
-    call.data = f"uacc:stock:list:{gid}:{page}"
-    await uacc_stock_list_view(call)
+    await uacc_stock_list_view(call, gid=gid, page=page)
 
 
 @router.callback_query(F.data.startswith("uacc:stock:view:"))
@@ -713,11 +716,12 @@ async def uacc_rule_delete(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("uacc:rule:view:"))
-async def uacc_rule_view(call: CallbackQuery) -> None:
+async def uacc_rule_view(call: CallbackQuery, rid: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
-    rid = int(call.data.split(":")[3])
+    if rid is None:
+        rid = int(call.data.split(":")[3])
     async with svc().db() as session:
         rule = await session.get(UniversalAccountLotRule, rid)
         if not rule:
@@ -769,8 +773,7 @@ async def uacc_rule_toggle_mail(call: CallbackQuery) -> None:
             rule.enable_mail_codes = not curr
             await session.commit()
     await call.answer("Настройка кодов почты обновлена.")
-    call.data = f"uacc:rule:view:{rid}"
-    await uacc_rule_view(call)
+    await uacc_rule_view(call, rid=rid)
 
 
 @router.callback_query(F.data.startswith("uacc:rule:edit_tmpl:"))
@@ -850,18 +853,18 @@ async def uacc_rule_reset_tmpl(call: CallbackQuery, state: FSMContext) -> None:
             await session.commit()
 
     await call.answer("Шаблон сброшен к стандартному")
-    call.data = f"uacc:rule:view:{rid}"
-    await uacc_rule_view(call)
+    await uacc_rule_view(call, rid=rid)
 
 
 # --- ГЛУБОКАЯ НАСТРОЙКА ИГРЫ (ШАБЛОН, ДОП. ПОЛЕ, ПОЧТОВЫЕ КОДЫ) ---
 
 @router.callback_query(F.data.startswith("uacc:game:custom_cfg:"))
-async def uacc_game_custom_config(call: CallbackQuery) -> None:
+async def uacc_game_custom_config(call: CallbackQuery, gid: int | None = None) -> None:
     account = await require_account(call)
     if not account:
         return
-    gid = int(call.data.split(":")[3])
+    if gid is None:
+        gid = int(call.data.split(":")[3])
 
     async with svc().db() as session:
         game = await session.get(UniversalGame, gid)
@@ -909,8 +912,7 @@ async def uacc_game_toggle_mail(call: CallbackQuery) -> None:
             await session.commit()
 
     await call.answer("Настройка кодов почты обновлена.")
-    call.data = f"uacc:game:custom_cfg:{gid}"
-    await uacc_game_custom_config(call)
+    await uacc_game_custom_config(call, gid=gid)
 
 
 @router.callback_query(F.data.startswith("uacc:game:edit_extra:"))
@@ -955,8 +957,7 @@ async def uacc_game_preset_extra_save(call: CallbackQuery, state: FSMContext) ->
             await session.commit()
 
     await call.answer(f"Поле названо: {name}")
-    call.data = f"uacc:game:custom_cfg:{gid}"
-    await uacc_game_custom_config(call)
+    await uacc_game_custom_config(call, gid=gid)
 
 
 @router.message(UniversalAccStates.game_extra_name_edit, F.text)
@@ -1059,8 +1060,7 @@ async def uacc_game_reset_tmpl(call: CallbackQuery, state: FSMContext) -> None:
             await session.commit()
 
     await call.answer("Шаблон игры сброшен к стандартному")
-    call.data = f"uacc:game:custom_cfg:{gid}"
-    await uacc_game_custom_config(call)
+    await uacc_game_custom_config(call, gid=gid)
 
 
 @router.callback_query(F.data.startswith("uacc:rule:toggle:"))
@@ -1075,8 +1075,7 @@ async def uacc_rule_toggle(call: CallbackQuery) -> None:
             rule.enabled = not rule.enabled
             await session.commit()
     await call.answer("Статус правила обновлён.")
-    call.data = f"uacc:rule:view:{rid}"
-    await uacc_rule_view(call)
+    await uacc_rule_view(call, rid=rid)
 
 
 @router.callback_query(F.data.startswith("uacc:rule:toggle_sent:"))
@@ -1091,8 +1090,7 @@ async def uacc_rule_toggle_sent(call: CallbackQuery) -> None:
             rule.auto_sent = not rule.auto_sent
             await session.commit()
     await call.answer("Автовыполнение обновлено.")
-    call.data = f"uacc:rule:view:{rid}"
-    await uacc_rule_view(call)
+    await uacc_rule_view(call, rid=rid)
 
 
 @router.callback_query(F.data.startswith("uacc:game:del_ask:"))
@@ -1118,8 +1116,7 @@ async def uacc_game_delete_confirm(call: CallbackQuery) -> None:
         await session.execute(delete(UniversalGame).where(UniversalGame.id == gid, UniversalGame.account_id == account.id))
         await session.commit()
     await call.answer("Игра удалена.")
-    call.data = "uacc:games:0"
-    await uacc_games_list(call)
+    await uacc_games_list(call, page=0)
 
 
 def back_to_games() -> InlineKeyboardMarkup:

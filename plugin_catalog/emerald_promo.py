@@ -5,6 +5,7 @@ import html
 import logging
 from typing import Any
 
+import requests
 from sqlalchemy import select
 
 from app.emerald_promo_manager import (

@@ -462,6 +462,7 @@ async def kosell_pair_confirm(call: CallbackQuery) -> None:
             existing.product_name = product_name
             existing.lot_title = lot_title
             existing.enabled = True
+            saved_rule = existing
         else:
             rule = KosellLotRule(
                 account_id=account.id,
@@ -473,10 +474,11 @@ async def kosell_pair_confirm(call: CallbackQuery) -> None:
                 enabled=True,
             )
             session.add(rule)
+            saved_rule = rule
         await session.commit()
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏱ Настроить длительность (1ч по умолч.)", callback_data=f"kosell:rule_hours:{lot_id}")],
+        [InlineKeyboardButton(text="⏱ Настроить длительность (1ч по умолч.)", callback_data=f"kosell:rule_view:{saved_rule.id}")],
         [InlineKeyboardButton(text="📋 Список привязок", callback_data="kosell:rules")],
         [InlineKeyboardButton(text="🚀 В меню KOSell", callback_data="kosell:open")],
     ])

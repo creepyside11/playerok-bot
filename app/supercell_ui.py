@@ -611,6 +611,87 @@ async def supercell_rule_view(call: CallbackQuery) -> None:
     await edit(call, text, builder.as_markup())
 
 
+@router.callback_query(F.data.startswith("sc_rule_tmpl_reset:"))
+async def supercell_rule_template_reset(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    rule_id = int(call.data.split(":", 1)[1])
+    async with svc().db() as session:
+        rule = await session.get(SupercellLotRule, rule_id)
+        if not rule or rule.account_id != account.id:
+            await call.answer("Правило не найдено", show_alert=True)
+            return
+        rule.delivery_template = DEFAULT_SUPERCELL_DELIVERY_TEMPLATE
+        await session.commit()
+    await call.answer("Шаблон сброшен к стандартному")
+    await supercell_rule_view(call)
+
+
+@router.callback_query(F.data.startswith("sc_rule_tmpl:"))
+async def supercell_rule_template_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+
+    rule_id = int(call.data.split(":", 1)[1])
+    async with svc().db() as session:
+        rule = await session.get(SupercellLotRule, rule_id)
+        if not rule or rule.account_id != account.id:
+            await call.answer("Правило не найдено", show_alert=True)
+            return
+        current = rule.delivery_template or DEFAULT_SUPERCELL_DELIVERY_TEMPLATE
+
+    await state.clear()
+    await state.set_state(SupercellStates.lot_template_edit)
+    await state.update_data(rule_id=rule_id)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить к стандартному", callback_data=f"sc_rule_tmpl_reset:{rule_id}")],
+        [InlineKeyboardButton(text="⬅️ К правилу", callback_data=f"sc_rule_view:{rule_id}")],
+    ])
+    await call.answer()
+    await edit(
+        call,
+        "✏️ <b>Шаблон выдачи Supercell ID</b>\n\n"
+        "Отправьте новый текст шаблона. Используйте <code>{login}</code>, <code>{password}</code>, "
+        "<code>{email}</code> и <code>{email_password}</code> как подстановки.\n\n"
+        f"<b>Текущий шаблон:</b>\n<pre>{html.escape(current[:1500])}</pre>",
+        markup,
+    )
+
+
+@router.message(SupercellStates.lot_template_edit, F.text)
+async def supercell_rule_template_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    rule_id = data.get("rule_id")
+    new_template = (message.text or "").strip()
+    account = await active_account(message.from_user.id)
+    if not account or not rule_id:
+        await state.clear()
+        await message.answer("❌ Аккаунт или правило не найдены. Откройте настройку заново.")
+        return
+    if not new_template:
+        await message.answer("⚠️ Шаблон не может быть пустым. Отправьте текст ещё раз.")
+        return
+
+    async with svc().db() as session:
+        rule = await session.get(SupercellLotRule, int(rule_id))
+        if not rule or rule.account_id != account.id:
+            await state.clear()
+            await message.answer("❌ Правило не найдено.")
+            return
+        rule.delivery_template = new_template
+        await session.commit()
+
+    await state.clear()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ К правилу", callback_data=f"sc_rule_view:{rule_id}")],
+    ])
+    await message.answer("✅ <b>Шаблон выдачи сохранён!</b>", parse_mode="HTML", reply_markup=markup)
+
+
 @router.callback_query(F.data.startswith("sc_rule_toggle:"))
 async def supercell_rule_toggle(call: CallbackQuery) -> None:
     account = await require_account(call)

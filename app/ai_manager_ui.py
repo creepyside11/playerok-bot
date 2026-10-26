@@ -3,6 +3,7 @@
 и выполнения автономных задач через LLM.
 """
 
+import base64
 import copy
 import html
 import json

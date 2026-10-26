@@ -27,8 +27,11 @@ def main_menu() -> InlineKeyboardMarkup:
 
 
 def back_menu(target: str = "main") -> InlineKeyboardMarkup:
+    # Полные callback-и (например "items:list" или "item:view:123") используем как есть,
+    # а короткие имена разделов ("items", "delivery") превращаем в "menu:<раздел>".
+    callback = target if ":" in target else f"menu:{target}"
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"menu:{target}")]]
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=callback)]]
     )
 
 

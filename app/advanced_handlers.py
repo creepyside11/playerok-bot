@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import html
 import uuid
 from collections import defaultdict
@@ -313,6 +314,9 @@ async def search_game_choose(call: CallbackQuery, state: FSMContext) -> None:
         return
     game_id, game_name, slug = games[idx]
     account = await active_account(call.from_user.id)
+    if not account:
+        await call.answer("Сначала добавьте Playerok аккаунт", show_alert=True)
+        return
     game = await (await svc().gateway.get_client(account)).call("get_game", id=game_id)
     categories = [(str(c.id), str(c.name)) for c in list(getattr(game, "categories", []) or [])]
     await state.update_data(categories=categories, selected_game_name=game_name, selected_game_slug=slug)
@@ -383,6 +387,8 @@ async def autoreply_view(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("ar:toggle:"))
 async def autoreply_toggle(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(AutoReplyRule, rid)
@@ -396,6 +402,8 @@ async def autoreply_toggle(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("ar:remove:"))
 async def autoreply_remove(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(AutoReplyRule, rid)
@@ -455,6 +463,8 @@ async def delivery_menu(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("del:view:"))
 async def delivery_view(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(DeliveryRule, rid)
@@ -491,6 +501,8 @@ async def delivery_view(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("del:toggle:"))
 async def delivery_toggle(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(DeliveryRule, rid)
@@ -504,6 +516,8 @@ async def delivery_toggle(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("del:stock:"))
 async def delivery_stock_start(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(DeliveryRule, rid)
@@ -524,6 +538,10 @@ async def delivery_stock_value(message: Message, state: FSMContext) -> None:
         await message.answer("Склад пуст.")
         return
     account = await active_account(message.from_user.id)
+    if not account:
+        await state.clear()
+        await message.answer("❌ Аккаунт не найден.")
+        return
     async with svc().db() as session:
         rule = await session.get(DeliveryRule, rid)
         if not rule or rule.account_id != account.id:
@@ -539,6 +557,8 @@ async def delivery_stock_value(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("del:remove:"))
 async def delivery_remove(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     rid = int(call.data.rsplit(":", 1)[-1])
     async with svc().db() as session:
         rule = await session.get(DeliveryRule, rid)
@@ -1663,6 +1683,8 @@ async def plugin_action(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("plugin:view:"))
 async def plugin_view(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     idx = int(call.data.rsplit(":", 1)[-1])
     plugin = plugins().by_index(idx)
     if not plugin:
@@ -1714,6 +1736,8 @@ async def plugin_view(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("plugin:toggle:"))
 async def plugin_toggle(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     idx = int(call.data.rsplit(":", 1)[-1])
     plugin = plugins().by_index(idx)
     if not plugin:
@@ -1727,6 +1751,8 @@ async def plugin_toggle(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("plugin:settings:"))
 async def plugin_settings(call: CallbackQuery) -> None:
     account = await require_account(call)
+    if not account:
+        return
     idx = int(call.data.rsplit(":", 1)[-1])
     plugin = plugins().by_index(idx)
     if not plugin:
@@ -1753,6 +1779,8 @@ async def plugin_setting_click(call: CallbackQuery, state: FSMContext) -> None:
     _prefix, idx_raw, key = call.data.split(":", 2)
     idx = int(idx_raw)
     account = await require_account(call)
+    if not account:
+        return
     plugin = plugins().by_index(idx)
     if not plugin or key not in plugin.settings:
         return
@@ -1788,8 +1816,10 @@ async def plugin_choice(call: CallbackQuery) -> None:
     _p, idx_raw, key, ci_raw = call.data.split(":", 3)
     idx, ci = int(idx_raw), int(ci_raw)
     account = await require_account(call)
+    if not account:
+        return
     plugin = plugins().by_index(idx)
-    if not plugin:
+    if not plugin or key not in plugin.settings:
         return
     choices = list(plugin.settings[key].get("choices") or [])
     if ci >= len(choices):

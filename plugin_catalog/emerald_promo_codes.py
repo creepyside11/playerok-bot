@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import select
 from playerokapi.enums import ItemDealDirections
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.models import ProcessedEvent
 from app.telegram_plugin_runtime import EmeraldSellerAPI

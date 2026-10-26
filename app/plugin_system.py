@@ -11,7 +11,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import PlayerokAccount, PluginState

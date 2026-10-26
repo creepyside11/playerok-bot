@@ -7,6 +7,7 @@ import logging
 import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 
 from app.config import Settings
 from app.crypto import SecretCipher
@@ -79,6 +80,24 @@ async def main() -> None:
         plugin_manager=plugin_manager,
     )
     worker_task = asyncio.create_task(worker.run(), name="playerok-worker")
+
+    @dispatcher.errors()
+    async def handle_update_error(event: ErrorEvent) -> None:
+        # Не даём одному сбойному апдейту уронить polling: логируем traceback
+        # и мягко сообщаем пользователю, что запрос не выполнен.
+        logging.getLogger("bot").error(
+            "Unhandled update error: %s", event.exception, exc_info=event.exception
+        )
+        update = event.update
+        try:
+            if update.callback_query is not None:
+                await update.callback_query.answer(
+                    "Произошла ошибка. Попробуйте ещё раз.", show_alert=True
+                )
+            elif update.message is not None:
+                await update.message.answer("Произошла ошибка. Попробуйте ещё раз.")
+        except Exception:
+            pass
 
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())

@@ -566,6 +566,10 @@ async def item_save_delivery_data(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     item_id = data.get("item_id")
+    if not item_id:
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Откройте товар заново из списка.", reply_markup=back_menu("items"))
+        return
     await state.update_data(new_delivery_content=text)
     await state.set_state(ItemEdit.delivery_comment)
 
@@ -592,6 +596,11 @@ async def item_save_delivery_comment_skip(call: CallbackQuery, state: FSMContext
     account = await require_account(call)
     if not account or not item_id:
         await state.clear()
+        await call.answer("Сессия устарела. Откройте товар заново.", show_alert=True)
+        return
+    if not content:
+        await state.clear()
+        await call.answer("Данные выдачи не найдены. Начните заново.", show_alert=True)
         return
 
     async with svc().db() as session:

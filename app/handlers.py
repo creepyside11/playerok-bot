@@ -5,11 +5,13 @@ import copy
 import hashlib
 import html
 import io
+import logging
 import secrets
 import uuid
 from typing import Any
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -25,6 +27,7 @@ from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, norm
 from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate
 
 
+logger = logging.getLogger(__name__)
 router = Router(name="main")
 
 
@@ -62,11 +65,24 @@ def clip(value: Any, limit: int = 70) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-async def edit(call: CallbackQuery, text: str, markup=None) -> None:
+async def edit(call: CallbackQuery, text: str, markup=None, **kwargs) -> None:
+    message = call.message
+    if message is None:
+        # Инлайн-сообщения (или удалённое исходное) не имеют message — шлём новое.
+        await call.bot.send_message(
+            call.from_user.id, text, reply_markup=markup, parse_mode="HTML", **kwargs
+        )
+        return
     try:
-        await call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await message.edit_text(text, reply_markup=markup, parse_mode="HTML", **kwargs)
+    except TelegramBadRequest as exc:
+        # Повторное нажатие «Обновить» с тем же текстом не должно плодить
+        # дубликаты сообщений.
+        if "message is not modified" in str(exc).lower():
+            return
+        await message.answer(text, reply_markup=markup, parse_mode="HTML", **kwargs)
     except Exception:
-        await call.message.answer(text, reply_markup=markup, parse_mode="HTML")
+        await message.answer(text, reply_markup=markup, parse_mode="HTML", **kwargs)
 
 
 async def ensure_user(tg_id: int) -> TelegramUser:
@@ -139,6 +155,18 @@ async def menu_main(call: CallbackQuery, state: FSMContext) -> None:
     tail = f"\nАктивный: <b>{html.escape(account.username)}</b>" if account else "\nАккаунт не подключён"
     await call.answer()
     await edit(call, "🤖 <b>Playerok Bot</b>" + tail, main_menu())
+
+
+@router.callback_query(F.data == "menu:root")
+async def menu_root(call: CallbackQuery, state: FSMContext) -> None:
+    # Совместимость со старыми сообщениями, где использовался callback menu:root.
+    await menu_main(call, state)
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery) -> None:
+    # Кнопки-счётчики страниц не должны оставлять «часики» на клиенте.
+    await call.answer()
 
 
 async def show_accounts(call: CallbackQuery) -> None:
@@ -953,14 +981,21 @@ async def autoreply_response(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if not value:
         return
+    account_id = data.get("account_id")
+    try:
+        account_uuid = uuid.UUID(str(account_id))
+    except (TypeError, ValueError):
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните добавление правила заново.", reply_markup=main_menu())
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
         if not account or account.tg_user_id != message.from_user.id:
             await state.clear()
             return
         session.add(AutoReplyRule(
             account_id=account.id,
-            trigger=data["trigger"],
+            trigger=data.get("trigger") or "*",
             response=value,
             enabled=True,
         ))
@@ -1070,7 +1105,12 @@ async def delivery_content(message: Message, state: FSMContext) -> None:
     if not content:
         return
     data = await state.get_data()
-    account_id = uuid.UUID(data["account_id"])
+    try:
+        account_id = uuid.UUID(str(data.get("account_id")))
+    except (TypeError, ValueError):
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните настройку автовыдачи заново.", reply_markup=main_menu())
+        return
     async with svc().db() as session:
         account = await session.get(PlayerokAccount, account_id)
         if not account or account.tg_user_id != message.from_user.id:
@@ -1205,8 +1245,18 @@ async def item_create(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(ItemCreate.game)
 async def item_game(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    try:
+        account_uuid = uuid.UUID(str(data.get("account_id")))
+    except (TypeError, ValueError):
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните создание товара заново.", reply_markup=main_menu())
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
+    if not account or account.tg_user_id != message.from_user.id:
+        await state.clear()
+        await message.answer("⚠️ Аккаунт не найден. Начните заново.", reply_markup=main_menu())
+        return
     try:
         client = await svc().gateway.get_client(account)
         game = await client.call("get_game", slug=(message.text or "").strip().lower())
@@ -1230,9 +1280,24 @@ async def item_game(message: Message, state: FSMContext) -> None:
 async def item_category(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     idx = int(call.data.split(":", 1)[1])
-    category_id, category_name = data["categories"][idx]
+    categories = data.get("categories") or []
+    if not (0 <= idx < len(categories)):
+        await state.clear()
+        await call.answer("Список категорий устарел. Начните заново.", show_alert=True)
+        return
+    category_id, category_name = categories[idx]
+    try:
+        account_uuid = uuid.UUID(str(data.get("account_id")))
+    except (TypeError, ValueError):
+        await state.clear()
+        await call.answer("Сессия устарела. Начните заново.", show_alert=True)
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
+    if not account or account.tg_user_id != call.from_user.id:
+        await state.clear()
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
     try:
         client = await svc().gateway.get_client(account)
         page = await client.call("get_game_category_obtaining_types", category_id, count=24)
@@ -1263,7 +1328,12 @@ async def item_category(call: CallbackQuery, state: FSMContext) -> None:
 async def item_obtaining(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     idx = int(call.data.split(":", 1)[1])
-    obtaining_id, obtaining_name = data["obtaining"][idx]
+    obtaining = data.get("obtaining") or []
+    if not (0 <= idx < len(obtaining)):
+        await state.clear()
+        await call.answer("Список способов получения устарел. Начните заново.", show_alert=True)
+        return
+    obtaining_id, obtaining_name = obtaining[idx]
     await _load_category_and_start_options(call, state, obtaining_id=obtaining_id, obtaining_name=obtaining_name)
 
 
@@ -1274,8 +1344,22 @@ async def _load_category_and_start_options(
     obtaining_name: str
 ) -> None:
     data = await state.get_data()
+    try:
+        account_uuid = uuid.UUID(str(data.get("account_id")))
+    except (TypeError, ValueError):
+        await state.clear()
+        await call.answer("Сессия устарела. Начните заново.", show_alert=True)
+        return
+    if not data.get("category_id"):
+        await state.clear()
+        await call.answer("Категория не выбрана. Начните заново.", show_alert=True)
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
+    if not account or account.tg_user_id != call.from_user.id:
+        await state.clear()
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
     try:
         client = await svc().gateway.get_client(account)
         category = await client.call("get_game_category", id=data["category_id"])
@@ -1755,8 +1839,26 @@ async def item_image(message: Message, state: FSMContext, bot: Bot) -> None:
 
 async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
     data = await state.get_data()
+    account_id = data.get("account_id")
+    missing = [
+        key for key in ("category_id", "obtaining_id", "item_name", "item_price", "item_description")
+        if not data.get(key)
+    ]
+    if not account_id or missing:
+        await state.clear()
+        await target.answer(
+            "⚠️ Сессия создания товара устарела. Начните заново: «Товары» → «Выставить товар».",
+            reply_markup=main_menu(),
+        )
+        return
+    try:
+        account_uuid = uuid.UUID(str(account_id))
+    except (TypeError, ValueError):
+        await state.clear()
+        await target.answer("⚠️ Некорректный аккаунт в сессии. Начните заново.", reply_markup=main_menu())
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
     if not account or account.tg_user_id != tg_id:
         await state.clear()
         return
@@ -1904,6 +2006,11 @@ async def item_template_save(message: Message, state: FSMContext) -> None:
         await message.answer("Название не должно быть пустым.")
         return
     data = await state.get_data()
+    account_id = data.get("account_id")
+    if not account_id:
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните создание товара заново.", reply_markup=main_menu())
+        return
     payload = {
         key: data[key]
         for key in (
@@ -1912,8 +2019,14 @@ async def item_template_save(message: Message, state: FSMContext) -> None:
         )
         if key in data
     }
+    try:
+        account_uuid = uuid.UUID(str(account_id))
+    except (TypeError, ValueError):
+        await state.clear()
+        await message.answer("⚠️ Некорректная сессия. Начните создание товара заново.", reply_markup=main_menu())
+        return
     async with svc().db() as session:
-        session.add(ItemTemplate(account_id=uuid.UUID(data["account_id"]), name=name, payload=payload))
+        session.add(ItemTemplate(account_id=account_uuid, name=name, payload=payload))
         await session.commit()
     await state.clear()
     await message.answer("✅ Шаблон сохранён.", reply_markup=main_menu())
@@ -1930,18 +2043,40 @@ async def leave_draft(call: CallbackQuery, state: FSMContext) -> None:
 async def item_publish(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     idx = int(call.data.split(":", 1)[1])
-    priority_id, _name, _price = data["priorities"][idx]
+    priorities = data.get("priorities") or []
+    account_id = data.get("account_id")
+    new_item_id = data.get("new_item_id")
+    if not (0 <= idx < len(priorities)) or not account_id or not new_item_id:
+        await state.clear()
+        await call.answer("Список приоритетов устарел. Создайте товар заново.", show_alert=True)
+        return
+    priority_id, _name, _price = priorities[idx]
+    try:
+        account_uuid = uuid.UUID(str(account_id))
+    except (TypeError, ValueError):
+        await state.clear()
+        await call.answer("Некорректная сессия. Создайте товар заново.", show_alert=True)
+        return
     async with svc().db() as session:
-        account = await session.get(PlayerokAccount, uuid.UUID(data["account_id"]))
+        account = await session.get(PlayerokAccount, account_uuid)
+    if not account:
+        await state.clear()
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
     try:
         client = await svc().gateway.get_client(account)
-        item = await client.call("publish_item", data["new_item_id"], priority_id)
+        item = await client.call("publish_item", new_item_id, priority_id)
 
         # Если была указана цена со скидкой, обновляем цену лота, чтобы появился шильдик скидки (prevPrice)
         discount_price = data.get("item_discount_price")
-        if discount_price and int(discount_price) < int(data["item_price"]):
+        base_price = data.get("item_price")
+        try:
+            has_discount = bool(discount_price) and int(discount_price) < int(base_price)
+        except (TypeError, ValueError):
+            has_discount = False
+        if has_discount:
             try:
-                item = await client.call("update_item", data["new_item_id"], price=int(discount_price))
+                item = await client.call("update_item", new_item_id, price=int(discount_price))
             except Exception as upd_exc:
                 logger.warning("Failed to apply discount price: %s", upd_exc)
 
