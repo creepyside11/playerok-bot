@@ -11,7 +11,7 @@ from aiogram.types import ErrorEvent
 
 from app.config import Settings
 from app.crypto import SecretCipher
-from app.db import init_db, make_engine, make_session_factory
+from app.db import init_db_with_retry, make_engine, make_session_factory
 from app.advanced_handlers import configure_advanced
 from app.emerald_promo_ui import router as emerald_promo_router
 from app.items_manager_ui import router as items_manager_router
@@ -38,7 +38,11 @@ async def main() -> None:
     )
 
     engine = make_engine(settings.database_url)
-    await init_db(engine)
+    try:
+        await init_db_with_retry(engine)
+    except BaseException:
+        await engine.dispose()
+        raise
     session_factory = make_session_factory(engine)
 
     cipher = SecretCipher(settings.bot_token)

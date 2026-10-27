@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError, TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from asyncpg.exceptions import CannotConnectNowError, PostgresConnectionError, TooManyConnectionsError
 
 from .models import Base
 
@@ -31,7 +34,13 @@ MIGRATIONS: dict[str, dict[str, str]] = {
 
 
 def make_engine(database_url: str) -> AsyncEngine:
-    engine = create_async_engine(database_url, future=True, pool_pre_ping=True)
+    connect_args = {"timeout": 15.0} if database_url.startswith("postgresql+asyncpg://") else {}
+    engine = create_async_engine(
+        database_url,
+        future=True,
+        pool_pre_ping=True,
+        connect_args=connect_args,
+    )
 
     if database_url.startswith("sqlite"):
         @event.listens_for(engine.sync_engine, "connect")
@@ -76,5 +85,73 @@ async def init_db(engine: AsyncEngine) -> None:
                         await conn.execute(
                             text(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{column}" {ddl}')
                         )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Не удалось применить миграцию таблицы %s", table)
+                if _is_transient_db_error(exc):
+                    raise
+
+
+async def init_db_with_retry(
+    engine: AsyncEngine,
+    attempts: int | None = None,
+    initial_delay: float = 2.0,
+) -> None:
+    """Retry transient database connection failures until the schema is initialized."""
+    max_attempts = max(1, int(attempts)) if attempts is not None else None
+    delay = max(0.1, float(initial_delay))
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        attempt += 1
+        try:
+            await init_db(engine)
+            return
+        except (
+            DBAPIError,
+            PoolTimeoutError,
+            OSError,
+            asyncio.TimeoutError,
+            PostgresConnectionError,
+            CannotConnectNowError,
+            TooManyConnectionsError,
+        ) as exc:
+            if not _is_transient_db_error(exc):
+                raise
+            logger.warning(
+                "Не удалось подключиться к БД (попытка %s, %s); повтор через %.1f с",
+                attempt,
+                type(exc).__name__,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    if isinstance(exc, DBAPIError):
+        current: BaseException | None = exc.orig
+        while current is not None:
+            if isinstance(
+                current,
+                (
+                    PoolTimeoutError,
+                    OSError,
+                    asyncio.TimeoutError,
+                    PostgresConnectionError,
+                    CannotConnectNowError,
+                    TooManyConnectionsError,
+                ),
+            ):
+                return True
+            current = current.__cause__
+        return False
+    return isinstance(
+        exc,
+        (
+            PoolTimeoutError,
+            OSError,
+            asyncio.TimeoutError,
+            PostgresConnectionError,
+            CannotConnectNowError,
+            TooManyConnectionsError,
+        ),
+    )

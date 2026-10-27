@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 
 
-DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost/playerok"
+DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///playerok.db"
 
 
 @dataclass(frozen=True, slots=True)
