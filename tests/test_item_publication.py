@@ -19,10 +19,10 @@ from app.item_publication import (
     parse_discount_price,
     publication_tariffs,
 )
-from app.models import DeliveryRule, DeliveryStock, PlayerokAccount, TelegramUser
-from app.states import ItemCreate
+from app.models import DeliveryRule, PlayerokAccount, TelegramUser
+from app.states import ItemCreate, ItemEdit
 from app.worker import WorkerManager
-from playerokapi.enums import ItemStatuses
+from playerokapi.enums import GameCategoryDataFieldTypes, ItemStatuses
 
 
 def item(price=900, status=ItemStatuses.DRAFT):
@@ -124,7 +124,8 @@ async def test_telegram_shows_amount_and_balance_and_consumes_confirmation(monke
 
 
 @pytest.mark.asyncio
-async def test_draft_keeps_native_data_and_buyer_message_before_publication(monkeypatch):
+@pytest.mark.parametrize("schema", ["text", "fields_and_text", "fields_with_message"])
+async def test_wizard_requires_native_buyer_message(monkeypatch, schema):
     engine = make_engine("sqlite+aiosqlite:///:memory:")
     try:
         await init_db(engine)
@@ -144,30 +145,73 @@ async def test_draft_keeps_native_data_and_buyer_message_before_publication(monk
         client.get_item.return_value = item(price=1000)
         client.update_item.return_value = item()
         cipher = SecretCipher("test-token")
+
+        fields = [SimpleNamespace(
+            id="buyer_input", label="Поле покупателя", type=GameCategoryDataFieldTypes.OBTAINING_DATA,
+            required=True,
+        )]
+        if schema != "text":
+            fields.append(SimpleNamespace(
+                id="code", label="Код товара", type=GameCategoryDataFieldTypes.ITEM_DATA, required=True,
+            ))
+        if schema == "fields_with_message":
+            fields.append(SimpleNamespace(
+                id="message", label="Сообщение покупателю после покупки",
+                type=GameCategoryDataFieldTypes.ITEM_DATA, required=False,
+            ))
+
+        async def api(method, *args, **kwargs):
+            if method == "get_game_category":
+                return SimpleNamespace(options=[])
+            assert method == "get_game_category_data_fields"
+            assert args == ("category", None)
+            assert kwargs["type"] == GameCategoryDataFieldTypes.ITEM_DATA
+            return SimpleNamespace(data_fields=fields, page_info=None)
+
+        client.call.side_effect = api
         monkeypatch.setattr(handlers, "services", SimpleNamespace(
-            db=db, cipher=cipher, gateway=SimpleNamespace(get_client=AsyncMock(return_value=client))
+            db=db, cipher=cipher, gateway=SimpleNamespace(get_client=AsyncMock(return_value=client)),
         ))
         state = fsm()
-        await state.set_state(ItemCreate.image)
         await state.set_data({
             "account_id": str(account.id), "category_id": "category",
             "item_name": "Товар", "item_price": 1000, "item_description": "Описание",
-            "item_data": "Цифровой товар", "buyer_message": "Инструкция с {фигурными скобками}",
         })
         message = MagicMock(spec=Message)
         message.from_user = SimpleNamespace(id=21)
         message.answer = AsyncMock(return_value=SimpleNamespace(delete=AsyncMock()))
+        call = MagicMock(spec=CallbackQuery)
+        call.answer = AsyncMock()
+        call.message = message
+        call.from_user = message.from_user
+        await handlers._load_category_and_start_options(call, state, None, "Стандартный")
+
+        if schema != "text":
+            assert await state.get_state() == ItemCreate.data_fields.state
+            message.text = "ABC-123"
+            await handlers.item_fields(message, state)
+        assert await state.get_state() == ItemCreate.buyer_message.state
+        message.text = "-"
+        await handlers.item_create_buyer_message(message, state)
+        assert await state.get_state() == ItemCreate.buyer_message.state
+        await handlers.create_draft(message, state, 21)
+        client.create_item.assert_not_awaited()
+
+        message.text = "Инструкция после покупки"
+        await handlers.item_create_buyer_message(message, state)
+        assert await state.get_state() == ItemCreate.image.state
         await handlers.create_draft(message, state, 21)
 
-        assert client.create_item.await_args.kwargs["comment"] == "Цифровой товар"
-        assert client.create_item.await_args.kwargs["obtaining_type_id"] is None
+        params = client.create_item.await_args.kwargs
+        if schema == "fields_with_message":
+            assert params["data_fields"] == {"code": "ABC-123", "message": "Инструкция после покупки"}
+            assert params["comment"] is None
+        else:
+            assert params["comment"] == "Инструкция после покупки"
+            assert params["data_fields"] == ({"code": "ABC-123"} if schema == "fields_and_text" else {})
         assert await state.get_state() == ItemCreate.priority.state
+        assert (await state.get_data())["buyer_message"] is None
         client.publish_item.assert_not_awaited()
-        async with db() as session:
-            rule = await session.scalar(select(DeliveryRule))
-            stock = await session.scalar(select(DeliveryStock))
-            assert rule.item_id == "lot" and rule.message_template == "{stock}"
-            assert cipher.decrypt(stock.payload_encrypted) == "Инструкция с {фигурными скобками}"
 
         await state.set_state(ItemCreate.discount_price)
         message.text = "900"
@@ -175,21 +219,62 @@ async def test_draft_keeps_native_data_and_buyer_message_before_publication(monk
         client.update_item.assert_awaited_once_with("lot", price=900)
         assert (await state.get_data())["item_sale_price"] == 900
 
-        call = MagicMock(spec=CallbackQuery)
-        call.answer = AsyncMock()
         call.message = MagicMock(spec=Message)
         call.message.edit_text = AsyncMock()
         await handlers.leave_draft(call, state)
         assert await state.get_state() is None
         client.publish_item.assert_not_awaited()
 
-        bot = AsyncMock()
-        worker = WorkerManager(bot, db, None, cipher, 10)
-        for deal_id in ("deal-1", "deal-1", "deal-2"):
-            deal = SimpleNamespace(id=deal_id, chat=SimpleNamespace(id=deal_id))
-            assert await worker._delivery(account, client, deal, "lot") is True
-        assert [args.args[1] for args in client.send_message.await_args_list] == [
-            "Инструкция с {фигурными скобками}", "Инструкция с {фигурными скобками}",
-        ]
+        async with db() as session:
+            assert await session.scalar(select(DeliveryRule)) is None
+            session.add(DeliveryRule(
+                account_id=account.id, item_id="lot", mode="message",
+                message_template="{stock}", enabled=True,
+            ))
+            await session.commit()
+
+        worker = WorkerManager(AsyncMock(), db, None, cipher, 10)
+        deal = SimpleNamespace(id="deal", chat=SimpleNamespace(id="chat"))
+        assert await worker._delivery(account, client, deal, "lot") is None
+        client.send_message.assert_not_awaited()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_edit_buyer_message_preserves_native_category_fields(monkeypatch):
+    account = SimpleNamespace(id=uuid4())
+    client = AsyncMock()
+    fields = [
+        SimpleNamespace(
+            id="code", label="Код товара", type=GameCategoryDataFieldTypes.ITEM_DATA, required=True, value="ABC",
+        ),
+        SimpleNamespace(
+            id="message", label="Сообщение покупателю после оплаты",
+            type=GameCategoryDataFieldTypes.ITEM_DATA, required=True, value="Прежнее сообщение",
+        ),
+    ]
+    client.get_item.return_value = SimpleNamespace(
+        id="lot", category=SimpleNamespace(id="category"),
+        obtaining_type=SimpleNamespace(id="method"), data_fields=fields,
+    )
+    client.call.return_value = SimpleNamespace(data_fields=fields, page_info=None)
+    monkeypatch.setattr(items_manager_ui, "active_account", AsyncMock(return_value=account))
+    monkeypatch.setattr(items_manager_ui, "render_item_card", AsyncMock())
+    monkeypatch.setattr(handlers, "services", SimpleNamespace(
+        gateway=SimpleNamespace(get_client=AsyncMock(return_value=client))
+    ))
+    state = fsm()
+    await state.set_state(ItemEdit.buyer_message)
+    await state.set_data({"item_id": "lot", "account_id": str(account.id)})
+    message = MagicMock(spec=Message)
+    message.from_user = SimpleNamespace(id=21)
+    message.answer = AsyncMock()
+    message.text = "Новое сообщение"
+
+    await items_manager_ui.item_save_buyer_message(message, state)
+
+    client.update_item.assert_awaited_once_with(
+        "lot", data_fields={"code": "ABC", "message": "Новое сообщение"}
+    )
+    assert await state.get_state() is None

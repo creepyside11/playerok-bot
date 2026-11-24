@@ -18,11 +18,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from playerokapi.enums import GameCategoryDataFieldTypes
 from playerokapi.exceptions import RequestPlayerokError
 
 from .crypto import SecretCipher
-from .item_delivery import save_item_delivery
+from .item_delivery import (
+    BUYER_MESSAGE_ERROR, BUYER_MESSAGE_PROMPT, SKIP_VALUES, buyer_message_field_id,
+    get_item_data_fields, item_delivery_payload, valid_buyer_message,
+)
 from .item_publication import parse_discount_price, tariff_price
 from .keyboards import auth_method_menu, back_menu, delivery_mode_menu, main_menu
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, PlayerokAccount, TelegramUser, fresh_settings
@@ -1317,7 +1319,6 @@ async def item_category(call: CallbackQuery, state: FSMContext) -> None:
 
     if not values:
         # Для категорий без способов получения (например, "Другое" в Claude / ChatGPT)
-        await call.answer()
         await _load_category_and_start_options(call, state, obtaining_id=None, obtaining_name="Стандартный")
         return
 
@@ -1370,40 +1371,17 @@ async def _load_category_and_start_options(
         client = await svc().gateway.get_client(account)
         category = await client.call("get_game_category", id=data["category_id"])
 
-        fields = []
-        if obtaining_id:
-            cursor = None
-            while True:
-                page = await client.call(
-                    "get_game_category_data_fields",
-                    data["category_id"],
-                    obtaining_id,
-                    count=24,
-                    type=GameCategoryDataFieldTypes.ITEM_DATA,
-                    after_cursor=cursor,
-                )
-                fields.extend(
-                    field for field in page.data_fields if field.type == GameCategoryDataFieldTypes.ITEM_DATA
-                )
-                next_cursor = getattr(page.page_info, "end_cursor", None)
-                if not getattr(page.page_info, "has_next_page", False) or not next_cursor or next_cursor == cursor:
-                    break
-                cursor = next_cursor
+        fields = await get_item_data_fields(client, data["category_id"], obtaining_id)
     except Exception as exc:
         await call.answer("Ошибка API", show_alert=True)
         await call.message.answer(f"<code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
         return
 
     options = list(getattr(category, "options", []) or [])
+    message_field_id = buyer_message_field_id(fields)
     field_meta = [
-        (
-            str(f.id),
-            str(f.label),
-            bool(f.required),
-            bool(getattr(f, "hidden", False)),
-            str(getattr(getattr(f, "type", None), "name", "")),
-        )
-        for f in fields
+        (str(field.id), str(field.label), bool(field.required))
+        for field in fields if str(field.id) != message_field_id
     ]
 
     # Группируем опции по их полю и названию группы с сохранением типа (RANGE или SELECTOR)
@@ -1441,6 +1419,7 @@ async def _load_category_and_start_options(
         obtaining_id=obtaining_id,
         obtaining_name=obtaining_name,
         field_meta=field_meta,
+        buyer_message_field_id=message_field_id,
         option_groups=option_groups,
         attribute_group_index=0,
         attributes=data.get("attributes", {}) if data.get("template") else {},
@@ -1527,8 +1506,8 @@ async def _show_attribute_group(call_or_msg: Any, state: FSMContext, page: int =
         await call_or_msg.answer(prompt, reply_markup=b.as_markup(), parse_mode="HTML")
 
 
-def _format_field_prompt(field: tuple[str, str, bool, bool, str], index: int, count: int) -> str:
-    _fid, label, required, _hidden, _type = field
+def _format_field_prompt(field: tuple[str, str, bool], index: int, count: int) -> str:
+    _fid, label, required = field
     requirement = "<b>Обязательное поле.</b>" if required else "Отправьте «-», чтобы пропустить."
     return f"🔐 <b>Данные товара {index}/{count}</b>\n\n{html.escape(label)}\n{requirement}"
 
@@ -1536,11 +1515,10 @@ def _format_field_prompt(field: tuple[str, str, bool, bool, str], index: int, co
 async def _start_item_fields(target: Message, state: FSMContext) -> None:
     data = await state.get_data()
     fields = data.get("field_meta") or []
+    await state.update_data(field_index=0, data_field_values={}, buyer_message=None)
     if not fields:
-        await state.update_data(data_field_values={})
-        await _ask_item_data(target, state)
+        await _ask_buyer_message(target, state)
         return
-    await state.update_data(field_index=0, data_field_values={})
     await state.set_state(ItemCreate.data_fields)
     prompt = _format_field_prompt(fields[0], 1, len(fields))
     await target.answer(prompt, parse_mode="HTML")
@@ -1659,14 +1637,14 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     if index >= len(fields):
         await _start_item_fields(message, state)
         return
-    field_id, label, required, _hidden, _type_name = fields[index]
+    field_id, label, required = fields[index]
     raw_value = (message.text or "").strip()
-    # Если поле обязательно, не разрешаем пустой ввод или пропуск через "-"
-    if required and (not raw_value or raw_value in {"-", "—", "пропуск", "skip"}):
+    skipped = raw_value.casefold() in SKIP_VALUES
+    if required and skipped:
         await message.answer(f"⚠️ Поле «{html.escape(label)}» <b>обязательно</b> для выставления этого лота. Пожалуйста, введите корректное значение:", parse_mode="HTML")
         return
     values = dict(data.get("data_field_values") or {})
-    if raw_value and raw_value not in {"-", "—", "пропуск", "skip"}:
+    if not skipped:
         values[field_id] = raw_value
     index += 1
     if index < len(fields):
@@ -1678,68 +1656,27 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     await _ask_buyer_message(message, state)
 
 
-async def _ask_item_data(target: Message, state: FSMContext) -> None:
-    await state.set_state(ItemCreate.delivery_data)
-    await target.answer(
-        "🔐 <b>Данные товара на Playerok</b>\n\n"
-        "Введите данные, которые покупатель увидит в разделе «Данные товара» после оплаты.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Пропустить", callback_data="itemdelivery:skip")]
-        ]),
-        parse_mode="HTML",
-    )
-
-
 async def _ask_buyer_message(target: Message, state: FSMContext) -> None:
-    await state.set_state(ItemCreate.delivery_comment)
+    await state.set_state(ItemCreate.buyer_message)
     await target.answer(
-        "💬 <b>Сообщение покупателю после оплаты</b>\n\n"
-        "Введите текст, который бот отправит в чат сделки. Например, инструкцию или время ответа.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Без сообщения", callback_data="itemdelivcomment:skip")]
-        ]),
+        BUYER_MESSAGE_PROMPT + "Введите обязательный текст, который Playerok покажет покупателю в сделке.",
         parse_mode="HTML",
     )
 
 
-@router.callback_query(ItemCreate.delivery_data, F.data == "itemdelivery:skip")
-async def item_delivery_data_skip(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    await _ask_buyer_message(call.message, state)
-
-
-@router.message(ItemCreate.delivery_data, F.text)
-async def item_delivery_data_input(message: Message, state: FSMContext) -> None:
+@router.message(ItemCreate.buyer_message, F.text)
+async def item_create_buyer_message(message: Message, state: FSMContext) -> None:
     text = message.text.strip()
-    if text not in {"-", "—"} and not 2 <= len(text) <= 2048:
-        await message.answer("Введите от 2 до 2048 символов или нажмите «Пропустить».")
+    if not valid_buyer_message(text):
+        await message.answer(BUYER_MESSAGE_ERROR)
         return
-    await state.update_data(item_data=None if text in {"-", "—"} else text)
-    await _ask_buyer_message(message, state)
-
-
-async def _finish_item_delivery(target: Message, state: FSMContext) -> None:
-    if (await state.get_data()).get("template"):
-        await _ask_item_images(target, state)
+    await state.update_data(buyer_message=text)
+    data = await state.get_data()
+    if data.get("template") or all(data.get(key) for key in ("item_name", "item_price", "item_description")):
+        await _ask_item_images(message, state, keep_photos=True)
         return
     await state.set_state(ItemCreate.name)
-    await target.answer("🏷 <b>Название товара</b>", parse_mode="HTML")
-
-
-@router.callback_query(ItemCreate.delivery_comment, F.data == "itemdelivcomment:skip")
-async def item_delivery_comment_skip(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    await _finish_item_delivery(call.message, state)
-
-
-@router.message(ItemCreate.delivery_comment, F.text)
-async def item_delivery_comment_input(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
-    if not text or len(text) > 2000:
-        await message.answer("Введите сообщение до 2000 символов или нажмите «Без сообщения».")
-        return
-    await state.update_data(buyer_message=None if text in {"-", "—"} else text)
-    await _finish_item_delivery(message, state)
+    await message.answer("🏷 <b>Название товара</b>", parse_mode="HTML")
 
 
 @router.message(ItemCreate.name)
@@ -1778,8 +1715,9 @@ async def item_description(message: Message, state: FSMContext) -> None:
     await _ask_item_images(message, state)
 
 
-async def _ask_item_images(message: Message, state: FSMContext) -> None:
-    await state.update_data(attachments_b64=[])
+async def _ask_item_images(message: Message, state: FSMContext, *, keep_photos: bool = False) -> None:
+    if not keep_photos:
+        await state.update_data(attachments_b64=[])
     await state.set_state(ItemCreate.image)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Продолжить к проверке лота", callback_data="itemimage:skip")]
@@ -1842,37 +1780,30 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
         await target.answer("Аккаунт не найден. Начните создание товара заново.", reply_markup=main_menu())
         return
 
+    buyer_message = data.get("buyer_message") or ""
+    if not valid_buyer_message(buyer_message):
+        await _ask_buyer_message(target, state)
+        return
+
+    values = data.get("data_field_values") or {}
+    comment, fields = item_delivery_payload(buyer_message, data.get("buyer_message_field_id"), values)
     wait_msg = await target.answer("Создаю черновик на Playerok…")
     try:
         client = await svc().gateway.get_client(account)
-        item_id = data.get("new_item_id")
-        if not item_id:
-            item = await client.create_item(
-                game_category_id=data["category_id"],
-                obtaining_type_id=data.get("obtaining_id"),
-                name=data["item_name"],
-                price=data["item_price"],
-                description=data["item_description"],
-                options=data.get("attributes") or {},
-                data_fields=data.get("data_field_values") or {},
-                attachments=[base64.b64decode(photo) for photo in data.get("attachments_b64", [])],
-                comment=data.get("item_data"),
-            )
-            item_id = str(item.id)
-            await state.update_data(new_item_id=item_id, attachments_b64=[])
-            await state.update_data(item_sale_price=int(item.price), item_price=tariff_price(item))
-        if data.get("buyer_message"):
-            await save_item_delivery(svc().db, svc().cipher, account.id, item_id, data["buyer_message"])
+        item = await client.create_item(
+            game_category_id=data["category_id"],
+            obtaining_type_id=data.get("obtaining_id"),
+            name=data["item_name"],
+            price=data["item_price"],
+            description=data["item_description"],
+            options=data.get("attributes") or {},
+            data_fields=fields,
+            attachments=[base64.b64decode(photo) for photo in data.get("attachments_b64", [])],
+            comment=comment,
+        )
     except Exception as exc:
-        item_id = (await state.get_data()).get("new_item_id")
-        if not item_id:
-            logger.warning("Playerok draft creation failed (%s)", type(exc).__name__)
-        if item_id:
-            detail = (
-                "Черновик создан. Нажмите «Повторить», чтобы закончить настройку "
-                f"лота <code>{html.escape(item_id)}</code>."
-            )
-        elif isinstance(exc, RequestPlayerokError):
+        logger.warning("Playerok draft creation failed (%s)", type(exc).__name__)
+        if isinstance(exc, RequestPlayerokError):
             detail = f"Playerok отклонил черновик:\n<code>{html.escape(clip(exc.error_message, 300))}</code>"
         else:
             detail = "Playerok не подтвердил создание. Проверьте список товаров перед повтором."
@@ -1887,9 +1818,8 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
         return
 
     await state.update_data(
-        data_field_values={}, item_data=None, buyer_message=None,
-        has_item_data=bool(data.get("data_field_values") or data.get("item_data")),
-        has_buyer_message=bool(data.get("buyer_message")),
+        new_item_id=str(item.id), item_sale_price=int(item.price), item_price=tariff_price(item),
+        attachments_b64=[], data_field_values={}, buyer_message=None,
     )
     await state.set_state(ItemCreate.priority)
     try:
@@ -1923,8 +1853,7 @@ async def _show_draft_review(target: CallbackQuery | Message, data: dict[str, An
     text = (
         f"📝 <b>Черновик · {html.escape(data['item_name'])}</b>\n\n"
         f"Цена продажи: {price_line}\n"
-        f"Данные товара: {'добавлены' if data.get('has_item_data') else 'не добавлены'}\n"
-        f"Сообщение после оплаты: {'настроено' if data.get('has_buyer_message') else 'не настроено'}"
+        "Сообщение покупателю сохранено в лоте Playerok."
     )
     if isinstance(target, CallbackQuery):
         await edit(target, text, markup)

@@ -19,7 +19,10 @@ from sqlalchemy import select
 
 from .ai_manager import UniversalImageClient, UniversalOpenAIClient
 from .handlers import active_account, clip, edit, require_account, svc
-from .item_delivery import save_item_delivery
+from .item_delivery import (
+    BUYER_MESSAGE_ERROR, SKIP_VALUES, buyer_message_field_id, get_item_data_fields,
+    item_delivery_payload, valid_buyer_message,
+)
 from .item_publication import can_publish, parse_discount_price, publication_tariffs, tariff_price
 from .items_manager_ui import item_status_badge
 from .keyboards import back_menu, main_menu
@@ -404,8 +407,9 @@ SYSTEM_AGENT_PROMPT = """Ты — интеллектуальный автоно�
    - game_name: название игры (например "Brawl Stars", "Roblox", "Black Russia", "Telegram", "Gmail", "Steam")
    - generate_cover: true / false (сгенерировать ли продающую AI-обложку)
    - cover_prompt: промпт для генерации картинки на английском (3D game render)
-   - delivery_text: текст для раздела «Данные товара» на Playerok
-   - delivery_comment: сообщение, которое бот отправит в чат после оплаты
+   - buyer_message: обязательный текст «Сообщение покупателю после покупки» в сделке Playerok.
+     Если пользователь не указал текст, используй general_response и попроси его указать.
+   - item_data_fields: дополнительные данные для полей категории по их названиям. Используй данные пользователя.
    - bind_plugin: id плагина для привязки если применимо
 
 2. web_fetch: запросить данные из интернета, цены конкурентов или вызвать внешний REST API
@@ -561,6 +565,11 @@ async def _process_ai_agent_pipeline(
 
     # 1. Выставление товара через ИИ
     if action == "create_item":
+        buyer_message = data.get("buyer_message")
+        if not isinstance(buyer_message, str) or not valid_buyer_message(buyer_message):
+            await wait_msg.delete()
+            await message.answer(BUYER_MESSAGE_ERROR, reply_markup=main_menu())
+            return
         client = await svc().gateway.get_client(account)
         item_name = data.get("name") or "Товар от ИИ"
         price = int(data.get("price") or 500)
@@ -611,6 +620,25 @@ async def _process_ai_agent_pipeline(
         await wait_msg.edit_text("⏳ <b>Создаю черновик на Playerok…</b>", parse_mode="HTML")
         try:
             discount = parse_discount_price(str(disc_price), price) if disc_price is not None else None
+            fields = await get_item_data_fields(client, target_cat_id, target_obt_id)
+            message_field_id = buyer_message_field_id(fields)
+            supplied = data.get("item_data_fields") or {}
+            if not isinstance(supplied, dict):
+                raise ValueError("Укажите дополнительные данные по названиям полей категории.")
+            values = {}
+            missing = []
+            for field in fields:
+                field_id = str(field.id)
+                if field_id == message_field_id:
+                    continue
+                value = supplied.get(field.label)
+                if value is not None and str(value).strip().casefold() not in SKIP_VALUES:
+                    values[field_id] = str(value).strip()
+                elif field.required:
+                    missing.append(field.label)
+            if missing:
+                raise ValueError(f"Заполните обязательные поля категории: {', '.join(missing)}.")
+            comment, values = item_delivery_payload(buyer_message, message_field_id, values)
             item = await client.create_item(
                 game_category_id=target_cat_id,
                 obtaining_type_id=target_obt_id,
@@ -618,19 +646,15 @@ async def _process_ai_agent_pipeline(
                 price=price,
                 description=desc,
                 options={},
-                data_fields=[],
+                data_fields=values,
                 attachments=attachments,
-                comment=data.get("delivery_text"),
+                comment=comment,
             )
             item_id = str(item.id)
             if discount is not None:
                 item = await client.update_item(item_id, price=discount)
                 if int(item.price) != discount:
                     raise ValueError("Playerok вернул другую цену.")
-            if data.get("delivery_comment"):
-                await save_item_delivery(
-                    svc().db, svc().cipher, account.id, item_id, data["delivery_comment"]
-                )
             sale_price = item.price
             if not data.get("draft_only") and can_publish(item):
                 tariffs = await publication_tariffs(client, item_id, tariff_price(item))

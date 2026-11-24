@@ -72,6 +72,7 @@ def test_update_item_graphql_payload():
         price=777,
         description="Новое описание лота",
         comment="Данные только для сделки",
+        data_fields={"field-id": "Значение"},
     )
 
     assert len(captured_requests) == 1
@@ -83,6 +84,7 @@ def test_update_item_graphql_payload():
     assert payload1["variables"]["input"]["price"] == 777
     assert payload1["variables"]["input"]["description"] == "Новое описание лота"
     assert payload1["variables"]["input"]["comment"] == "Данные только для сделки"
+    assert payload1["variables"]["input"]["dataFields"] == [{"fieldId": "field-id", "value": "Значение"}]
 
     # 2. Обновление с фото и удалением старых фото
     fake_png = b"\x89PNG\r\n\x1a\nfake-png-bytes"

@@ -389,6 +389,7 @@ class WorkerManager:
                 select(DeliveryRule).where(
                     DeliveryRule.account_id == account.id,
                     DeliveryRule.enabled.is_(True),
+                    DeliveryRule.mode != "message",
                     DeliveryRule.item_id == item_id,
                 )
             )
@@ -397,6 +398,7 @@ class WorkerManager:
                     select(DeliveryRule).where(
                         DeliveryRule.account_id == account.id,
                         DeliveryRule.enabled.is_(True),
+                        DeliveryRule.mode != "message",
                         DeliveryRule.item_id == "*",
                     )
                 )
@@ -459,7 +461,7 @@ class WorkerManager:
         values = defaultdict(str, {"buyer": buyer, "item": item_name, "deal_id": action_id})
         stock_id: int | None = None
 
-        if rule.mode in {"stock", "message"}:
+        if rule.mode == "stock":
             async with self.db() as session:
                 stock = await session.scalar(
                     select(DeliveryStock)
@@ -477,12 +479,11 @@ class WorkerManager:
                             f"Deal ID: <code>{html.escape(action_id)}</code>",
                         )
                     return False
+                stock_id = stock.id
                 values["stock"] = self.cipher.decrypt(stock.payload_encrypted) or ""
-                if rule.mode == "stock":
-                    stock_id = stock.id
-                    stock.used_at = datetime.now(timezone.utc)
-                    stock.deal_id = action_id
-                    await session.commit()
+                stock.used_at = datetime.now(timezone.utc)
+                stock.deal_id = action_id
+                await session.commit()
 
         try:
             await client.send_message(

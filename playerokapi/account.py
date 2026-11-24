@@ -842,7 +842,7 @@ class Account:
     def get_game_category_data_fields(
         self, 
         game_category_id: str, 
-        obtaining_type_id: str, 
+        obtaining_type_id: str | None,
         count: int = 24,
         type: GameCategoryDataFieldTypes | None = None, 
         after_cursor: str | None = None
@@ -854,7 +854,7 @@ class Account:
         :type game_category_id: `str`
         
         :param obtaining_type_id: ID типа (способа) получения предмета.
-        :type obtaining_type_id: `str`
+        :type obtaining_type_id: `str` or `None`
 
         :param count: Кол-во инструкций, которые нужно получить (не более 24 за один запрос).
         :type count: `int`
@@ -1226,6 +1226,28 @@ class Account:
         r = self.request("post", f"{self.base_url}/graphql", headers, payload).json()
         return chat_message(r["data"]["createChatMessage"])
  
+    @staticmethod
+    def _serialize_item_data_fields(
+        data_fields: dict[str, str] | list[GameCategoryDataField],
+    ) -> list[dict[str, str]]:
+        payload_data_fields = []
+        if isinstance(data_fields, dict):
+            for f_id, f_val in data_fields.items():
+                if f_val is not None:
+                    payload_data_fields.append({"fieldId": str(f_id), "value": str(f_val)})
+        elif isinstance(data_fields, (list, tuple)):
+            for f in data_fields:
+                if isinstance(f, dict):
+                    fid = f.get("fieldId") or f.get("id") or f.get("field_id")
+                    fval = f.get("value")
+                    if fid is not None and fval is not None:
+                        payload_data_fields.append({"fieldId": str(fid), "value": str(fval)})
+                elif hasattr(f, "id"):
+                    val = getattr(f, "value", None)
+                    if val is not None:
+                        payload_data_fields.append({"fieldId": str(f.id), "value": str(val)})
+        return payload_data_fields
+
     def create_item(
         self,
         game_category_id: str,
@@ -1234,7 +1256,7 @@ class Account:
         price: int,
         description: str,
         options: list[GameCategoryOption] | dict,
-        data_fields: list[GameCategoryDataField],
+        data_fields: dict[str, str] | list[GameCategoryDataField],
         attachments: list[str | bytes],
         comment: str | None = None,
     ) -> types.Item:
@@ -1268,7 +1290,7 @@ class Account:
         :param attachments: Массив файлов-приложений предмета. Пути к файлам или байты.
         :type attachments: `list[str | bytes]`
 
-        :param comment: Текст для раздела «Данные товара» в сделке.
+        :param comment: Сообщение покупателю после покупки для категорий с текстовым полем.
 
         :return: Объект созданного предмета.
         :rtype: `playerokapi.types.Item`
@@ -1288,22 +1310,7 @@ class Account:
         else:
             payload_attributes = {}
 
-        payload_data_fields = []
-        if isinstance(data_fields, dict):
-            for f_id, f_val in data_fields.items():
-                if f_val is not None:
-                    payload_data_fields.append({"fieldId": str(f_id), "value": str(f_val)})
-        elif isinstance(data_fields, (list, tuple)):
-            for f in data_fields:
-                if isinstance(f, dict):
-                    fid = f.get("fieldId") or f.get("id") or f.get("field_id")
-                    fval = f.get("value")
-                    if fid is not None and fval is not None:
-                        payload_data_fields.append({"fieldId": str(fid), "value": str(fval)})
-                elif hasattr(f, "id"):
-                    val = getattr(f, "value", None)
-                    if val is not None:
-                        payload_data_fields.append({"fieldId": str(f.id), "value": str(val)})
+        payload_data_fields = self._serialize_item_data_fields(data_fields)
 
         headers = {"accept": "*/*"}
         operations = {
@@ -1349,7 +1356,7 @@ class Account:
         price: int | None = None, 
         description: str | None = None, 
         options: list[GameCategoryOption] | None = None, 
-        data_fields: list[GameCategoryDataField] | None = None, 
+        data_fields: dict[str, str] | list[GameCategoryDataField] | None = None,
         remove_attachments: list[str] | None = None, 
         add_attachments: list[str | bytes] | None = None,
         comment: str | None = None,
@@ -1383,13 +1390,13 @@ class Account:
         :param add_attachments: Массив файлов-приложений предмета, которые нужно добавить. Пути к файлам или байты.
         :type add_attachments: `list[str | bytes]` or `None`
 
-        :param comment: Текст для раздела «Данные товара» в сделке.
+        :param comment: Сообщение покупателю после покупки для категорий с текстовым полем.
 
         :return: Объект обновлённого предмета.
         :rtype: `playerokapi.types.Item`
         """
         payload_attributes = {option.field: option.value for option in options} if options is not None else None
-        payload_data_fields = [{"fieldId": field.id, "value": field.value} for field in data_fields] if data_fields is not None else None
+        payload_data_fields = self._serialize_item_data_fields(data_fields) if data_fields is not None else None
         
         headers = {"accept": "*/*"}
         operations = {
