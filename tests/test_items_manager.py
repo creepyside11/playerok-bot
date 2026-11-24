@@ -71,6 +71,7 @@ def test_update_item_graphql_payload():
         name="Новый заголовок лота",
         price=777,
         description="Новое описание лота",
+        comment="Данные только для сделки",
     )
 
     assert len(captured_requests) == 1
@@ -81,6 +82,7 @@ def test_update_item_graphql_payload():
     assert payload1["variables"]["input"]["name"] == "Новый заголовок лота"
     assert payload1["variables"]["input"]["price"] == 777
     assert payload1["variables"]["input"]["description"] == "Новое описание лота"
+    assert payload1["variables"]["input"]["comment"] == "Данные только для сделки"
 
     # 2. Обновление с фото и удалением старых фото
     fake_png = b"\x89PNG\r\n\x1a\nfake-png-bytes"
@@ -161,6 +163,7 @@ def test_create_item_with_credentials_and_multiple_photos():
             "login_field_id": "player_user@mail.com",
             "password_field_id": "SuperSecretPass123",
         },
+        comment="Описание для покупателя после оплаты",
         attachments=[photo1, photo2],
     )
 
@@ -174,6 +177,7 @@ def test_create_item_with_credentials_and_multiple_photos():
     inp = operations["variables"]["input"]
     assert inp["gameCategoryId"] == "cat-100"
     assert inp["obtainingTypeId"] == "obt-200"
+    assert inp["comment"] == "Описание для покупателя после оплаты"
     assert inp["name"] == "Аккаунт с отлегой"
     assert inp["price"] == 1500
     assert inp["attributes"] == {"server": "EU", "level": "80"}

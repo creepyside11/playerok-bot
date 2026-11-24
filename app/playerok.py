@@ -40,7 +40,7 @@ CHECK_EMAIL_AUTH_CODE = """mutation checkEmailAuthCode($input: CheckEmailAuthCod
 VIEWER_QUERY = """query viewer {
   viewer {
     id username email role hasFrozenBalance isBlocked isBlockedFor canPublishItems createdAt
-    balance { value __typename }
+    balance { value available __typename }
     profile { id avatarURL testimonialCounter __typename }
     __typename
   }
@@ -125,6 +125,7 @@ class ViewerSnapshot:
     is_blocked: bool | None
     can_publish_items: bool | None
     testimonials: int | None
+    available_balance: str | int | float | None = None
 
 
 class PlayerokSession:
@@ -159,6 +160,7 @@ class PlayerokSession:
                     is_blocked=data.get("isBlocked", self.account.is_blocked),
                     can_publish_items=data.get("canPublishItems", self.account.can_publish_items),
                     testimonials=profile.get("testimonialCounter"),
+                    available_balance=(data.get("balance") or {}).get("available"),
                 )
             return await asyncio.to_thread(_load)
 
@@ -205,6 +207,7 @@ class PlayerokSession:
         data_fields: Any = None,
         remove_attachments: list[str] | None = None,
         add_attachments: list[str | bytes] | None = None,
+        comment: str | None = None,
     ) -> Any:
         return await self.call(
             "update_item",
@@ -216,6 +219,7 @@ class PlayerokSession:
             data_fields=data_fields,
             remove_attachments=remove_attachments,
             add_attachments=add_attachments,
+            comment=comment,
         )
 
     async def remove_item(self, item_id: str) -> Any:
@@ -230,13 +234,14 @@ class PlayerokSession:
     async def create_item(
         self,
         game_category_id: str,
-        obtaining_type_id: str,
+        obtaining_type_id: str | None,
         name: str,
         price: int,
         description: str,
         options: Any = None,
         data_fields: Any = None,
         attachments: list[str | bytes] | None = None,
+        comment: str | None = None,
     ) -> Any:
         return await self.call(
             "create_item",
@@ -248,6 +253,7 @@ class PlayerokSession:
             options=options or {},
             data_fields=data_fields or [],
             attachments=attachments or [],
+            comment=comment,
         )
 
 

@@ -6,7 +6,7 @@ import logging
 
 import httpx
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import ErrorEvent
 
 from app.config import Settings
@@ -56,7 +56,7 @@ async def main() -> None:
     bot = Bot(settings.bot_token)
     http_client = httpx.AsyncClient(timeout=30)
     plugin_manager.set_external_api(ExternalAPI(http_client))
-    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dispatcher.include_router(configure_advanced(plugin_manager))
     dispatcher.include_router(emerald_promo_router)
     dispatcher.include_router(telegram_accounts_router)

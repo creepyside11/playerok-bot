@@ -19,8 +19,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from playerokapi.enums import GameCategoryDataFieldTypes
+from playerokapi.exceptions import RequestPlayerokError
 
 from .crypto import SecretCipher
+from .item_delivery import save_item_delivery
+from .item_publication import parse_discount_price, tariff_price
 from .keyboards import auth_method_menu, back_menu, delivery_mode_menu, main_menu
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, PlayerokAccount, TelegramUser, fresh_settings
 from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, normalize_proxy
@@ -1161,7 +1164,8 @@ async def delivery_delete(call: CallbackQuery) -> None:
 
 async def show_items(call: CallbackQuery) -> None:
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Мои товары", callback_data="items:list")],
+        [InlineKeyboardButton(text="📋 Мои товары", callback_data="items:list"),
+         InlineKeyboardButton(text="📝 Черновики", callback_data="items:list:drafts")],
         [InlineKeyboardButton(text="🧩 Шаблоны товаров", callback_data="templates:list")],
         [InlineKeyboardButton(text="➕ Выставить товар", callback_data="items:create")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")],
@@ -1216,9 +1220,11 @@ async def template_use(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Шаблон не найден", show_alert=True)
         return
     await state.clear()
-    await state.update_data(account_id=str(account.id), **row.payload)
-    await call.answer()
-    await create_draft(call.message, state, call.from_user.id)
+    payload = {key: value for key, value in row.payload.items() if key != "data_field_values"}
+    await state.update_data(account_id=str(account.id), template=True, **payload)
+    await _load_category_and_start_options(
+        call, state, payload.get("obtaining_id"), payload.get("obtaining_name") or "Стандартный"
+    )
 
 
 @router.callback_query(F.data == "menu:items")
@@ -1364,34 +1370,25 @@ async def _load_category_and_start_options(
         client = await svc().gateway.get_client(account)
         category = await client.call("get_game_category", id=data["category_id"])
 
-        # Запрашиваем ВСЕ поля категории (включая логин, пароль, почту, формат выдачи)
         fields = []
         if obtaining_id:
-            try:
-                fields_page = await client.call(
+            cursor = None
+            while True:
+                page = await client.call(
                     "get_game_category_data_fields",
                     data["category_id"],
                     obtaining_id,
-                    count=50,
-                    type=None,
+                    count=24,
+                    type=GameCategoryDataFieldTypes.ITEM_DATA,
+                    after_cursor=cursor,
                 )
-                fields = list(getattr(fields_page, "data_fields", []) or [])
-            except Exception:
-                pass
-
-            if not fields:
-                # Fallback: объединяем ITEM_DATA и OBTAINING_DATA
-                try:
-                    p1 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.ITEM_DATA)
-                    p2 = await client.call("get_game_category_data_fields", data["category_id"], obtaining_id, count=50, type=GameCategoryDataFieldTypes.OBTAINING_DATA)
-                    seen_fids = set()
-                    for f in (getattr(p1, "data_fields", []) or []) + (getattr(p2, "data_fields", []) or []):
-                        fid = str(getattr(f, "id", ""))
-                        if fid and fid not in seen_fids:
-                            seen_fids.add(fid)
-                            fields.append(f)
-                except Exception:
-                    pass
+                fields.extend(
+                    field for field in page.data_fields if field.type == GameCategoryDataFieldTypes.ITEM_DATA
+                )
+                next_cursor = getattr(page.page_info, "end_cursor", None)
+                if not getattr(page.page_info, "has_next_page", False) or not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
     except Exception as exc:
         await call.answer("Ошибка API", show_alert=True)
         await call.message.answer(f"<code>{html.escape(str(exc))[:1200]}</code>", parse_mode="HTML")
@@ -1446,14 +1443,13 @@ async def _load_category_and_start_options(
         field_meta=field_meta,
         option_groups=option_groups,
         attribute_group_index=0,
-        attributes={},
+        attributes=data.get("attributes", {}) if data.get("template") else {},
     )
 
-    if option_groups:
+    if option_groups and not data.get("template"):
         await _show_attribute_group(call, state)
     else:
-        await state.set_state(ItemCreate.data_fields)
-        await call.message.answer("Атрибутов нет. Переходим к полям товара.")
+        await call.answer()
         await _start_item_fields(call.message, state)
 
 
@@ -1531,20 +1527,10 @@ async def _show_attribute_group(call_or_msg: Any, state: FSMContext, page: int =
         await call_or_msg.answer(prompt, reply_markup=b.as_markup(), parse_mode="HTML")
 
 
-async def _format_field_prompt(field_tuple: tuple[str, str, bool, bool, str], current_index: int, total_count: int) -> str:
-    _fid, label, required, is_hidden, type_name = field_tuple
-    lbl_lower = label.lower()
-    is_obtaining = type_name == "OBTAINING_DATA" or any(k in lbl_lower for k in ("логин", "login", "почт", "email", "пароль", "password", "ключ", "выдач", "аккаунт", "токен", "код"))
-    
-    if is_obtaining or is_hidden:
-        header = f"🔐 <b>Данные выдачи {current_index}/{total_count} (для покупателя):</b>\n"
-        hint = "\n<i>(Эти данные передаются покупателю автоматически после оплаты)</i>"
-    else:
-        header = f"🧾 <b>Поле товара {current_index}/{total_count}:</b>\n"
-        hint = ""
-
-    req_str = " <b>(обязательно)</b>" if required else " <i>(можно пропустить, отправив «-»)</i>"
-    return f"{header}Поле: «<b>{html.escape(label)}</b>»{req_str}{hint}\n\nВведите значение:"
+def _format_field_prompt(field: tuple[str, str, bool, bool, str], index: int, count: int) -> str:
+    _fid, label, required, _hidden, _type = field
+    requirement = "<b>Обязательное поле.</b>" if required else "Отправьте «-», чтобы пропустить."
+    return f"🔐 <b>Данные товара {index}/{count}</b>\n\n{html.escape(label)}\n{requirement}"
 
 
 async def _start_item_fields(target: Message, state: FSMContext) -> None:
@@ -1552,12 +1538,11 @@ async def _start_item_fields(target: Message, state: FSMContext) -> None:
     fields = data.get("field_meta") or []
     if not fields:
         await state.update_data(data_field_values={})
-        await state.set_state(ItemCreate.name)
-        await target.answer("Название товара:")
+        await _ask_item_data(target, state)
         return
     await state.update_data(field_index=0, data_field_values={})
     await state.set_state(ItemCreate.data_fields)
-    prompt = await _format_field_prompt(fields[0], 1, len(fields))
+    prompt = _format_field_prompt(fields[0], 1, len(fields))
     await target.answer(prompt, parse_mode="HTML")
 
 
@@ -1666,7 +1651,7 @@ async def item_attribute_message(message: Message, state: FSMContext) -> None:
             await _start_item_fields(message, state)
 
 
-@router.message(ItemCreate.data_fields)
+@router.message(ItemCreate.data_fields, F.text)
 async def item_fields(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     fields = data.get("field_meta") or []
@@ -1678,7 +1663,7 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     raw_value = (message.text or "").strip()
     # Если поле обязательно, не разрешаем пустой ввод или пропуск через "-"
     if required and (not raw_value or raw_value in {"-", "—", "пропуск", "skip"}):
-        await message.answer(f"⚠️ Поле «{label}» <b>обязательно</b> для выставления этого лота. Пожалуйста, введите корректное значение:", parse_mode="HTML")
+        await message.answer(f"⚠️ Поле «{html.escape(label)}» <b>обязательно</b> для выставления этого лота. Пожалуйста, введите корректное значение:", parse_mode="HTML")
         return
     values = dict(data.get("data_field_values") or {})
     if raw_value and raw_value not in {"-", "—", "пропуск", "skip"}:
@@ -1686,24 +1671,33 @@ async def item_fields(message: Message, state: FSMContext) -> None:
     index += 1
     if index < len(fields):
         await state.update_data(data_field_values=values, field_index=index)
-        prompt = await _format_field_prompt(fields[index], index + 1, len(fields))
+        prompt = _format_field_prompt(fields[index], index + 1, len(fields))
         await message.answer(prompt, parse_mode="HTML")
         return
     await state.update_data(data_field_values=values)
-    await _ask_delivery_data_or_name(message, state)
+    await _ask_buyer_message(message, state)
 
 
-async def _ask_delivery_data_or_name(target: Message, state: FSMContext) -> None:
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Пропустить автовыдачу", callback_data="itemdelivery:skip")]
-    ])
+async def _ask_item_data(target: Message, state: FSMContext) -> None:
     await state.set_state(ItemCreate.delivery_data)
     await target.answer(
-        "🔐 <b>Данные для выдачи покупателю (логин, пароль, ключ, код)</b>\n\n"
-        "Отправьте данные, которые бот автоматически отправит покупателю сразу после оплаты.\n"
-        "<i>Пример: <code>логин:пароль</code> или <code>аккаунт:пароль:секрет</code></i>\n\n"
-        "Если автовыдача для этого товара не нужна, нажмите «Пропустить»:",
-        reply_markup=markup,
+        "🔐 <b>Данные товара на Playerok</b>\n\n"
+        "Введите данные, которые покупатель увидит в разделе «Данные товара» после оплаты.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="itemdelivery:skip")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+async def _ask_buyer_message(target: Message, state: FSMContext) -> None:
+    await state.set_state(ItemCreate.delivery_comment)
+    await target.answer(
+        "💬 <b>Сообщение покупателю после оплаты</b>\n\n"
+        "Введите текст, который бот отправит в чат сделки. Например, инструкцию или время ответа.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Без сообщения", callback_data="itemdelivcomment:skip")]
+        ]),
         parse_mode="HTML",
     )
 
@@ -1711,49 +1705,41 @@ async def _ask_delivery_data_or_name(target: Message, state: FSMContext) -> None
 @router.callback_query(ItemCreate.delivery_data, F.data == "itemdelivery:skip")
 async def item_delivery_data_skip(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
-    await state.update_data(delivery_content=None, delivery_comment=None)
-    await state.set_state(ItemCreate.name)
-    await edit(call, "🏷 <b>Название товара:</b>", parse_mode="HTML")
+    await _ask_buyer_message(call.message, state)
 
 
-@router.message(ItemCreate.delivery_data)
+@router.message(ItemCreate.delivery_data, F.text)
 async def item_delivery_data_input(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text in {"-", "—", "пропустить", "skip", "нет"}:
-        await state.update_data(delivery_content=None, delivery_comment=None)
-        await state.set_state(ItemCreate.name)
-        await message.answer("🏷 <b>Название товара:</b>", parse_mode="HTML")
+    text = message.text.strip()
+    if text not in {"-", "—"} and not 2 <= len(text) <= 2048:
+        await message.answer("Введите от 2 до 2048 символов или нажмите «Пропустить».")
         return
+    await state.update_data(item_data=None if text in {"-", "—"} else text)
+    await _ask_buyer_message(message, state)
 
-    await state.update_data(delivery_content=text)
-    await state.set_state(ItemCreate.delivery_comment)
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Без комментария", callback_data="itemdelivcomment:skip")]
-    ])
-    await message.answer(
-        "📝 <b>Комментарий / инструкция к выдаче для покупателя:</b>\n\n"
-        "Напишите пояснение или инструкцию (например: <i>«Не меняйте почту первые 24 часа. Гарантия на момент покупки.»</i>).\n\n"
-        "Если комментарий не нужен, нажмите «Без комментария»:",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
+
+async def _finish_item_delivery(target: Message, state: FSMContext) -> None:
+    if (await state.get_data()).get("template"):
+        await _ask_item_images(target, state)
+        return
+    await state.set_state(ItemCreate.name)
+    await target.answer("🏷 <b>Название товара</b>", parse_mode="HTML")
 
 
 @router.callback_query(ItemCreate.delivery_comment, F.data == "itemdelivcomment:skip")
 async def item_delivery_comment_skip(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
-    await state.update_data(delivery_comment=None)
-    await state.set_state(ItemCreate.name)
-    await edit(call, "✅ Данные выдачи сохранены!\n\n🏷 <b>Название товара:</b>", parse_mode="HTML")
+    await _finish_item_delivery(call.message, state)
 
 
-@router.message(ItemCreate.delivery_comment)
+@router.message(ItemCreate.delivery_comment, F.text)
 async def item_delivery_comment_input(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    comment = None if text in {"-", "—", "пропустить", "skip", "нет"} else text
-    await state.update_data(delivery_comment=comment)
-    await state.set_state(ItemCreate.name)
-    await message.answer("✅ Данные выдачи и комментарий сохранены!\n\n🏷 <b>Название товара:</b>", parse_mode="HTML")
+    text = message.text.strip()
+    if not text or len(text) > 2000:
+        await message.answer("Введите сообщение до 2000 символов или нажмите «Без сообщения».")
+        return
+    await state.update_data(buyer_message=None if text in {"-", "—"} else text)
+    await _finish_item_delivery(message, state)
 
 
 @router.message(ItemCreate.name)
@@ -1782,17 +1768,24 @@ async def item_price(message: Message, state: FSMContext) -> None:
     await message.answer(f"💰 Цена: <b>{value} ₽</b>\n\n📝 <b>Описание товара:</b>", parse_mode="HTML")
 
 
-@router.message(ItemCreate.description)
+@router.message(ItemCreate.description, F.text)
 async def item_description(message: Message, state: FSMContext) -> None:
-    await state.update_data(item_description=(message.text or "").strip(), attachments_b64=[])
+    description = message.text.strip()
+    if not description:
+        await message.answer("Введите описание товара.")
+        return
+    await state.update_data(item_description=description)
+    await _ask_item_images(message, state)
+
+
+async def _ask_item_images(message: Message, state: FSMContext) -> None:
+    await state.update_data(attachments_b64=[])
     await state.set_state(ItemCreate.image)
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Без фотографий (создать)", callback_data="itemimage:skip")]
+        [InlineKeyboardButton(text="Продолжить к проверке лота", callback_data="itemimage:skip")]
     ])
     await message.answer(
-        "📸 <b>Фотографии товара</b>\n\n"
-        "Отправьте фотографии (обложку, скриншоты лота) прямо в этот чат.\n"
-        "Вы можете отправить до 10 фотографий по очереди или нажать кнопку ниже, чтобы выставить без фото:",
+        "📸 <b>Фотографии товара</b>\n\nОтправьте до 10 фотографий и нажмите «Продолжить».",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -1815,7 +1808,7 @@ async def item_image(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     current_list = list(data.get("attachments_b64") or [])
     if len(current_list) >= 10:
-        await message.answer("⚠️ Достигнут лимит 10 фотографий на лот. Нажмите кнопку создания лота ниже:")
+        await message.answer("Достигнут лимит 10 фотографий. Нажмите «Продолжить» под добавленным фото.")
         return
 
     buffer = io.BytesIO()
@@ -1826,7 +1819,7 @@ async def item_image(message: Message, state: FSMContext, bot: Bot) -> None:
 
     count = len(current_list)
     b = InlineKeyboardBuilder()
-    b.button(text=f"✅ Завершить и создать лот ({count} фото)", callback_data="itemimage:done")
+    b.button(text=f"Продолжить ({count} фото)", callback_data="itemimage:done")
     b.adjust(1)
 
     await message.answer(
@@ -1839,161 +1832,175 @@ async def item_image(message: Message, state: FSMContext, bot: Bot) -> None:
 
 async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
     data = await state.get_data()
-    account_id = data.get("account_id")
-    missing = [
-        key for key in ("category_id", "obtaining_id", "item_name", "item_price", "item_description")
-        if not data.get(key)
-    ]
-    if not account_id or missing:
-        await state.clear()
-        await target.answer(
-            "⚠️ Сессия создания товара устарела. Начните заново: «Товары» → «Выставить товар».",
-            reply_markup=main_menu(),
-        )
-        return
-    try:
-        account_uuid = uuid.UUID(str(account_id))
-    except (TypeError, ValueError):
-        await state.clear()
-        await target.answer("⚠️ Некорректный аккаунт в сессии. Начните заново.", reply_markup=main_menu())
-        return
-    async with svc().db() as session:
-        account = await session.get(PlayerokAccount, account_uuid)
-    if not account or account.tg_user_id != tg_id:
-        await state.clear()
+    if any(not data.get(key) for key in ("account_id", "category_id", "item_name", "item_price", "item_description")):
+        await target.answer("Заполните название, цену и описание товара.", reply_markup=main_menu())
         return
 
-    wait_msg = await target.answer("⏳ Создаю товар на Playerok…")
+    account = await _draft_account(data, tg_id)
+    if not account:
+        await state.clear()
+        await target.answer("Аккаунт не найден. Начните создание товара заново.", reply_markup=main_menu())
+        return
+
+    wait_msg = await target.answer("Создаю черновик на Playerok…")
     try:
         client = await svc().gateway.get_client(account)
-
-        # Собираем ВСЕ поля (параметры товара + логин/пароль/формат выдачи)
-        values = data.get("data_field_values") or {}
-        payload_fields = [{"fieldId": str(fid), "value": str(fval)} for fid, fval in values.items()]
-
-        # Декодируем все загруженные фотографии
-        attachments = []
-        for b64 in (data.get("attachments_b64") or []):
-            if b64:
-                attachments.append(base64.b64decode(b64))
-
-        item = await client.create_item(
-            game_category_id=data["category_id"],
-            obtaining_type_id=data["obtaining_id"],
-            name=data["item_name"],
-            price=data["item_price"],
-            description=data["item_description"],
-            options=data.get("attributes") or {},
-            data_fields=payload_fields,
-            attachments=attachments,
-        )
-        priorities = await client.get_item_priority_statuses(str(item.id), data["item_price"])
+        item_id = data.get("new_item_id")
+        if not item_id:
+            item = await client.create_item(
+                game_category_id=data["category_id"],
+                obtaining_type_id=data.get("obtaining_id"),
+                name=data["item_name"],
+                price=data["item_price"],
+                description=data["item_description"],
+                options=data.get("attributes") or {},
+                data_fields=data.get("data_field_values") or {},
+                attachments=[base64.b64decode(photo) for photo in data.get("attachments_b64", [])],
+                comment=data.get("item_data"),
+            )
+            item_id = str(item.id)
+            await state.update_data(new_item_id=item_id, attachments_b64=[])
+            await state.update_data(item_sale_price=int(item.price), item_price=tariff_price(item))
+        if data.get("buyer_message"):
+            await save_item_delivery(svc().db, svc().cipher, account.id, item_id, data["buyer_message"])
     except Exception as exc:
-        await wait_msg.delete()
-        await target.answer(
-            f"❌ Не удалось создать черновик:\n<code>{html.escape(str(exc))[:1800]}</code>",
+        item_id = (await state.get_data()).get("new_item_id")
+        if not item_id:
+            logger.warning("Playerok draft creation failed (%s)", type(exc).__name__)
+        if item_id:
+            detail = (
+                "Черновик создан. Нажмите «Повторить», чтобы закончить настройку "
+                f"лота <code>{html.escape(item_id)}</code>."
+            )
+        elif isinstance(exc, RequestPlayerokError):
+            detail = f"Playerok отклонил черновик:\n<code>{html.escape(clip(exc.error_message, 300))}</code>"
+        else:
+            detail = "Playerok не подтвердил создание. Проверьте список товаров перед повтором."
+        await wait_msg.edit_text(
+            detail,
             parse_mode="HTML",
-            reply_markup=main_menu(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Повторить", callback_data="itemimage:done")],
+                [InlineKeyboardButton(text="Черновики", callback_data="items:list:drafts")],
+            ]),
         )
-        await state.clear()
         return
 
-    await wait_msg.delete()
-    packed = [(str(p.id), str(p.name), int(p.price or 0)) for p in priorities]
-    await state.update_data(new_item_id=str(item.id), priorities=packed)
-    await state.set_state(ItemCreate.priority)
-    b = InlineKeyboardBuilder()
-    for i, (_id, name, price) in enumerate(packed):
-        b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
-    b.button(text="🔥 Указать цену со скидкой", callback_data="itemdiscount:prompt")
-    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
-    b.button(text="Оставить черновиком", callback_data="itemprio:draft")
-    b.adjust(1)
-    disc_info = ""
-    if data.get("item_discount_price"):
-        disc_info = f"\n🔥 Цена со скидкой: <b>{data['item_discount_price']} ₽</b> (базовая: {data['item_price']} ₽)"
-    await target.answer(
-        f"✅ Черновик создан: <code>{html.escape(str(item.id))}</code>{disc_info}\nВыберите публикацию или задайте скидку:",
-        reply_markup=b.as_markup(),
-        parse_mode="HTML",
+    await state.update_data(
+        data_field_values={}, item_data=None, buyer_message=None,
+        has_item_data=bool(data.get("data_field_values") or data.get("item_data")),
+        has_buyer_message=bool(data.get("buyer_message")),
     )
+    await state.set_state(ItemCreate.priority)
+    try:
+        await wait_msg.delete()
+    except TelegramBadRequest:
+        pass
+    await _show_draft_review(target, await state.get_data())
+
+
+async def _draft_account(data: dict[str, Any], tg_id: int) -> PlayerokAccount | None:
+    try:
+        account_id = uuid.UUID(str(data.get("account_id")))
+    except (TypeError, ValueError):
+        return None
+    async with svc().db() as session:
+        account = await session.get(PlayerokAccount, account_id)
+    return account if account and account.tg_user_id == tg_id else None
+
+
+async def _show_draft_review(target: CallbackQuery | Message, data: dict[str, Any]) -> None:
+    item_id = data["new_item_id"]
+    price = data.get("item_sale_price", data["item_price"])
+    base = data["item_price"]
+    price_line = f"<s>{base} ₽</s> → <b>{price} ₽</b>" if price < base else f"<b>{price} ₽</b>"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Выбрать способ публикации", callback_data=f"item:publish:{item_id}")],
+        [InlineKeyboardButton(text="Изменить скидку" if price < base else "Добавить скидку", callback_data="itemdiscount:prompt")],
+        [InlineKeyboardButton(text="Сохранить в черновиках", callback_data="itemprio:draft")],
+        [InlineKeyboardButton(text="Сохранить как шаблон", callback_data="itemtemplate:save")],
+    ])
+    text = (
+        f"📝 <b>Черновик · {html.escape(data['item_name'])}</b>\n\n"
+        f"Цена продажи: {price_line}\n"
+        f"Данные товара: {'добавлены' if data.get('has_item_data') else 'не добавлены'}\n"
+        f"Сообщение после оплаты: {'настроено' if data.get('has_buyer_message') else 'не настроено'}"
+    )
+    if isinstance(target, CallbackQuery):
+        await edit(target, text, markup)
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(ItemCreate.priority, F.data == "itemdraft:review")
+async def item_draft_review(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(publication=None)
+    await _show_draft_review(call, await state.get_data())
 
 
 @router.callback_query(ItemCreate.priority, F.data == "itemdiscount:prompt")
 async def item_create_discount_prompt(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    base_price = int(data.get("item_price", 0))
+    base_price = data["item_price"]
+    await state.update_data(publication=None)
     await state.set_state(ItemCreate.discount_price)
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад к публикации", callback_data="itemdiscount:cancel")]
-    ])
+    await call.answer()
     await edit(
         call,
-        f"🔥 <b>Установка цены со скидкой для лота</b>\n\n"
-        f"Базовая цена: <b>{base_price} ₽</b>\n"
-        f"Отправьте цену со скидкой (целое число меньше {base_price} ₽):\n"
-        f"<i>На Playerok базовая цена станет зачёркнутой, а лот получит шильдик со скидкой!</i>",
-        markup,
+        "🔥 <b>Скидка до публикации</b>\n\n"
+        f"Базовая цена: <b>{base_price} ₽</b>. Введите цену со скидкой от 5% "
+        "или отправьте «-», чтобы снять скидку.",
+        back_menu("itemdiscount:cancel"),
     )
 
 
 @router.callback_query(ItemCreate.discount_price, F.data == "itemdiscount:cancel")
 async def item_create_discount_cancel(call: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    packed = data.get("priorities", [])
+    await call.answer()
     await state.set_state(ItemCreate.priority)
-    b = InlineKeyboardBuilder()
-    for i, (_id, name, price) in enumerate(packed):
-        b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
-    b.button(text="🔥 Указать цену со скидкой", callback_data="itemdiscount:prompt")
-    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
-    b.button(text="Оставить черновиком", callback_data="itemprio:draft")
-    b.adjust(1)
-    disc_info = ""
-    if data.get("item_discount_price"):
-        disc_info = f"\n🔥 Цена со скидкой: <b>{data['item_discount_price']} ₽</b> (базовая: {data['item_price']} ₽)"
-    await edit(
-        call,
-        f"✅ Черновик: <code>{html.escape(str(data.get('new_item_id', '')))}</code>{disc_info}\nВыберите публикацию:",
-        b.as_markup(),
-    )
+    await _show_draft_review(call, await state.get_data())
 
 
-@router.message(ItemCreate.discount_price)
+@router.message(ItemCreate.discount_price, F.text)
 async def item_create_discount_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    base_price = int(data.get("item_price", 0))
-    text = (message.text or "").strip()
+    base_price = data["item_price"]
+    text = message.text.strip()
     try:
-        clean_val = text.replace(" ", "").replace("₽", "").replace("руб", "").replace("р", "")
-        disc_val = int(clean_val)
-        if disc_val <= 0 or disc_val >= base_price:
-            raise ValueError
+        price = parse_discount_price(text, base_price)
     except ValueError:
-        await message.answer(f"⚠️ Цена со скидкой должна быть целым числом больше 0 и меньше базовой ({base_price} ₽).\nПовторите ввод:")
+        await message.answer(f"Введите целую цену от 1 до {base_price * 95 // 100} ₽ или «-» для снятия скидки.")
         return
 
-    await state.update_data(item_discount_price=disc_val)
-    packed = data.get("priorities", [])
+    try:
+        account = await _draft_account(data, message.from_user.id)
+        if not account:
+            await state.clear()
+            await message.answer("Аккаунт не найден.", reply_markup=main_menu())
+            return
+        client = await svc().gateway.get_client(account)
+        current = await client.get_item(data["new_item_id"])
+        if getattr(current.status, "name", current.status) != "DRAFT" or tariff_price(current) != base_price:
+            await state.clear()
+            await message.answer(
+                "Статус или базовая цена изменились. Откройте товар заново.",
+                reply_markup=back_menu(f"item:view:{data['new_item_id']}"),
+            )
+            return
+        item = await client.update_item(data["new_item_id"], price=price)
+    except Exception as exc:
+        await message.answer(f"Playerok не принял изменение цены:\n<code>{html.escape(clip(str(exc), 350))}</code>", parse_mode="HTML")
+        return
+
+    await state.update_data(item_sale_price=int(item.price), item_price=tariff_price(item), publication=None)
     await state.set_state(ItemCreate.priority)
-    b = InlineKeyboardBuilder()
-    for i, (_id, name, price) in enumerate(packed):
-        b.button(text=f"{clip(name, 26)} · {price} ₽", callback_data=f"itemprio:{i}")
-    b.button(text="🔥 Изменить цену со скидкой", callback_data="itemdiscount:prompt")
-    b.button(text="💾 Сохранить как шаблон", callback_data="itemtemplate:save")
-    b.button(text="Оставить черновиком", callback_data="itemprio:draft")
-    b.adjust(1)
-    pct = round((1 - disc_val / base_price) * 100)
-    await message.answer(
-        f"🔥 <b>Скидка установлена: {disc_val} ₽</b> (-{pct}% от {base_price} ₽)\n\n"
-        "Выберите публикацию на Playerok:",
-        reply_markup=b.as_markup(),
-        parse_mode="HTML",
-    )
+    await _show_draft_review(message, await state.get_data())
 
 
 @router.callback_query(ItemCreate.priority, F.data == "itemtemplate:save")
 async def item_template_save_start(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(publication=None)
     await state.set_state(ItemCreate.template_name)
     await call.answer()
     await call.message.answer("Введите название шаблона:")
@@ -2015,7 +2022,7 @@ async def item_template_save(message: Message, state: FSMContext) -> None:
         key: data[key]
         for key in (
             "category_id", "category_name", "obtaining_id", "obtaining_name", "attributes",
-            "data_field_values", "item_name", "item_price", "item_description",
+            "item_name", "item_price", "item_description",
         )
         if key in data
     }
@@ -2034,94 +2041,13 @@ async def item_template_save(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(ItemCreate.priority, F.data == "itemprio:draft")
 async def leave_draft(call: CallbackQuery, state: FSMContext) -> None:
+    item_id = (await state.get_data())["new_item_id"]
     await state.clear()
-    await call.answer("Оставлено в черновиках")
-    await edit(call, "Товар сохранён как черновик.", main_menu())
-
-
-@router.callback_query(ItemCreate.priority, F.data.startswith("itemprio:"))
-async def item_publish(call: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    idx = int(call.data.split(":", 1)[1])
-    priorities = data.get("priorities") or []
-    account_id = data.get("account_id")
-    new_item_id = data.get("new_item_id")
-    if not (0 <= idx < len(priorities)) or not account_id or not new_item_id:
-        await state.clear()
-        await call.answer("Список приоритетов устарел. Создайте товар заново.", show_alert=True)
-        return
-    priority_id, _name, _price = priorities[idx]
-    try:
-        account_uuid = uuid.UUID(str(account_id))
-    except (TypeError, ValueError):
-        await state.clear()
-        await call.answer("Некорректная сессия. Создайте товар заново.", show_alert=True)
-        return
-    async with svc().db() as session:
-        account = await session.get(PlayerokAccount, account_uuid)
-    if not account:
-        await state.clear()
-        await call.answer("Аккаунт не найден.", show_alert=True)
-        return
-    try:
-        client = await svc().gateway.get_client(account)
-        item = await client.call("publish_item", new_item_id, priority_id)
-
-        # Если была указана цена со скидкой, обновляем цену лота, чтобы появился шильдик скидки (prevPrice)
-        discount_price = data.get("item_discount_price")
-        base_price = data.get("item_price")
-        try:
-            has_discount = bool(discount_price) and int(discount_price) < int(base_price)
-        except (TypeError, ValueError):
-            has_discount = False
-        if has_discount:
-            try:
-                item = await client.call("update_item", new_item_id, price=int(discount_price))
-            except Exception as upd_exc:
-                logger.warning("Failed to apply discount price: %s", upd_exc)
-
-        # Привязываем автовыдачу и комментарий к этому лоту, если были указаны
-        delivery_content = data.get("delivery_content")
-        delivery_comment = data.get("delivery_comment")
-        custom_creds = data.get("custom_credentials")
-
-        final_delivery_text = None
-        if delivery_content:
-            if delivery_comment:
-                final_delivery_text = f"{delivery_content}\n\n📝 Инструкция / Комментарий:\n{delivery_comment}"
-            else:
-                final_delivery_text = delivery_content
-        elif custom_creds and custom_creds.get("raw_text"):
-            final_delivery_text = custom_creds["raw_text"]
-
-        if final_delivery_text:
-            async with svc().db() as session:
-                rule = DeliveryRule(
-                    account_id=account.id,
-                    item_id=str(data["new_item_id"]),
-                    mode="static",
-                    message_template=final_delivery_text,
-                    enabled=True,
-                )
-                session.add(rule)
-                await session.flush()
-                session.add(DeliveryStock(
-                    rule_id=rule.id,
-                    payload_encrypted=svc().cipher.encrypt(final_delivery_text)
-                ))
-                await session.commit()
-    except Exception as exc:
-        await call.answer("Ошибка публикации", show_alert=True)
-        await call.message.answer(f"<code>{html.escape(str(exc))[:1600]}</code>", parse_mode="HTML")
-        return
-    await state.clear()
-    await call.answer("Опубликовано")
-    await edit(
-        call,
-        f"✅ Опубликовано: <b>{html.escape(str(getattr(item, 'name', 'Товар')))}</b>\n"
-        f"ID: <code>{html.escape(str(getattr(item, 'id', data['new_item_id'])))}</code>",
-        main_menu(),
-    )
+    await call.answer("Черновик сохранён")
+    await edit(call, "Черновик сохранён на Playerok.", InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Открыть черновик", callback_data=f"item:view:{item_id}")],
+        [InlineKeyboardButton(text="Мои товары", callback_data="items:list")],
+    ]))
 
 
 @router.message()

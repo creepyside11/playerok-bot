@@ -19,8 +19,11 @@ from sqlalchemy import select
 
 from .ai_manager import UniversalImageClient, UniversalOpenAIClient
 from .handlers import active_account, clip, edit, require_account, svc
+from .item_delivery import save_item_delivery
+from .item_publication import can_publish, parse_discount_price, publication_tariffs, tariff_price
+from .items_manager_ui import item_status_badge
 from .keyboards import back_menu, main_menu
-from .models import AutoReplyRule, DeliveryRule, DeliveryStock, PlayerokAccount
+from .models import PlayerokAccount
 from .plugin_system import PluginManager, PluginState
 from .states import AIManagerState
 
@@ -396,12 +399,13 @@ SYSTEM_AGENT_PROMPT = """Ты — интеллектуальный автоно�
    - name: привлекательное продающее название лота
    - description: продающее структурированное описание
    - price: цена в рублях (целое число)
-   - discount_price: (опционально) цена со скидкой, меньше price
+   - discount_price: (опционально) цена со скидкой минимум 5%
+   - draft_only: true, если пользователь просит сохранить черновик
    - game_name: название игры (например "Brawl Stars", "Roblox", "Black Russia", "Telegram", "Gmail", "Steam")
    - generate_cover: true / false (сгенерировать ли продающую AI-обложку)
    - cover_prompt: промпт для генерации картинки на английском (3D game render)
-   - delivery_text: данные для выдачи покупателю (логин, пароль, ключ, код)
-   - delivery_comment: инструкция или правила гарантии для покупателя
+   - delivery_text: текст для раздела «Данные товара» на Playerok
+   - delivery_comment: сообщение, которое бот отправит в чат после оплаты
    - bind_plugin: id плагина для привязки если применимо
 
 2. web_fetch: запросить данные из интернета, цены конкурентов или вызвать внешний REST API
@@ -603,9 +607,11 @@ async def _process_ai_agent_pipeline(
                 attachments.append(cover_bytes)
                 report.append("🖼 <i>Сгенерирована продающая AI-обложка лота</i>")
 
-        await wait_msg.edit_text("⏳ <b>Публикую лот на Playerok…</b>", parse_mode="HTML")
+        item_id = None
+        await wait_msg.edit_text("⏳ <b>Создаю черновик на Playerok…</b>", parse_mode="HTML")
         try:
-            created_item = await client.create_item(
+            discount = parse_discount_price(str(disc_price), price) if disc_price is not None else None
+            item = await client.create_item(
                 game_category_id=target_cat_id,
                 obtaining_type_id=target_obt_id,
                 name=item_name,
@@ -614,53 +620,34 @@ async def _process_ai_agent_pipeline(
                 options={},
                 data_fields=[],
                 attachments=attachments,
+                comment=data.get("delivery_text"),
             )
+            item_id = str(item.id)
+            if discount is not None:
+                item = await client.update_item(item_id, price=discount)
+                if int(item.price) != discount:
+                    raise ValueError("Playerok вернул другую цену.")
+            if data.get("delivery_comment"):
+                await save_item_delivery(
+                    svc().db, svc().cipher, account.id, item_id, data["delivery_comment"]
+                )
+            sale_price = item.price
+            if not data.get("draft_only") and can_publish(item):
+                tariffs = await publication_tariffs(client, item_id, tariff_price(item))
+                free = next((tariff for tariff in tariffs if tariff.fee == 0), None)
+                if free:
+                    item = await client.publish_item(item_id, free.id)
 
-            # Применяем скидку если была запрошена
-            if disc_price and int(disc_price) < price:
-                try:
-                    await client.call("update_item", str(created_item.id), price=int(disc_price))
-                    report.append(f"🔥 <i>Установлена скидка: {disc_price} ₽ (было {price} ₽)</i>")
-                except Exception:
-                    pass
-
-            # Публикуем
-            try:
-                statuses = await client.get_item_priority_statuses(str(created_item.id), price)
-                prio_id = str(statuses[0].id) if statuses else "1"
-                await client.publish_item(str(created_item.id), prio_id)
-            except Exception:
-                pass
-
-            report.append(f"✅ <b>Лот успешно опубликован!</b>")
             report.append(f"• Товар: <b>{html.escape(item_name)}</b>")
-            report.append(f"• ID: <code>{created_item.id}</code>")
-            report.append(f"• Цена: <b>{price} ₽</b>")
-
-            # Автовыдача и комментарий
-            deliv_text = data.get("delivery_text")
-            deliv_comment = data.get("delivery_comment")
-            if deliv_text:
-                full_deliv = f"{deliv_text}\n\n📝 Инструкция / Комментарий:\n{deliv_comment}" if deliv_comment else deliv_text
-                async with svc().db() as session:
-                    rule = DeliveryRule(
-                        account_id=account.id,
-                        item_id=str(created_item.id),
-                        mode="static",
-                        message_template=full_deliv,
-                        enabled=True,
-                    )
-                    session.add(rule)
-                    await session.flush()
-                    session.add(DeliveryStock(
-                        rule_id=rule.id,
-                        payload_encrypted=svc().cipher.encrypt(full_deliv)
-                    ))
-                    await session.commit()
-                report.append("⚡ <i>Автовыдача и комментарий покупателю успешно привязаны к лоту!</i>")
-
-        except Exception as create_exc:
-            report.append(f"❌ Ошибка создания лота: {html.escape(str(create_exc))}")
+            report.append(f"• ID: <code>{html.escape(item_id)}</code>")
+            report.append(f"• Цена: <b>{sale_price} ₽</b>")
+            report.append(f"• Статус на Playerok: {item_status_badge(item.status)}")
+        except Exception as exc:
+            if item_id:
+                report.append("Playerok создал лот. Проверьте его статус и настройки в разделе «Мои товары».")
+                report.append(f"• ID: <code>{html.escape(item_id)}</code>")
+            else:
+                report.append(f"Playerok не подтвердил создание лота: {html.escape(clip(str(exc), 350))}")
 
     # 2. Настройка бота
     elif action == "configure_bot":

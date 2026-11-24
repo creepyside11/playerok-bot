@@ -90,7 +90,7 @@ class ItemEdit(StatesGroup):
     discount = State()
     description = State()
     delivery_data = State()
-    delivery_comment = State()
+    goods = State()
     add_photo = State()
     replace_photo = State()
 

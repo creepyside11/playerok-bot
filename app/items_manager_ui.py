@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import io
 import logging
+import secrets
 from typing import Any
 
 from aiogram import F, Router
@@ -11,9 +12,17 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .handlers import active_account, clip, edit, require_account, svc
+from playerokapi.enums import ItemStatuses
+from playerokapi.exceptions import RequestPlayerokError
+
+from .item_delivery import save_item_delivery
+from .item_publication import (
+    PublicationChanged, can_publish, confirm_publication, parse_discount_price, publication_balance,
+    publication_tariffs, rubles, tariff_price,
+)
 from .keyboards import back_menu
-from .models import DeliveryRule, DeliveryStock
-from .states import ItemEdit
+from .models import DeliveryRule
+from .states import ItemCreate, ItemEdit
 from sqlalchemy import select
 
 logger = logging.getLogger("items_manager")
@@ -26,13 +35,15 @@ def item_status_badge(status: Any) -> str:
     raw = str(getattr(status, "name", status) or "").upper()
     if raw in ("APPROVED", "ACTIVE"):
         return "🟢 На продаже"
-    elif raw in ("PENDING", "MODERATION", "ON_MODERATION"):
+    elif raw in ("PENDING", "MODERATION", "ON_MODERATION", "PENDING_APPROVAL", "PENDING_MODERATION"):
         return "⏳ На модерации"
     elif raw in ("SOLD", "COMPLETED"):
         return "📦 Продан"
     elif raw in ("PAUSED", "DISABLED", "ARCHIVED"):
         return "⏸ Снят с продажи"
-    return f"ℹ️ {raw}"
+    elif raw == "DRAFT":
+        return "📝 Черновик"
+    return f"ℹ️ {html.escape(raw)}"
 
 
 @router.callback_query(F.data == "items:list")
@@ -43,17 +54,29 @@ async def items_list_view(call: CallbackQuery, state: FSMContext) -> None:
     if not account:
         return
 
-    page_idx = 0
-    parts = (call.data or "").split(":")
-    if len(parts) >= 3 and parts[2].isdigit():
-        page_idx = int(parts[2])
+    parts = call.data.split(":")
+    drafts = "drafts" in parts
+    page_idx = min(int(parts[-1]), 1000) if parts[-1].isdigit() else 0
+    list_callback = "items:list:drafts" if drafts else "items:list"
 
     await call.answer("Загружаю товары…")
     try:
         client = await svc().gateway.get_client(account)
-        # Загружаем товары продавца без фильтрации по статусу (макс. 24 на запрос в Playerok API)
-        res = await client.call("get_my_items", statuses=None, count=24)
-        all_items = list(getattr(res, "items", []) or [])
+        cursor = None
+        for idx in range(page_idx + 1):
+            page = await client.call(
+                "get_my_items", statuses=[ItemStatuses.DRAFT] if drafts else None,
+                count=PAGE_SIZE, after_cursor=cursor,
+            )
+            page_info = getattr(page, "page_info", None)
+            next_cursor = getattr(page_info, "end_cursor", None)
+            if not getattr(page_info, "has_next_page", False) or not next_cursor or next_cursor == cursor:
+                page_idx = idx
+                break
+            cursor = next_cursor
+        current_items = [item for item in page.items if item]
+        total_count = page.total_count
+        has_next = bool(getattr(page_info, "has_next_page", False) and next_cursor)
     except Exception as exc:
         await edit(
             call,
@@ -62,54 +85,43 @@ async def items_list_view(call: CallbackQuery, state: FSMContext) -> None:
         )
         return
 
-    if not all_items:
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Выставить товар (Поиск)", callback_data="catalog:search")],
-                [InlineKeyboardButton(text="⬅️ Меню товаров", callback_data="menu:items")],
-            ]
-        )
-        await edit(call, "📦 <b>У вас пока нет товаров на Playerok.</b>\n\nВы можете выставить первый товар кнопкой ниже:", markup)
-        return
-
-    total_count = len(all_items)
-    start_idx = page_idx * PAGE_SIZE
-    current_page_items = all_items[start_idx : start_idx + PAGE_SIZE]
-    total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
-
     builder = InlineKeyboardBuilder()
-
-    for item in current_page_items:
-        i_id = str(getattr(item, "id", ""))
-        name = str(getattr(item, "name", "Товар") or "Товар")
-        price = getattr(item, "price", 0)
-        status_raw = str(getattr(getattr(item, "status", None), "name", "")).upper()
-        icon = "🟢" if status_raw in ("APPROVED", "ACTIVE") else ("⏳" if status_raw in ("PENDING", "MODERATION") else "⏸")
-        btn_text = f"{icon} {price} ₽ · {clip(name, 35)}"
-        builder.button(text=btn_text, callback_data=f"item:view:{i_id}")
+    for item in current_items:
+        badge = item_status_badge(item.status).split(" ", 1)[0]
+        builder.button(
+            text=f"{badge} {item.price} ₽ · {clip(item.name, 35)}",
+            callback_data=f"item:view:{item.id}",
+        )
 
     builder.adjust(1)
 
     # Пагинация
     nav_buttons = []
     if page_idx > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"items:list:{page_idx - 1}"))
-    if page_idx + 1 < total_pages:
-        nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"items:list:{page_idx + 1}"))
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{list_callback}:{page_idx - 1}"))
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"{list_callback}:{page_idx + 1}"))
     if nav_buttons:
         builder.row(*nav_buttons)
 
     builder.row(
-        InlineKeyboardButton(text="➕ Выставить товар", callback_data="catalog:search"),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"items:list:{page_idx}"),
+        InlineKeyboardButton(text="Выставить товар", callback_data="catalog:search"),
+        InlineKeyboardButton(text="Обновить", callback_data=f"{list_callback}:{page_idx}"),
     )
-    builder.row(InlineKeyboardButton(text="⬅️ Меню товаров", callback_data="menu:items"))
-
-    text = (
-        f"📋 <b>Ваши товары ({account.username})</b>\n\n"
-        f"Всего лотов: <b>{total_count}</b> (страница {page_idx + 1} из {max(1, total_pages)})\n\n"
-        "💡 <i>Нажмите на любой товар ниже, чтобы изменить цену, название, описание или фото:</i>"
+    builder.row(
+        InlineKeyboardButton(
+            text="Все товары" if drafts else "Черновики",
+            callback_data="items:list" if drafts else "items:list:drafts",
+        ),
+        InlineKeyboardButton(text="Меню товаров", callback_data="menu:items"),
     )
+    title = "Черновики" if drafts else "Мои товары"
+    text = f"📋 <b>{title} · {html.escape(account.username or '')}</b>"
+    if current_items:
+        total = f" · всего {total_count}" if total_count is not None else ""
+        text += f"\nСтраница {page_idx + 1}{total}"
+    else:
+        text += "\nЗдесь пока пусто."
     await edit(call, text, builder.as_markup())
 
 
@@ -126,7 +138,7 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
 
     name = str(getattr(item, "name", "Без названия") or "Без названия")
     price = getattr(item, "price", 0)
-    prev_price = getattr(item, "prev_price", None)
+    base_price = tariff_price(item)
     desc = str(getattr(item, "description", "") or "").strip()
     status = getattr(item, "status", None)
     status_label = item_status_badge(status)
@@ -137,8 +149,8 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
     category_name = str(getattr(category, "name", "—") or "—")
 
     price_str = f"<b>{price} ₽</b>"
-    if prev_price and int(prev_price) != int(price):
-        price_str += f" <i>(ранее: {prev_price} ₽)</i>"
+    if base_price > int(price):
+        price_str = f"<s>{base_price} ₽</s> → {price_str}"
 
     desc_display = html.escape(desc)
     if len(desc_display) > 800:
@@ -151,20 +163,15 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
     if attachments and hasattr(attachments[0], "url"):
         photos_note += f" · <a href=\"{attachments[0].url}\">Обложка ↗</a>"
 
-    # Проверяем наличие автовыдачи для этого товара в базе бота
-    delivery_info = "<i>Автовыдача не настроена</i>"
     async with svc().db() as session:
-        deliv_rule = await session.scalar(
+        rule = await session.scalar(
             select(DeliveryRule).where(
-                DeliveryRule.account_id == account.id,
-                DeliveryRule.item_id == str(item_id),
+                DeliveryRule.account_id == account.id, DeliveryRule.item_id == item_id
             )
         )
-        if deliv_rule:
-            tmpl_preview = deliv_rule.message_template
-            if len(tmpl_preview) > 100:
-                tmpl_preview = tmpl_preview[:100] + "…"
-            delivery_info = f"<b>Включена</b> (<code>{html.escape(tmpl_preview)}</code>)"
+    has_item_data = bool(getattr(item, "comment", None) or any(
+        field.value for field in getattr(item, "data_fields", []) or []
+    ))
 
     lines = [
         f"📦 <b>Лот: {html.escape(name)}</b>",
@@ -173,7 +180,8 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
         f"📊 Статус: <b>{status_label}</b>",
         f"🎮 Игра / Раздел: <b>{html.escape(game_name)}</b>",
         f"📂 Категория: <b>{html.escape(category_name)}</b>",
-        f"⚡ Автовыдача: {delivery_info}",
+        f"🔐 Данные товара: {'добавлены' if has_item_data else 'не добавлены'}",
+        f"💬 Отправка в чат после оплаты: {'настроена' if rule and rule.enabled else 'не настроена'}",
         f"🖼 Фотографий: {photos_note}",
         f"🆔 ID: <code>{html.escape(item_id)}</code>",
         "",
@@ -191,14 +199,14 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
         InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"item:edit:desc:{item_id}"),
     )
     builder.row(
-        InlineKeyboardButton(text="🔐 Данные выдачи / комментарий", callback_data=f"item:edit:delivery:{item_id}"),
+        InlineKeyboardButton(text="🔐 Данные товара", callback_data=f"item:edit:goods:{item_id}"),
+        InlineKeyboardButton(text="💬 После оплаты", callback_data=f"item:edit:delivery:{item_id}"),
     )
     builder.row(
         InlineKeyboardButton(text=f"🖼 Фото ({photos_count})", callback_data=f"item:edit:photo:{item_id}"),
     )
 
-    status_name = str(getattr(status, "name", "")).upper()
-    if status_name not in ("APPROVED", "ACTIVE"):
+    if can_publish(item):
         builder.row(InlineKeyboardButton(text="🚀 Опубликовать на Playerok", callback_data=f"item:publish:{item_id}"))
 
     builder.row(InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"item:delete:ask:{item_id}"))
@@ -349,92 +357,58 @@ async def item_edit_discount_prompt(call: CallbackQuery, state: FSMContext) -> N
     account = await require_account(call)
     if not account:
         return
-    item_id = call.data.split(":")[3]
-    await state.clear()
-    await state.set_state(ItemEdit.discount)
+    item_id = call.data.rsplit(":", 1)[1]
+    await call.answer()
     client = await svc().gateway.get_client(account)
     try:
-        cur_item = await client.get_item(item_id)
-        current_price = int(getattr(cur_item, "price", 0) or 0)
+        item = await client.get_item(item_id)
+        base_price = tariff_price(item)
     except Exception:
-        current_price = 0
-
-    await state.update_data(item_id=item_id, account_id=str(account.id), current_price=current_price)
-    await call.answer()
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")]]
-    )
+        await edit(call, "Не удалось загрузить цену товара.", back_menu(f"item:view:{item_id}"))
+        return
+    await state.clear()
+    await state.set_state(ItemEdit.discount)
+    await state.update_data(item_id=item_id, account_id=str(account.id), base_price=base_price)
     await edit(
         call,
-        "🔥 <b>Установка цены со скидкой</b>\n\n"
-        f"Текущая цена лота: <b>{current_price} ₽</b>\n\n"
-        "Отправьте новую цену со скидкой (целое число меньше текущей цены, либо пару <code>старая_цена новая_цена</code>).\n"
-        "<i>На Playerok старая цена станет зачёркнутой (<code>prevPrice</code>), а новая цена станет текущей ценой продажи со скидкой!</i>\n\n"
-        "Для отмены нажмите кнопку ниже или введите /cancel.",
-        markup,
+        "🔥 <b>Скидка на товар</b>\n\n"
+        f"Базовая цена: <b>{base_price} ₽</b>. Введите цену со скидкой от 5% "
+        "или отправьте «-», чтобы снять скидку.",
+        back_menu(f"item:view:{item_id}"),
     )
 
 
-@router.message(ItemEdit.discount, F.text)
+@router.message(ItemEdit.discount, F.text, ~F.text.startswith("/"))
 async def item_save_discount(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    item_id = data.get("item_id")
-    current_price = int(data.get("current_price", 0))
-
+    item_id = data["item_id"]
+    base_price = data["base_price"]
     account = await active_account(message.from_user.id)
-    if not account or not item_id:
+    if not account or data["account_id"] != str(account.id):
         await state.clear()
-        await message.answer("❌ Аккаунт не найден.")
+        await message.answer("Аккаунт изменился. Откройте товар заново.")
         return
 
-    text = (message.text or "").strip()
-    parts = text.replace("₽", "").replace("руб", "").replace("р", "").split()
+    text = message.text.strip()
     try:
-        if len(parts) == 1:
-            disc_price = int(parts[0].replace(" ", ""))
-            base_price = current_price
-            if disc_price <= 0:
-                raise ValueError
-            if base_price > 0 and disc_price >= base_price:
-                await message.answer(f"⚠️ Цена со скидкой ({disc_price} ₽) должна быть меньше текущей ({base_price} ₽):")
-                return
-        elif len(parts) >= 2:
-            base_price = int(parts[0].replace(" ", ""))
-            disc_price = int(parts[1].replace(" ", ""))
-            if base_price <= 0 or disc_price <= 0 or disc_price >= base_price:
-                raise ValueError
-        else:
-            raise ValueError
+        price = parse_discount_price(text, base_price)
     except ValueError:
-        await message.answer("⚠️ Введите число меньше текущей цены или формат: <code>1000 790</code> (старая и новая цена):", parse_mode="HTML")
+        await message.answer(f"Введите цену от 1 до {base_price * 95 // 100} ₽ или «-» для снятия скидки.")
         return
 
-    await state.clear()
-    wait_msg = await message.answer("⏳ Устанавливаю цену со скидкой в Playerok…")
+    client = await svc().gateway.get_client(account)
     try:
-        client = await svc().gateway.get_client(account)
-        if len(parts) >= 2 and base_price != current_price:
-            # Сначала обновляем базовую цену, чтобы зафиксировать prevPrice
-            await client.update_item(item_id, price=base_price)
-        # Затем устанавливаем цену со скидкой
-        await client.update_item(item_id, price=disc_price)
-        await wait_msg.delete()
-        pct = round((1 - disc_price / max(1, base_price)) * 100) if base_price > disc_price else 0
-        await message.answer(
-            f"✅ <b>Скидка успешно установлена!</b>\n"
-            f"Старая цена: <s>{base_price} ₽</s>\n"
-            f"Новая цена со скидкой: <b>{disc_price} ₽</b> (-{pct}%)\n"
-            f"<i>Лот на Playerok обновлён с бейджем скидки!</i>",
-            parse_mode="HTML",
-        )
-        await render_item_card(message, account, client, item_id)
+        current = await client.get_item(item_id)
+        if tariff_price(current) != base_price:
+            await state.clear()
+            await message.answer("Базовая цена изменилась. Откройте настройки скидки заново.", reply_markup=back_menu(f"item:view:{item_id}"))
+            return
+        await client.update_item(item_id, price=price)
     except Exception as exc:
-        await wait_msg.delete()
-        await message.answer(
-            f"❌ <b>Ошибка при установке скидки:</b>\n<code>{html.escape(str(exc))[:1500]}</code>",
-            parse_mode="HTML",
-            reply_markup=back_menu(f"item:view:{item_id}"),
-        )
+        await message.answer(f"Playerok не принял изменение цены:\n<code>{html.escape(clip(str(exc), 350))}</code>", parse_mode="HTML")
+        return
+    await state.clear()
+    await render_item_card(message, account, client, item_id)
 
 
 # --- РЕДАКТИРОВАНИЕ ОПИСАНИЯ ---
@@ -495,188 +469,122 @@ async def item_save_description(message: Message, state: FSMContext) -> None:
 
 # --- УПРАВЛЕНИЕ ДАННЫМИ ВЫДАЧИ И КОММЕНТАРИЕМ ---
 
+@router.callback_query(F.data.startswith("item:edit:goods:"))
+async def item_edit_goods_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    item_id = call.data.rsplit(":", 1)[1]
+    await state.clear()
+    await state.set_state(ItemEdit.goods)
+    await state.update_data(item_id=item_id, account_id=str(account.id))
+    await call.answer()
+    await edit(
+        call,
+        "🔐 <b>Данные товара на Playerok</b>\n\n"
+        "Введите новый текст для раздела «Данные товара» после оплаты. "
+        "Отправьте «-», чтобы очистить текст. Поля категории сохранятся.",
+        back_menu(f"item:view:{item_id}"),
+    )
+
+
+@router.message(ItemEdit.goods, F.text, ~F.text.startswith("/"))
+async def item_save_goods(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if text not in {"-", "—"} and not 2 <= len(text) <= 2048:
+        await message.answer("Введите от 2 до 2048 символов или «-», чтобы очистить текст.")
+        return
+    data = await state.get_data()
+    account = await active_account(message.from_user.id)
+    if not account or data["account_id"] != str(account.id):
+        await state.clear()
+        await message.answer("Аккаунт изменился. Откройте товар заново.")
+        return
+    item_id = data["item_id"]
+    client = await svc().gateway.get_client(account)
+    try:
+        await client.update_item(item_id, comment="" if text in {"-", "—"} else text)
+    except RequestPlayerokError as exc:
+        await message.answer(f"Playerok не принял данные товара: {clip(exc.error_message, 300)}")
+        return
+    await state.clear()
+    await render_item_card(message, account, client, item_id)
+
+
 @router.callback_query(F.data.startswith("item:edit:delivery:"))
 async def item_edit_delivery_prompt(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)
     if not account:
         return
-    item_id = call.data.split(":")[3]
-    await state.clear()
-
+    item_id = call.data.rsplit(":", 1)[1]
     async with svc().db() as session:
         rule = await session.scalar(
             select(DeliveryRule).where(
-                DeliveryRule.account_id == account.id,
-                DeliveryRule.item_id == str(item_id),
+                DeliveryRule.account_id == account.id, DeliveryRule.item_id == item_id
             )
         )
+    if rule and rule.mode == "stock":
+        await call.answer("У лота настроена выдача со склада. Её можно изменить в меню «Автовыдача».", show_alert=True)
+        return
 
-    current_text = rule.message_template if rule else "<i>[Не настроена]</i>"
-
+    await state.clear()
     await state.set_state(ItemEdit.delivery_data)
     await state.update_data(item_id=item_id, account_id=str(account.id))
     await call.answer()
-
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Отключить автовыдачу", callback_data=f"item:deliv:clear:{item_id}")],
-            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")],
-        ]
-    )
-
     await edit(
         call,
-        "🔐 <b>Настройка автовыдачи и данных для выдачи</b>\n\n"
-        f"<b>Текущие данные выдачи:</b>\n<pre>{html.escape(current_text)}</pre>\n\n"
-        "Отправьте новые данные для выдачи покупателю (логин, пароль, ключ или ссылку).\n"
-        "<i>Следующим шагом можно будет указать комментарий/инструкцию.</i>\n\n"
-        "Для отмены нажмите кнопку ниже:",
-        markup,
+        "💬 <b>Сообщение покупателю после оплаты</b>\n\n"
+        "Введите текст, который бот отправит в чат сделки после оплаты.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Удалить сообщение лота", callback_data=f"item:deliv:clear:{item_id}")],
+            [InlineKeyboardButton(text="Отмена", callback_data=f"item:view:{item_id}")],
+        ]),
     )
 
 
-@router.callback_query(F.data.startswith("item:deliv:clear:"))
+@router.callback_query(ItemEdit.delivery_data, F.data.startswith("item:deliv:clear:"))
 async def item_delivery_clear(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
     account = await require_account(call)
     if not account:
         return
-    item_id = call.data.split(":")[3]
-    await state.clear()
-
+    item_id = call.data.rsplit(":", 1)[1]
+    if data.get("item_id") != item_id or data.get("account_id") != str(account.id):
+        await call.answer("Откройте настройки сообщения заново.", show_alert=True)
+        return
     async with svc().db() as session:
         rule = await session.scalar(
             select(DeliveryRule).where(
-                DeliveryRule.account_id == account.id,
-                DeliveryRule.item_id == str(item_id),
+                DeliveryRule.account_id == account.id, DeliveryRule.item_id == item_id
             )
         )
+        if rule and rule.mode == "stock":
+            await call.answer("У лота настроена выдача со склада.", show_alert=True)
+            return
         if rule:
             await session.delete(rule)
             await session.commit()
+    await state.clear()
+    await call.answer("Сообщение лота удалено")
+    await render_item_card(call, account, await svc().gateway.get_client(account), item_id)
 
-    await call.answer("Автовыдача удалена")
-    client = await svc().gateway.get_client(account)
-    await render_item_card(call, account, client, item_id)
 
-
-@router.message(ItemEdit.delivery_data, F.text)
+@router.message(ItemEdit.delivery_data, F.text, ~F.text.startswith("/"))
 async def item_save_delivery_data(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if not text:
+    text = message.text.strip()
+    if not text or len(text) > 2000:
+        await message.answer("Введите сообщение до 2000 символов.")
         return
     data = await state.get_data()
-    item_id = data.get("item_id")
-    if not item_id:
-        await state.clear()
-        await message.answer("⚠️ Сессия устарела. Откройте товар заново из списка.", reply_markup=back_menu("items"))
-        return
-    await state.update_data(new_delivery_content=text)
-    await state.set_state(ItemEdit.delivery_comment)
-
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Без комментария (сохранить)", callback_data=f"item:delivcomment:skip:{item_id}")],
-            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"item:view:{item_id}")],
-        ]
-    )
-    await message.answer(
-        "📝 <b>Комментарий / инструкция для покупателя к выдаче:</b>\n\n"
-        "Напишите инструкцию (например: <i>«Не меняйте почту первые 24 часа. Гарантия на момент покупки.»</i>).\n\n"
-        "Или нажмите «Без комментария», чтобы сохранить только данные выдачи:",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data.startswith("item:delivcomment:skip:"))
-async def item_save_delivery_comment_skip(call: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    item_id = data.get("item_id") or call.data.split(":")[3]
-    content = data.get("new_delivery_content", "")
-    account = await require_account(call)
-    if not account or not item_id:
-        await state.clear()
-        await call.answer("Сессия устарела. Откройте товар заново.", show_alert=True)
-        return
-    if not content:
-        await state.clear()
-        await call.answer("Данные выдачи не найдены. Начните заново.", show_alert=True)
-        return
-
-    async with svc().db() as session:
-        old = await session.scalar(
-            select(DeliveryRule).where(
-                DeliveryRule.account_id == account.id,
-                DeliveryRule.item_id == str(item_id),
-            )
-        )
-        if old:
-            await session.delete(old)
-            await session.flush()
-        rule = DeliveryRule(
-            account_id=account.id,
-            item_id=str(item_id),
-            mode="static",
-            message_template=content,
-            enabled=True,
-        )
-        session.add(rule)
-        await session.flush()
-        session.add(DeliveryStock(
-            rule_id=rule.id,
-            payload_encrypted=svc().cipher.encrypt(content),
-        ))
-        await session.commit()
-
-    await state.clear()
-    await call.answer("✅ Данные выдачи сохранены!", show_alert=True)
-    client = await svc().gateway.get_client(account)
-    await render_item_card(call, account, client, item_id)
-
-
-@router.message(ItemEdit.delivery_comment, F.text)
-async def item_save_delivery_comment(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    item_id = data.get("item_id")
-    content = data.get("new_delivery_content", "")
-    comment = (message.text or "").strip()
     account = await active_account(message.from_user.id)
-    if not account or not item_id:
+    if not account or data["account_id"] != str(account.id):
         await state.clear()
-        await message.answer("❌ Аккаунт не найден.")
+        await message.answer("Аккаунт изменился. Откройте товар заново.")
         return
-
-    full_template = f"{content}\n\n📝 Инструкция / Комментарий:\n{comment}" if comment and comment not in {"-", "—"} else content
-
-    async with svc().db() as session:
-        old = await session.scalar(
-            select(DeliveryRule).where(
-                DeliveryRule.account_id == account.id,
-                DeliveryRule.item_id == str(item_id),
-            )
-        )
-        if old:
-            await session.delete(old)
-            await session.flush()
-        rule = DeliveryRule(
-            account_id=account.id,
-            item_id=str(item_id),
-            mode="static",
-            message_template=full_template,
-            enabled=True,
-        )
-        session.add(rule)
-        await session.flush()
-        session.add(DeliveryStock(
-            rule_id=rule.id,
-            payload_encrypted=svc().cipher.encrypt(full_template),
-        ))
-        await session.commit()
-
+    item_id = data["item_id"]
+    await save_item_delivery(svc().db, svc().cipher, account.id, item_id, text)
     await state.clear()
-    await message.answer("✅ <b>Данные автовыдачи и комментарий успешно сохранены!</b>", parse_mode="HTML")
-    client = await svc().gateway.get_client(account)
-    await render_item_card(message, account, client, item_id)
+    await render_item_card(message, account, await svc().gateway.get_client(account), item_id)
 
 
 # --- УПРАВЛЕНИЕ ФОТОГРАФИЯМИ ---
@@ -843,35 +751,159 @@ async def item_photo_clear(call: CallbackQuery) -> None:
 # --- ПУБЛИКАЦИЯ ТОВАРА ---
 
 @router.callback_query(F.data.startswith("item:publish:"))
-async def item_publish_action(call: CallbackQuery) -> None:
+async def item_publish_action(call: CallbackQuery, state: FSMContext) -> None:
     account = await require_account(call)
     if not account:
         return
-    item_id = call.data.split(":")[2]
-    await call.answer("Публикую товар…")
+    item_id = call.data.rsplit(":", 1)[1]
+    data = await state.get_data()
+    in_wizard = await state.get_state() == ItemCreate.priority.state and data.get("new_item_id") == item_id
+    if in_wizard and data.get("account_id") != str(account.id):
+        await call.answer("Аккаунт изменился. Откройте черновик из списка товаров.", show_alert=True)
+        return
+    if not in_wizard:
+        await state.clear()
+    await call.answer()
+    await _show_publication(call, state, account, item_id, in_wizard)
 
+
+async def _show_publication(
+    call: CallbackQuery, state: FSMContext, account: Any, item_id: str,
+    in_wizard: bool, notice: str = "",
+) -> None:
+    await state.update_data(publication=None)
+    back = "itemdraft:review" if in_wizard else f"item:view:{item_id}"
+    try:
+        client = await svc().gateway.get_client(account)
+        item = await client.get_item(item_id)
+        if not can_publish(item):
+            await edit(call, "У этого товара сейчас нет доступной публикации.", back_menu(f"item:view:{item_id}"))
+            return
+        prices = int(item.price), tariff_price(item)
+        tariffs = await publication_tariffs(client, item_id, prices[1])
+        balance = await publication_balance(client)
+    except Exception:
+        await edit(call, "Не удалось загрузить условия публикации.", InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Повторить", callback_data=f"item:publish:{item_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data=back)],
+        ]))
+        return
+
+    token = secrets.token_hex(6)
+    await state.update_data(publication={
+        "token": token, "item_id": item_id, "account_id": str(account.id), "prices": prices,
+        "tariffs": tariffs, "balance": balance, "in_wizard": in_wizard, "selected": None,
+    })
+    price, base = prices
+    price_text = f"<s>{base} ₽</s> → <b>{price} ₽</b>" if price < base else f"<b>{price} ₽</b>"
+    lines = [
+        f"🚀 <b>Публикация · {html.escape(clip(item.name, 100))}</b>\n",
+        f"Цена продажи: {price_text}",
+        f"Доступный баланс: <b>{rubles(balance) if balance is not None else 'недоступен'}</b>",
+    ]
+    if notice:
+        lines.append(f"\n{notice}")
+    builder = InlineKeyboardBuilder()
+    for idx, tariff in enumerate(tariffs):
+        if not tariff.fee:
+            builder.row(InlineKeyboardButton(text="Выставить бесплатно", callback_data=f"itempub:pick:{token}:{idx}"))
+            continue
+        if balance is None:
+            details = "баланс недоступен"
+        elif balance < tariff.fee:
+            details = "недостаточно средств"
+        else:
+            details = f"остаток {rubles(balance - tariff.fee)}"
+        label = f"{clip(tariff.name, 24)} · {rubles(tariff.fee)}"
+        lines.append(f"{html.escape(label)} · {details}")
+        if balance is not None and balance >= tariff.fee:
+            builder.row(InlineKeyboardButton(text=label, callback_data=f"itempub:pick:{token}:{idx}"))
+    if not tariffs:
+        lines.append("Playerok пока не предложил тарифы для этого лота.")
+    if in_wizard:
+        builder.row(InlineKeyboardButton(text="Сохранить в черновиках", callback_data="itemprio:draft"))
+    builder.row(InlineKeyboardButton(text="Обновить тарифы и баланс", callback_data=f"item:publish:{item_id}"))
+    builder.row(InlineKeyboardButton(text="Назад", callback_data=back))
+    await edit(call, "\n".join(lines), builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("itempub:pick:"))
+async def item_publish_pick(call: CallbackQuery, state: FSMContext) -> None:
+    _, _, token, idx = call.data.split(":")
+    quote = (await state.get_data()).get("publication")
+    if not quote or quote["token"] != token or not idx.isdigit() or int(idx) >= len(quote["tariffs"]):
+        await call.answer("Условия устарели. Откройте экран публикации заново.", show_alert=True)
+        return
+    tariff = quote["tariffs"][int(idx)]
+    balance = quote["balance"]
+    if tariff.fee > 0 and (balance is None or balance < tariff.fee):
+        await call.answer("Недостаточно средств или баланс недоступен.", show_alert=True)
+        return
+    confirm_token = secrets.token_hex(6)
+    quote = {**quote, "selected": tariff, "confirm_token": confirm_token}
+    await state.update_data(publication=quote)
+    lines = [f"<b>Подтвердите публикацию</b>\n", f"Цена продажи: <b>{rubles(quote['prices'][0])}</b>"]
+    if tariff.fee:
+        lines += [
+            f"Тариф: <b>{html.escape(tariff.name)}</b>",
+            f"Будет списано: <b>{rubles(tariff.fee)}</b>",
+            f"Остаток после списания: <b>{rubles(balance - tariff.fee)}</b>",
+        ]
+    else:
+        lines.append("Стоимость размещения: <b>0 ₽</b>")
+    await call.answer()
+    await edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"Подтвердить и списать {rubles(tariff.fee)}" if tariff.fee else "Подтвердить бесплатное размещение",
+            callback_data=f"itempub:confirm:{confirm_token}",
+        )],
+        [InlineKeyboardButton(text="Назад к тарифам", callback_data=f"item:publish:{quote['item_id']}")],
+    ]))
+
+
+@router.callback_query(F.data.startswith("itempub:confirm:"))
+async def item_publish_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    quote = (await state.get_data()).get("publication")
+    token = call.data.rsplit(":", 1)[1]
+    if not quote or quote.get("confirm_token") != token or not quote["selected"]:
+        await call.answer("Условия устарели. Откройте экран публикации заново.", show_alert=True)
+        return
+    account = await require_account(call)
+    if not account:
+        return
+    if str(account.id) != quote["account_id"]:
+        await call.answer("Аккаунт изменился. Откройте товар заново.", show_alert=True)
+        return
+    await call.answer("Проверяю условия публикации…")
+    await state.update_data(publication=None)
+    item_id, tariff = quote["item_id"], quote["selected"]
     client = await svc().gateway.get_client(account)
     try:
-        item = await client.get_item(item_id)
-        price = getattr(item, "price", 0)
-        statuses = await client.get_item_priority_statuses(item_id, price)
-        if not statuses:
-            raise RuntimeError("Не удалось получить статусы приоритета для публикации")
+        item = await confirm_publication(client, item_id, quote["prices"], tariff, quote["balance"])
+    except PublicationChanged:
+        await _show_publication(call, state, account, item_id, quote["in_wizard"],
+                                "Условия изменились. Выберите тариф заново.")
+        return
+    except RequestPlayerokError as exc:
+        detail = html.escape(clip(exc.error_message, 350))
+        await edit(call, f"Playerok отклонил запрос.\n<code>{detail}</code>", back_menu(f"item:view:{item_id}"))
+        return
+    except Exception:
+        await edit(call, "Playerok не подтвердил результат. Проверьте статус товара и баланс.", back_menu(f"item:view:{item_id}"))
+        return
 
-        # Берем базовый/бесплатный приоритет
-        priority_id = str(statuses[0].id)
-        await client.publish_item(item_id, priority_status_id=priority_id)
-        await call.answer("✅ Товар успешно выставлен на продажу!", show_alert=True)
-        await render_item_card(call, account, client, item_id)
-    except Exception as exc:
-        await edit(
-            call,
-            f"❌ <b>Не удалось опубликовать товар:</b>\n<code>{html.escape(str(exc))[:1500]}</code>",
-            back_menu(f"item:view:{item_id}"),
-        )
+    await state.clear()
+    status = getattr(item, "status", None)
+    lines = [
+        f"<b>{html.escape(clip(getattr(item, 'name', None) or 'Товар', 100))}</b>",
+        f"Статус на Playerok: {item_status_badge(status)}",
+    ]
+    if tariff.fee:
+        balance = await publication_balance(client)
+        if balance is not None:
+            lines.append(f"Текущий баланс: <b>{rubles(balance)}</b>")
+    await edit(call, "\n".join(lines), back_menu(f"item:view:{item_id}"))
 
-
-# --- УДАЛЕНИЕ ТОВАРА ---
 
 @router.callback_query(F.data.startswith("item:delete:ask:"))
 async def item_delete_ask(call: CallbackQuery) -> None:

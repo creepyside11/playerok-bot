@@ -206,10 +206,8 @@ class Account:
         :return: Ответа запроса requests.
         :rtype: `requests.Response`
         """
-        try: 
-            x_gql_op = payload.get("operationName", "viewer")
-        except: 
-            x_gql_op = "viewer"
+        operation = json.loads(payload["operations"]) if files and payload and "operations" in payload else payload
+        x_gql_op = (operation or {}).get("operationName", "viewer")
         
         _headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -245,7 +243,8 @@ class Account:
         def make_req():
             err = ""
 
-            for _ in range(3):
+            attempts = 1 if x_gql_op in {"createItem", "publishItem"} else 3
+            for _ in range(attempts):
                 try:
                     if method == "get":
                         r = self.__curl_session.get(
@@ -1236,7 +1235,8 @@ class Account:
         description: str,
         options: list[GameCategoryOption] | dict,
         data_fields: list[GameCategoryDataField],
-        attachments: list[str | bytes]  # ← было: list[str]
+        attachments: list[str | bytes],
+        comment: str | None = None,
     ) -> types.Item:
         """
         Создаёт предмет (после создания помещается в черновик, а не сразу выставляется на продажу).
@@ -1267,6 +1267,8 @@ class Account:
 
         :param attachments: Массив файлов-приложений предмета. Пути к файлам или байты.
         :type attachments: `list[str | bytes]`
+
+        :param comment: Текст для раздела «Данные товара» в сделке.
 
         :return: Объект созданного предмета.
         :rtype: `playerokapi.types.Item`
@@ -1324,6 +1326,9 @@ class Account:
         map = {}
         files = {}
 
+        if comment is not None:
+            operations["variables"]["input"]["comment"] = comment
+
         for i, att in enumerate(attachments or [], start=1):
             filename, file_obj, content_type = self._resolve_image_file(att)
             map[str(i)] = [f"variables.attachments.{i-1}"]
@@ -1346,7 +1351,8 @@ class Account:
         options: list[GameCategoryOption] | None = None, 
         data_fields: list[GameCategoryDataField] | None = None, 
         remove_attachments: list[str] | None = None, 
-        add_attachments: list[str | bytes] | None = None  # ← было: list[str] | None
+        add_attachments: list[str | bytes] | None = None,
+        comment: str | None = None,
     ) -> types.Item:
         """
         Обновляет предмет аккаунта.
@@ -1377,6 +1383,8 @@ class Account:
         :param add_attachments: Массив файлов-приложений предмета, которые нужно добавить. Пути к файлам или байты.
         :type add_attachments: `list[str | bytes]` or `None`
 
+        :param comment: Текст для раздела «Данные товара» в сделке.
+
         :return: Объект обновлённого предмета.
         :rtype: `playerokapi.types.Item`
         """
@@ -1397,6 +1405,7 @@ class Account:
         if name is not None: operations["variables"]["input"]["name"] = name
         if price is not None: operations["variables"]["input"]["price"] = int(price)
         if description is not None: operations["variables"]["input"]["description"] = description
+        if comment is not None: operations["variables"]["input"]["comment"] = comment
         if options is not None: operations["variables"]["input"]["attributes"] = payload_attributes
         if data_fields is not None: operations["variables"]["input"]["dataFields"] = payload_data_fields
         if remove_attachments is not None: operations["variables"]["input"]["removedAttachments"] = remove_attachments
