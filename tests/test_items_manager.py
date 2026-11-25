@@ -1,8 +1,13 @@
 import json
-import pytest
+from threading import RLock
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.item_publication import confirm_publication, publication_tariffs
+from app.playerok import PlayerokSession
 from playerokapi.account import Account
+from playerokapi.enums import ItemStatuses
 from playerokapi.exceptions import RequestPlayerokError
 
 
@@ -332,3 +337,60 @@ def test_publish_business_rejection_is_not_retried(monkeypatch):
     with pytest.raises(RequestPlayerokError, match="только платно"):
         account.publish_item("lot", "regular")
     assert request.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_status, upload_operation", [("DRAFT", "createItem"), ("SOLD", "updateItem")])
+async def test_listing_with_photo_and_comment_can_be_published(initial_status, upload_operation):
+    account = object.__new__(Account)
+    account.base_url = "https://playerok.com"
+    account.requests_timeout = 10
+    account.user_agent = "TestAgent"
+    account.cookies = {}
+    account._Account__request_lock = RLock()
+    account._Account__tls_requests = MagicMock()
+    account._Account__curl_session = MagicMock()
+
+    photo = b"\x89PNG\r\n\x1a\nphoto"
+    comment = "Инструкция для покупателя"
+    listing = {
+        "__typename": "MyItem", "id": "lot", "name": "Лот", "price": 900, "rawPrice": 900,
+        "status": initial_status, "comment": comment, "mayBePublished": True,
+    }
+
+    def response(operation, result):
+        reply = MagicMock(status_code=200, text="")
+        reply.json.return_value = {"data": {operation: result}}
+        return reply
+
+    account._Account__tls_requests.post.return_value = response(upload_operation, listing)
+    account._Account__curl_session.get.side_effect = lambda **request: {
+        "item": response("item", listing),
+        "itemPriorityStatuses": response("itemPriorityStatuses", [
+            {"id": "regular", "name": "Обычный", "type": "DEFAULT", "price": 0},
+        ]),
+    }[request["params"]["operationName"]]
+    account._Account__curl_session.post.return_value = response(
+        "publishItem", {**listing, "status": "APPROVED"},
+    )
+
+    client = PlayerokSession(account)
+    if initial_status == "DRAFT":
+        updated = await client.create_item("cat", None, "Лот", 900, "Описание", attachments=[photo], comment=comment)
+    else:
+        updated = await client.update_item("lot", add_attachments=[photo])
+
+    assert updated.comment == comment
+    upload = account._Account__tls_requests.post.call_args.kwargs
+    assert json.loads(upload["data"]["operations"])["operationName"] == upload_operation
+    assert upload["headers"]["x-gql-op"] == upload_operation
+    assert "content-type" not in upload["headers"]
+    assert upload["files"]["1"] == ("image.png", photo, "image/png")
+    if initial_status == "DRAFT":
+        assert json.loads(upload["data"]["operations"])["variables"]["input"]["comment"] == comment
+
+    (tariff,) = await publication_tariffs(client, "lot", 900)
+    published = await confirm_publication(client, "lot", (900, 900), tariff, None)
+    assert published.status is ItemStatuses.APPROVED
+    assert published.comment == comment
+    account._Account__curl_session.post.assert_called_once()

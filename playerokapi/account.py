@@ -309,11 +309,12 @@ class Account:
         # for k, v in cookie_headers.items():
         #     self.cookies[k] = v
         
-        json = {}
-        try: json = resp.json()
-        except: pass
-        
-        if isinstance(json, dict) and json.get("errors"):
+        try:
+            response_body = resp.json()
+        except ValueError:
+            response_body = None
+
+        if isinstance(response_body, dict) and response_body.get("errors"):
             raise RequestPlayerokError(resp)
 
         if resp.status_code != 200 and not (resp.status_code == 304 and pass_304):
