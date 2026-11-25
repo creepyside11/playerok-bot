@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 # table_info, а PostgreSQL использует IF NOT EXISTS.
 MIGRATIONS: dict[str, dict[str, str]] = {
     "plugin_states": {"enabled_explicit": "BOOLEAN NOT NULL DEFAULT FALSE"},
+    "telegram_account_deals": {
+        "intro_sent": "BOOLEAN",
+        "intro_attempted_at": "TIMESTAMP WITH TIME ZONE",
+    },
     "telegram_users": {
         "web_login": "VARCHAR(64)",
         "web_password_hash": "VARCHAR(128)",

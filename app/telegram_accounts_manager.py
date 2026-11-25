@@ -82,6 +82,8 @@ class TelegramAccountDeal(Base):
     )
     phone: Mapped[str] = mapped_column(String(64), nullable=False)
     country: Mapped[str] = mapped_column(String(128), nullable=False)
+    intro_sent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    intro_attempted_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=True)
     code_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     code_sent: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deal_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

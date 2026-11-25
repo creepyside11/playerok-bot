@@ -251,7 +251,7 @@ class Account:
         def make_req():
             err = ""
 
-            attempts = 1 if x_gql_op in {"createItem", "updateItem", "publishItem"} else 3
+            attempts = 1 if x_gql_op in {"createItem", "updateItem", "publishItem", "createChatMessage"} else 3
             for _ in range(attempts):
                 try:
                     if method == "get":

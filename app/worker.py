@@ -157,7 +157,15 @@ class WorkerManager:
         chats_page = chats_res if not isinstance(chats_res, Exception) else None
         reviews_page = reviews_res if not isinstance(reviews_res, Exception) else None
 
-        deals = list(getattr(deals_out_page, "deals", []) or []) + list(getattr(deals_in_page, "deals", []) or [])
+        if isinstance(deals_out_res, Exception):
+            logger.warning("Playerok sales polling failed for %s (%s)", account.id, type(deals_out_res).__name__)
+        deals = []
+        for page, direction in ((deals_out_page, ItemDealDirections.OUT), (deals_in_page, ItemDealDirections.IN)):
+            for deal in getattr(page, "deals", None) or []:
+                if deal is not None:
+                    if getattr(deal, "direction", None) is None:
+                        deal.direction = direction
+                    deals.append(deal)
         chats = list(getattr(chats_page, "chats", []) or [])
         reviews = list(getattr(reviews_page, "reviews", []) or [])
 
@@ -281,10 +289,11 @@ class WorkerManager:
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)
 
-        # Вызываем плагины для всех активных оплаченных заказов
+        # Плагин может взять на себя выдачу и завершение конкретной сделки.
+        plugin_handles_delivery = False
         if self.plugins and (new_deal or status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}):
             try:
-                await self.plugins.dispatch_deal(account, client, self.bot, deal)
+                plugin_handles_delivery = await self.plugins.dispatch_deal(account, client, self.bot, deal)
             except Exception as p_exc:
                 logger.exception("Plugin dispatch_deal error: %s", p_exc)
         if self.plugins and new_status and not new_deal:
@@ -341,7 +350,8 @@ class WorkerManager:
                 reply_markup=deal_markup,
             )
 
-        if status not in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}:
+        if (plugin_handles_delivery or status not in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}
+                or getattr(deal, "direction", None) == ItemDealDirections.IN):
             return
 
         delivery = await self._delivery(account, client, deal, item_id)

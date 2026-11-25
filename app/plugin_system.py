@@ -376,8 +376,8 @@ class PluginManager:
     async def dispatch_message(self, account: PlayerokAccount, client: Any, bot: Any, chat: Any, message: Any) -> None:
         await self._dispatch("on_message", account, client, bot, chat, message)
 
-    async def dispatch_deal(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any) -> None:
-        await self._dispatch("on_deal", account, client, bot, deal)
+    async def dispatch_deal(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any) -> bool:
+        return await self._dispatch("on_deal", account, client, bot, deal)
 
     async def dispatch_deal_changed(self, account: PlayerokAccount, client: Any, bot: Any, deal: Any, previous_status: str | None) -> None:
         await self._dispatch("on_deal_changed", account, client, bot, deal, previous_status)
@@ -401,7 +401,8 @@ class PluginManager:
     async def dispatch_schedule(self, account: PlayerokAccount, client: Any, bot: Any) -> None:
         await self._dispatch("on_schedule", account, client, bot)
 
-    async def _dispatch(self, hook_name: str, account: PlayerokAccount, client: Any, bot: Any, *args: Any) -> None:
+    async def _dispatch(self, hook_name: str, account: PlayerokAccount, client: Any, bot: Any, *args: Any) -> bool:
+        handled = False
         for plugin in self.ordered():
             hook = getattr(plugin.module, hook_name, None)
             deal_fallback = False
@@ -435,8 +436,10 @@ class PluginManager:
             try:
                 call_args = (ctx, args[0]) if deal_fallback else (ctx, *args)
                 if inspect.iscoroutinefunction(hook):
-                    await hook(*call_args)
+                    result = await hook(*call_args)
                 else:
-                    await asyncio.to_thread(hook, *call_args)
+                    result = await asyncio.to_thread(hook, *call_args)
+                handled |= result is True
             except Exception:
                 logger.exception("Plugin %s failed", plugin.id)
+        return handled
