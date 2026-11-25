@@ -1,14 +1,18 @@
 from datetime import timedelta
+import json
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select, update
 
 from app.db import init_db, make_engine, make_session_factory
+from app import telegram_accounts_ui
 from app.models import PlayerokAccount, TelegramUser
+from app.playerok import PlayerokSession
 from app.plugin_system import PluginManager, PluginSpec
 from app.telegram_accounts_manager import (
+    bind_keyword,
     extract_5digit_code,
     format_delivery_message,
     format_code_message,
@@ -19,7 +23,9 @@ from app.telegram_accounts_manager import (
     TelegramAccountDeal,
 )
 from app.worker import WorkerManager
+from playerokapi.account import Account
 from playerokapi.enums import ItemDealDirections, ItemDealStatuses
+from playerokapi.exceptions import RequestPlayerokError
 from playerokapi.parser import chat_list, item_deal, item_deal_list
 from plugins import telegram_accounts
 
@@ -220,5 +226,89 @@ async def test_first_poll_processes_payment_from_actual_chat_shape(tmp_path, sou
             assert bool(record) is expected
             if record:
                 assert record.intro_sent is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bind_mode", ["id", "keyword", "both"])
+async def test_repeated_listing_uses_new_deal_id_with_same_bound_lot(tmp_path, monkeypatch, bind_mode):
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/relisted.db")
+    await init_db(engine)
+    db = make_session_factory(engine)
+    try:
+        async with db() as session:
+            session.add(TelegramUser(id=10))
+            await session.flush()
+            seller = PlayerokAccount(
+                tg_user_id=10, playerok_user_id="seller", username="seller", cookies_encrypted="fixture",
+                user_agent="test", worker_initialized=True,
+            )
+            session.add(seller)
+            await session.flush()
+            if bind_mode != "keyword":
+                session.add(TelegramAccountLotRule(account_id=seller.id, lot_id="same-lot", lot_title="Лот", country="США"))
+            session.add_all([
+                TelegramAccountStock(account_id=seller.id, country="🇺🇸 США", phone=phone, session_encrypted="fixture")
+                for phone in ("first-number", "second-number")
+            ])
+            await session.commit()
+        if bind_mode != "id":
+            await bind_keyword(db, seller, "telegram", "Казахстан")
+            await bind_keyword(db, seller, "Telegram   US", "США" if bind_mode == "keyword" else "Германия")
+
+        account = object.__new__(Account)
+        account._is_initiated, account.id, account.base_url = True, "seller", "https://playerok.com"
+        cycle = 0
+
+        def transport(method, url, headers, payload):
+            assert payload["operationName"] == "deals"
+            variables = json.loads(payload["variables"]) if method == "get" else payload["variables"]
+            result = MagicMock(status_code=200, text="")
+            statuses = variables["filter"].get("status")
+            if not statuses:
+                result.json.return_value = {"data": {"deals": {"edges": []}}}
+                return result
+            assert statuses == ["PAID", "PENDING"]
+            if method == "get":
+                result.json.return_value = {"errors": [{"message": "PersistedQueryNotFound"}]}
+                raise RequestPlayerokError(result)
+            active = {"edges": [{"node": raw_sale(cycle)}]} if variables["pagination"]["after"] else {
+                "edges": [], "pageInfo": {"hasNextPage": True, "endCursor": "second-page"},
+            }
+            result.json.return_value = {"data": {"deals": active}}
+            return result
+
+        def raw_sale(number):
+            return {"id": f"order-{number}", "status": "PAID", "direction": "OUT",
+                    "chat": {"id": "same-buyer-chat"}, "item": {"id": "same-lot", "name": "Лот TELEGRAM US"}}
+
+        account.request = MagicMock(side_effect=transport)
+        session_client = PlayerokSession(account)
+        client = NS(
+            get_deals=session_client.get_deals, get_deal=AsyncMock(), get_chats=AsyncMock(return_value=None),
+            get_my_reviews=AsyncMock(return_value=None), send_message=AsyncMock(return_value=NS(id="sent")),
+        )
+        manager = PluginManager(db)
+        manager.plugins["telegram_accounts"] = PluginSpec(
+            "telegram_accounts", "Telegram Accounts", "1", "", "",
+            telegram_accounts.PLUGIN_META["settings"], telegram_accounts,
+        )
+        worker = WorkerManager(
+            NS(send_message=AsyncMock()), db, NS(get_client=AsyncMock(return_value=client)), None, 15, manager,
+        )
+        for cycle in (1, 2, 2):
+            await worker._poll(seller)
+
+        assert [c.args[1] for c in client.send_message.await_args_list] == [
+            format_delivery_message("🇺🇸 США", phone) for phone in ("first-number", "second-number")
+        ]
+        client.get_deal.assert_not_awaited()
+        monkeypatch.setattr(telegram_accounts_ui, "plugins", lambda: manager)
+        monkeypatch.setattr(telegram_accounts_ui, "svc", lambda: NS(db=db))
+        report = await telegram_accounts_ui.describe_deal_delivery(seller, item_deal(raw_sale(2)))
+        assert "same-lot" in report and "Привязка — активна" in report and "подтверждена Playerok" in report
+        assert ("фраза «Telegram US»" in report) is (bind_mode == "keyword")
+        assert "second-number" not in report
     finally:
         await engine.dispose()

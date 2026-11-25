@@ -12,19 +12,26 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import delete, func, select
+from playerokapi.enums import ItemDealDirections, ItemDealStatuses
 
+from .advanced_handlers import plugins
 from .handlers import active_account, clip, edit, require_account, svc
 from .keyboards import back_menu
 from .models import PlayerokAccount
+from .playerok_errors import playerok_error_text
 from .states import TelegramAccountsState
 from .telegram_accounts_manager import (
     COUNTRY_PRESETS,
-    DEFAULT_TG_API_HASH,
-    DEFAULT_TG_API_ID,
+    default_telegram_api_hash,
+    default_telegram_api_id,
     TelegramAccountDeal,
     TelegramAccountLotRule,
     TelegramAccountStock,
     TelegramAccountsConfig,
+    available_stock_query,
+    bind_keyword,
+    bound_lot_rule,
+    valid_keyword,
 )
 
 logger = logging.getLogger("telegram_accounts_ui")
@@ -91,7 +98,9 @@ async def tgacc_main_menu(call: CallbackQuery, state: FSMContext) -> None:
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Менеджер аккаунтов (Склад)", callback_data="tgacc:manager")],
         [InlineKeyboardButton(text="➕ Привязать лот к стране", callback_data="tgacc:lots")],
+        [InlineKeyboardButton(text="🔤 Привязать по слову в названии", callback_data="tgacc:keyword")],
         [InlineKeyboardButton(text=f"📋 Привязанные лоты ({total_rules})", callback_data="tgacc:rules")],
+        [InlineKeyboardButton(text="🔍 Проверить автовыдачу сделки", callback_data="tgacc:diagnose")],
         [InlineKeyboardButton(text="⚙️ Настройки API (Telethon)", callback_data="tgacc:settings")],
         [InlineKeyboardButton(text="⬅️ Меню плагинов", callback_data="plugins:mine")],
     ])
@@ -109,6 +118,96 @@ async def tgacc_main_menu(call: CallbackQuery, state: FSMContext) -> None:
     )
     await call.answer()
     await edit(call, text, markup)
+
+
+@router.callback_query(F.data == "tgacc:diagnose")
+async def tgacc_diagnose_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    await state.set_state(TelegramAccountsState.diagnose_deal)
+    await state.update_data(diagnostic_account_id=str(account.id))
+    await call.answer()
+    await edit(call, "Пришлите ID сделки или ссылку на неё: playerok.com/deal/…", back_menu("tgacc:open"))
+
+
+@router.message(TelegramAccountsState.diagnose_deal, F.text, ~F.text.startswith("/"))
+async def tgacc_diagnose_result(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    account = await active_account(message.from_user.id)
+    if not account or data.get("diagnostic_account_id") != str(account.id):
+        await state.clear()
+        await message.answer("Откройте проверку для выбранного аккаунта.", reply_markup=back_menu("tgacc:open"))
+        return
+    match = re.fullmatch(
+        r"(?:(?:https://)?(?:www\.)?playerok\.com/deal/)?"
+        r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?:[/?#].*)?",
+        message.text.strip(),
+    )
+    if not match:
+        await message.answer("Введите ID сделки или ссылку из Playerok.")
+        return
+    deal_id = match[1].lower()
+    try:
+        client = await svc().gateway.get_client(account)
+        deal = await client.get_deal(deal_id)
+    except Exception as exc:
+        await message.answer(html.escape(playerok_error_text(exc)), parse_mode="HTML", reply_markup=back_menu("tgacc:open"))
+        return
+    item = getattr(deal, "item", None)
+    seller_id = getattr(getattr(item, "user", None), "id", None)
+    if (str(getattr(deal, "id", "")) != deal_id or getattr(deal, "direction", None) != ItemDealDirections.OUT
+            or seller_id and str(seller_id) != account.playerok_user_id):
+        await message.answer("Playerok не подтвердил, что это продажа выбранного аккаунта.", reply_markup=back_menu("tgacc:open"))
+        return
+    report = await describe_deal_delivery(account, deal)
+    await state.clear()
+    await message.answer(report, parse_mode="HTML", reply_markup=back_menu("tgacc:open"))
+
+
+async def describe_deal_delivery(account: PlayerokAccount, deal: Any) -> str:
+    manager = plugins()
+    spec = manager.plugins.get("telegram_accounts")
+    enabled = bool(spec and (await manager.resolved_state(account.id, spec))[0])
+    lot_id = str(getattr(getattr(deal, "item", None), "id", "") or "")
+    chat = bool(getattr(getattr(deal, "chat", None), "id", None))
+    status = getattr(deal, "status", None)
+    async with svc().db() as session:
+        rule = await bound_lot_rule(session, account.id, lot_id, getattr(getattr(deal, "item", None), "name", None) or "")
+        delivery = await session.scalar(select(TelegramAccountDeal).where(
+            TelegramAccountDeal.account_id == account.id, TelegramAccountDeal.deal_id == str(deal.id),
+        ))
+        stock = None
+        if rule:
+            available = await available_stock_query(session, account.id, rule.country)
+            stock = await session.scalar(select(func.count()).select_from(available.subquery()))
+
+    plugin_text = "Включён" if enabled else "Выключен" if spec else "Не загружен"
+    lines = [
+        f"<b>Сделка</b> <code>{html.escape(str(deal.id))}</code>",
+        f"Статус Playerok — <code>{html.escape(getattr(status, 'name', None) or 'неизвестен')}</code>",
+        f"ID лота из Playerok — <code>{html.escape(lot_id or 'не получен')}</code>",
+        f"Чат сделки — {'есть' if chat else 'Playerok не вернул'}",
+        f"Плагин — {plugin_text}",
+    ]
+    if rule:
+        rule_text = "активна" if rule.enabled else "выключена"
+        match = f"фраза «{html.escape(rule.keyword)}»" if rule.keyword else "ID лота"
+        lines.append(f"Привязка — {rule_text}, {match}, {html.escape(rule.country)}. На складе — {stock}.")
+    else:
+        lines.append("Привязка — совпадений по ID и названию нет.")
+    if delivery and delivery.intro_sent:
+        lines.append("Отправка инструкции — подтверждена Playerok.")
+    elif delivery:
+        lines.append("Профиль зарезервирован. Отправка инструкции ещё не подтверждена.")
+        if delivery.intro_error:
+            lines.append(f"Последний сбой — <code>{html.escape(delivery.intro_error)}</code>")
+    elif status in {ItemDealStatuses.PAID, ItemDealStatuses.PENDING} and enabled and rule and rule.enabled and chat and stock:
+        lines.append("Условия выдачи выполнены. В базе пока нет записи о запуске выдачи по этой сделке.")
+    else:
+        lines.append("В базе нет записи о выдаче по этой сделке.")
+    return "\n".join(lines)
 
 
 # --- Менеджер аккаунтов / Склад ---
@@ -251,8 +350,11 @@ async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
     country = data.get("chosen_country", "Другая")
 
     cfg = await get_or_create_config(account.id)
-    api_id = cfg.api_id or DEFAULT_TG_API_ID
-    api_hash = cfg.api_hash or DEFAULT_TG_API_HASH
+    api_id = cfg.api_id or default_telegram_api_id()
+    api_hash = cfg.api_hash or default_telegram_api_hash()
+    if not api_hash:
+        await message.answer("Сначала задайте API ID и API Hash.", reply_markup=back_menu("tgacc:settings"))
+        return
 
     status_msg = await message.answer("⏳ Подключаюсь к Telegram и отправляю код запроса…")
 
@@ -495,11 +597,15 @@ async def tgacc_raw_session_entered(message: Message, state: FSMContext) -> None
 
     # Проверяем валидность сессии
     cfg = await get_or_create_config(account.id)
+    api_hash = cfg.api_hash or default_telegram_api_hash()
+    if not api_hash:
+        await message.answer("Сначала задайте API ID и API Hash.", reply_markup=back_menu("tgacc:settings"))
+        return
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
-        client = TelegramClient(StringSession(session_str), cfg.api_id, cfg.api_hash)
+        client = TelegramClient(StringSession(session_str), cfg.api_id, api_hash)
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -684,7 +790,7 @@ async def tgacc_lot_country_choose(call: CallbackQuery, state: FSMContext) -> No
     lot_id = call.data.split(":", 2)[2]
 
     # Сохраняем выбранный лот в FSM состояние для избежания переполнения callback_data (лимит 64 байта в Telegram)
-    await state.update_data(bind_lot_id=lot_id)
+    await state.update_data(bind_lot_id=lot_id, bind_account_id=str(account.id), bind_keyword=None)
 
     # Получаем название лота
     try:
@@ -696,20 +802,45 @@ async def tgacc_lot_country_choose(call: CallbackQuery, state: FSMContext) -> No
 
     await state.update_data(bind_lot_title=lot_title)
 
-    b = InlineKeyboardBuilder()
-    for idx, (name, _) in enumerate(COUNTRY_PRESETS):
-        b.button(text=name, callback_data=f"tgacc:bind:{idx}")
-    b.button(text="🌐 Другая страна", callback_data="tgacc:bind:custom")
-    b.button(text="❌ Отмена", callback_data="tgacc:lots")
-    b.adjust(2, 2, 2, 2, 1, 1)
-
     await call.answer()
     await edit(
         call,
         f"📦 Лот: <b>{html.escape(lot_title)}</b>\n\n"
         "🌍 <b>Выберите страну, профиль которой нужно выдавать при покупке этого лота:</b>",
-        b.as_markup(),
+        bind_country_buttons(),
     )
+
+
+def bind_country_buttons() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for idx, (name, _) in enumerate(COUNTRY_PRESETS):
+        builder.button(text=name, callback_data=f"tgacc:bind:{idx}")
+    builder.button(text="🌐 Другая страна", callback_data="tgacc:bind:custom")
+    builder.button(text="❌ Отмена", callback_data="tgacc:open")
+    builder.adjust(2, 2, 2, 2, 1, 1, 1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == "tgacc:keyword")
+async def tgacc_keyword_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    await state.clear()
+    await state.set_state(TelegramAccountsState.rule_keyword)
+    await state.update_data(bind_account_id=str(account.id))
+    await call.answer()
+    await edit(call, "Введите слово или фразу, которая должна встречаться в названии лота.", back_menu("tgacc:open"))
+
+
+@router.message(TelegramAccountsState.rule_keyword, F.text, ~F.text.startswith("/"))
+async def tgacc_keyword_received(message: Message, state: FSMContext) -> None:
+    if not valid_keyword(message.text):
+        await message.answer("Введите слово или фразу длиной до 128 символов.")
+        return
+    await state.set_state(None)
+    await state.update_data(bind_keyword=message.text.strip())
+    await message.answer("Выберите страну для этой привязки.", reply_markup=bind_country_buttons())
 
 
 @router.callback_query(F.data.startswith("tgacc:bind:"))
@@ -722,10 +853,10 @@ async def tgacc_bind_lot_country(call: CallbackQuery, state: FSMContext) -> None
 
     data = await state.get_data()
     lot_id = data.get("bind_lot_id")
+    keyword = data.get("bind_keyword")
 
-    if not lot_id:
-        await call.answer("Сессия выбора лота устарела, выберите лот снова.", show_alert=True)
-        await tgacc_lots_select(call)
+    if (not lot_id and not keyword) or data.get("bind_account_id") != str(account.id):
+        await call.answer("Откройте привязку заново для выбранного аккаунта.", show_alert=True)
         return
 
     if choice == "custom":
@@ -742,7 +873,13 @@ async def tgacc_bind_lot_country(call: CallbackQuery, state: FSMContext) -> None
         idx = int(choice)
         country = COUNTRY_PRESETS[idx][0]
     except (ValueError, IndexError):
-        country = choice
+        await call.answer("Выберите страну из списка.", show_alert=True)
+        return
+    if keyword:
+        await bind_keyword(svc().db, account, keyword, country)
+        await state.clear()
+        await tgacc_rules_list(call)
+        return
 
     lot_title = data.get("bind_lot_title")
     if not lot_title:
@@ -796,10 +933,19 @@ async def tgacc_rule_custom_country(message: Message, state: FSMContext) -> None
         return
     data = await state.get_data()
     lot_id = data.get("bind_lot_id")
+    keyword = data.get("bind_keyword")
     country = (message.text or "").strip()
-    if not lot_id or not country:
+    if (not lot_id and not keyword) or data.get("bind_account_id") != str(account.id):
         await message.answer("Некорректный ввод.")
         await state.clear()
+        return
+    if not 1 <= len(country) <= 128:
+        await message.answer("Введите название страны длиной до 128 символов.")
+        return
+    if keyword:
+        await bind_keyword(svc().db, account, keyword, country)
+        await state.clear()
+        await message.answer("Привязка по фразе сохранена.", reply_markup=back_menu("tgacc:rules"))
         return
 
     try:
@@ -871,7 +1017,8 @@ async def tgacc_rules_list(call: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     for r in rules:
         status_icon = "🟢" if r.enabled else "⏸"
-        b.button(text=f"{status_icon} {clip(r.lot_title, 20)} ➔ {r.country}", callback_data=f"tgacc:rule:view:{r.id}")
+        label = f"Фраза «{r.keyword}»" if r.keyword else r.lot_title
+        b.button(text=f"{status_icon} {clip(label, 25)} ➔ {r.country}", callback_data=f"tgacc:rule:view:{r.id}")
         b.button(text="🗑", callback_data=f"tgacc:rule:del:{r.id}")
     b.adjust(2)
     b.row(
@@ -921,8 +1068,9 @@ async def tgacc_rule_view(call: CallbackQuery, rule_id: int | None = None) -> No
     await call.answer()
     await edit(
         call,
-        f"📦 <b>Лот:</b> {html.escape(r.lot_title)}\n"
-        f"🆔 ID лота: <code>{html.escape(r.lot_id)}</code>\n"
+        (f"🔤 <b>Фраза:</b> {html.escape(r.keyword)}\n" if r.keyword else
+         f"📦 <b>Лот:</b> {html.escape(r.lot_title)}\n🆔 ID лота: <code>{html.escape(r.lot_id)}</code>\n")
+        +
         f"🌍 Страна выдачи: <b>{html.escape(r.country)}</b>\n"
         f"Статус: <b>{'🟢 Активен' if r.enabled else '⏸ Выключен'}</b>",
         markup,
@@ -965,8 +1113,8 @@ async def tgacc_settings_view(call: CallbackQuery) -> None:
         call,
         "⚙️ <b>Настройки Telethon MTProto</b>\n\n"
         f"API ID: <code>{cfg.api_id}</code>\n"
-        f"API Hash: <code>{cfg.api_hash[:6]}...{cfg.api_hash[-4:] if len(cfg.api_hash) > 10 else cfg.api_hash}</code>\n\n"
-        "<i>По умолчанию используются публичные данные Telegram Desktop / Android, позволяющие авторизовывать номера без создания своего приложения на my.telegram.org.</i>",
+        f"API Hash: {'задан' if cfg.api_hash or default_telegram_api_hash() else 'не задан'}\n\n"
+        "<i>Данные Telegram API можно указать здесь или в окружении сервера.</i>",
         markup,
     )
 
@@ -979,8 +1127,8 @@ async def tgacc_settings_reset(call: CallbackQuery) -> None:
     async with svc().db() as session:
         cfg = await session.scalar(select(TelegramAccountsConfig).where(TelegramAccountsConfig.account_id == account.id))
         if cfg:
-            cfg.api_id = DEFAULT_TG_API_ID
-            cfg.api_hash = DEFAULT_TG_API_HASH
+            cfg.api_id = default_telegram_api_id()
+            cfg.api_hash = default_telegram_api_hash()
             await session.commit()
     await call.answer("Сброшено к стандартным значениям")
     await tgacc_settings_view(call)
@@ -1034,8 +1182,8 @@ async def tgacc_api_hash_entered(message: Message, state: FSMContext) -> None:
     if not account:
         return
     text = (message.text or "").strip()
-    if len(text) < 16:
-        await message.answer("Слишком короткий API Hash. Введите корректный хеш:")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", text):
+        await message.answer("API Hash должен содержать 32 шестнадцатеричных символа.")
         return
 
     async with svc().db() as session:

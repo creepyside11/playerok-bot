@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import html
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
@@ -10,12 +11,13 @@ from sqlalchemy.exc import IntegrityError
 
 from app.handlers import svc
 from app.telegram_accounts_manager import (
-    DEFAULT_TG_API_HASH,
-    DEFAULT_TG_API_ID,
+    default_telegram_api_hash,
+    default_telegram_api_id,
     TelegramAccountDeal,
-    TelegramAccountLotRule,
     TelegramAccountStock,
     TelegramAccountsConfig,
+    available_stock_query,
+    bound_lot_rule,
     fetch_latest_code_from_telethon,
     format_code_message,
     format_code_repeat_message,
@@ -32,7 +34,7 @@ INTRO_RETRY_DELAY = timedelta(minutes=1)
 PLUGIN_META = {
     "id": "telegram_accounts",
     "name": "Telegram Accounts",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "Playerok Bot",
     "description": (
         "Автовыдача Telegram-профилей по странам с получением кода через Telethon. "
@@ -40,8 +42,8 @@ PLUGIN_META = {
         "передает покупателю и автоматически переводит сделку в статус «Выполнен»."
     ),
     "settings": {
-        "default_api_id": {"label": "Telegram API ID", "type": "str", "default": "2040"},
-        "default_api_hash": {"label": "Telegram API Hash", "type": "str", "default": "b1844dd2b70111dd37c342977a944a31"},
+        "default_api_id": {"label": "Telegram API ID", "type": "str", "default": str(default_telegram_api_id())},
+        "default_api_hash": {"label": "Telegram API Hash", "type": "str", "default": ""},
     },
 }
 
@@ -53,9 +55,10 @@ async def on_deal(ctx: Any, deal: Any) -> bool:
     deal_id = str(getattr(deal, "id", "") or "")
     if not deal_id:
         return False
-    item_id = str(getattr(getattr(deal, "item", None), "id", "") or "")
+    item = getattr(deal, "item", None)
+    item_id = str(getattr(item, "id", "") or "")
     chat_id = str(getattr(getattr(deal, "chat", None), "id", "") or "")
-    if not chat_id or not item_id:
+    if not chat_id or not item_id or not getattr(item, "name", None):
         try:
             full_deal = await ctx.get_deal(deal_id)
         except Exception as exc:
@@ -66,17 +69,18 @@ async def on_deal(ctx: Any, deal: Any) -> bool:
             if (current_status is not None and current_status not in PAID_STATUSES
                     or getattr(full_deal, "direction", None) == ItemDealDirections.IN):
                 return False
-            item_id = item_id or str(getattr(getattr(full_deal, "item", None), "id", "") or "")
+            item = getattr(full_deal, "item", None) or item
+            item_id = str(getattr(item, "id", "") or "")
             chat_id = chat_id or str(getattr(getattr(full_deal, "chat", None), "id", "") or "")
 
     account = ctx.account
+    seller_id = getattr(getattr(item, "user", None), "id", None)
+    if seller_id and str(seller_id) != account.playerok_user_id:
+        logger.warning("Telegram sale %s seller does not match the configured account", deal_id)
+        return False
     async with ctx.db() as session:
-        rule = await session.scalar(select(TelegramAccountLotRule).where(
-            TelegramAccountLotRule.account_id == account.id,
-            TelegramAccountLotRule.lot_id == item_id,
-            TelegramAccountLotRule.enabled.is_(True),
-        ))
-        if not rule:
+        rule = await bound_lot_rule(session, account.id, item_id, getattr(item, "name", None) or "")
+        if rule is None or not rule.enabled:
             return False
         if not chat_id:
             logger.warning("Telegram sale %s has no buyer chat yet", deal_id)
@@ -87,11 +91,8 @@ async def on_deal(ctx: Any, deal: Any) -> bool:
         )
         record = await session.scalar(assigned)
         if record is None:
-            stock = await session.scalar(select(TelegramAccountStock).where(
-                TelegramAccountStock.account_id == account.id,
-                TelegramAccountStock.country == rule.country,
-                TelegramAccountStock.status == "available",
-            ).order_by(TelegramAccountStock.id).limit(1))
+            available = await available_stock_query(session, account.id, rule.country)
+            stock = await session.scalar(available.order_by(TelegramAccountStock.id).limit(1))
             if stock:
                 reserved = await session.execute(update(TelegramAccountStock).where(
                     TelegramAccountStock.id == stock.id, TelegramAccountStock.status == "available",
@@ -152,19 +153,30 @@ async def send_initial_message(ctx: Any, record: TelegramAccountDeal) -> None:
         return
 
     text = format_delivery_message(record.country, record.phone)
+    stage = "история чата"
     try:
         previous_attempt = record.intro_sent is None or record.intro_attempted_at is not None
         already_sent = previous_attempt and await initial_message_in_history(ctx, record, text)
         if not already_sent:
+            stage = "отправка"
             message = await ctx.client.send_message(record.chat_id, text, mark_chat_as_read=False)
             if not getattr(message, "id", None):
                 raise RuntimeError("Playerok did not confirm the initial message")
     except Exception as exc:
-        logger.warning("Telegram sale %s initial message unconfirmed (%s)", record.deal_id, type(exc).__name__)
+        code = str(getattr(exc, "error_code", None) or "")
+        detail = code if re.fullmatch(r"[A-Z0-9_]{1,60}", code) else type(exc).__name__
+        async with ctx.db() as session:
+            await session.execute(update(TelegramAccountDeal).where(
+                TelegramAccountDeal.id == record.id, TelegramAccountDeal.intro_sent.is_not(True),
+            ).values(intro_error=f"{stage} · {detail}"))
+            await session.commit()
+        logger.warning("Telegram sale %s initial message unconfirmed (%s)", record.deal_id, detail)
         return
 
     async with ctx.db() as session:
-        await session.execute(update(TelegramAccountDeal).where(TelegramAccountDeal.id == record.id).values(intro_sent=True))
+        await session.execute(update(TelegramAccountDeal).where(
+            TelegramAccountDeal.id == record.id,
+        ).values(intro_sent=True, intro_error=None))
         await session.commit()
     if not already_sent:
         await notify_seller(
@@ -196,16 +208,16 @@ async def initial_message_in_history(ctx: Any, record: TelegramAccountDeal, text
         for message in page.messages or []:
             if message is None:
                 continue
-            if getattr(message, "text", None) == text and str(getattr(
-                getattr(message, "user", None), "id", "",
-            )) == str(ctx.account.playerok_user_id) and not getattr(message, "deleted_at", None):
-                return True
             if timestamp := getattr(message, "created_at", None):
                 try:
                     if datetime.fromisoformat(timestamp) < older_than:
                         return False
                 except (TypeError, ValueError):
                     pass
+            if getattr(message, "text", None) == text and str(getattr(
+                getattr(message, "user", None), "id", "",
+            )) == str(ctx.account.playerok_user_id) and not getattr(message, "deleted_at", None):
+                return True
         if not getattr(page.page_info, "has_next_page", False):
             return False
         next_cursor = getattr(page.page_info, "end_cursor", None)
@@ -249,8 +261,12 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
         cfg = await session.scalar(
             select(TelegramAccountsConfig).where(TelegramAccountsConfig.account_id == account.id)
         )
-        api_id = cfg.api_id if cfg else int(ctx.config.get("default_api_id") or DEFAULT_TG_API_ID)
-        api_hash = cfg.api_hash if cfg else str(ctx.config.get("default_api_hash") or DEFAULT_TG_API_HASH)
+        api_id = cfg.api_id if cfg and cfg.api_hash else int(ctx.config.get("default_api_id") or default_telegram_api_id())
+        api_hash = (cfg.api_hash if cfg else "") or str(ctx.config.get("default_api_hash") or default_telegram_api_hash())
+
+    if not api_hash:
+        await ctx.send_chat(chat_id, "Настройки Telegram API не заполнены. Свяжитесь с продавцом.")
+        return
 
     # Дешифруем строку сессии Telethon
     cipher = svc().cipher

@@ -808,9 +808,16 @@ function renderTelegramPlugin() {
       ${telegramLotsCursor ? button("Загрузить ещё лоты", "telegramMoreLots") : ""}
       <label class="field">Страна<input name="country" list="tg-countries" maxlength="128" required></label>
       <p class="form-error" role="alert" hidden></p><button class="button primary" type="submit">Привязать лот</button></form>
-      <div class="seller-subsection"><h3>Привязанные лоты</h3>
+      <div class="seller-subsection"><h3>По названию</h3>
+        <form id="telegram-keyword-form">
+          <label class="field">Слово или фраза<input name="keyword" maxlength="128" required></label>
+          <label class="field">Страна<input name="country" list="tg-countries" maxlength="128" required></label>
+          <p class="form-error" role="alert" hidden></p><button class="button primary" type="submit">Привязать по названию</button>
+        </form>
+      </div>
+      <div class="seller-subsection"><h3>Сохранённые привязки</h3>
       ${rules.length ? rules.map((rule) => `<form class="panel telegram-rule" data-rule="${rule.id}">
-        <div class="preference"><span>${safe(rule.title)}</span>${toggle("Активность привязки", rule.enabled, "telegramRuleSwitch", rule.id)}</div>
+        <div class="preference"><span>${rule.keyword ? "Фраза «" + safe(rule.keyword) + "»" : safe(rule.title)}</span>${toggle("Активность привязки", rule.enabled, "telegramRuleSwitch", rule.id)}</div>
         <label class="field">Страна<input name="country" list="tg-countries" maxlength="128" value="${safe(rule.country)}" required></label>
         <div class="detail-buttons"><button class="button" type="submit">Сохранить страну</button>${button("Удалить", "telegramDeleteRule", { value: rule.id, variant: "flat" })}</div>
         <p class="form-error" role="alert" hidden></p></form>`).join("")
@@ -921,7 +928,7 @@ document.addEventListener("click", (event) => {
     telegramRule(value, "PATCH", { enabled: target.getAttribute("aria-checked") !== "true" })
       .catch((error) => notify(error.message, true)).finally(() => { target.disabled = false; });
   }
-  if (action === "telegramDeleteRule") askConfirmation("Удалить привязку этого лота?", () => telegramRule(value, "DELETE"));
+  if (action === "telegramDeleteRule") askConfirmation("Удалить эту привязку?", () => telegramRule(value, "DELETE"));
   if (action === "selectDrawer") switchDrawer();
   if (action === "selectAccount") chooseAccount(value, target);
   if (action === "page") readPage(target);
@@ -989,6 +996,9 @@ document.addEventListener("submit", async (event) => {
     }
     if (form.id === "telegram-bind-form") {
       await telegramRule(null, "POST", { lotId: form.elements.lotId.value, country: form.elements.country.value.trim() });
+    }
+    if (form.id === "telegram-keyword-form") {
+      await telegramRule(null, "POST", { keyword: form.elements.keyword.value.trim(), country: form.elements.country.value.trim() });
     }
     if (form.matches(".telegram-rule")) {
       await telegramRule(form.dataset.rule, "PATCH", { country: form.elements.country.value.trim() });

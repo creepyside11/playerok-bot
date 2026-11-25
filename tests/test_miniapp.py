@@ -226,5 +226,13 @@ async def test_balance_listing_edits_and_telegram_settings_are_scoped(tmp_path):
             assert (await result.json())["rules"][0]["country"] == "🇩🇪 Германия"
             removed = await client.delete(rule_path, headers=headers)
             assert removed.status == 200
+            key_rule = await client.post(f"{group}/rules", headers=headers, json={"keyword": "Telegram US", "country": "США"})
+            assert key_rule.status == 201
+            keyword_rule = await key_rule.json()
+            assert keyword_rule["keyword"] == "Telegram US" and keyword_rule["lotId"] is None
+            same_rule = await client.post(f"{group}/rules", headers=headers, json={"keyword": " telegram   us ", "country": "США"})
+            assert (await same_rule.json())["id"] == keyword_rule["id"]
+            invalid = await client.post(f"{group}/rules", headers=headers, json={"keyword": "  ", "country": "США"})
+            assert invalid.status == 400
     finally:
         await engine.dispose()

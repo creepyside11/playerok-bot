@@ -146,9 +146,9 @@ class WorkerManager:
 
     async def _poll(self, account: PlayerokAccount) -> None:
         client = await self.gateway.get_client(account)
-        # Fetch deals (outgoing sales and incoming purchases) + chats + reviews
-        deals_out_res, deals_in_res, chats_res, reviews_res = await asyncio.gather(
+        deals_out_res, active_sales_res, deals_in_res, chats_res, reviews_res = await asyncio.gather(
             client.get_deals(direction=ItemDealDirections.OUT, count=24),
+            self._active_sales(client),
             client.get_deals(direction=ItemDealDirections.IN, count=24),
             client.get_chats(count=24),
             client.get_my_reviews(count=24),
@@ -159,14 +159,20 @@ class WorkerManager:
         chats_page = chats_res if not isinstance(chats_res, Exception) else None
         reviews_page = reviews_res if not isinstance(reviews_res, Exception) else None
 
-        if isinstance(deals_out_res, Exception):
-            logger.warning(
-                "Playerok sales polling failed for %s (%s, %s)", account.id,
-                type(deals_out_res).__name__, getattr(deals_out_res, "error_code", None),
-            )
+        for result in (deals_out_res, active_sales_res):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Playerok sales polling failed for %s (%s, %s)", account.id,
+                    type(result).__name__, getattr(result, "error_code", None),
+                )
         deals: dict[str, Any] = {}
-        for page, direction in ((deals_out_page, ItemDealDirections.OUT), (deals_in_page, ItemDealDirections.IN)):
-            for deal in getattr(page, "deals", None) or []:
+        pages = (
+            (getattr(deals_out_page, "deals", None), ItemDealDirections.OUT),
+            (active_sales_res if isinstance(active_sales_res, list) else None, ItemDealDirections.OUT),
+            (getattr(deals_in_page, "deals", None), ItemDealDirections.IN),
+        )
+        for entries, direction in pages:
+            for deal in entries or []:
                 if deal_id := getattr(deal, "id", None):
                     if getattr(deal, "direction", None) is None:
                         deal.direction = direction
@@ -198,17 +204,42 @@ class WorkerManager:
                 if row:
                     row.worker_initialized = True
                     await session.commit()
-            for deal in reversed(deals.values()):
-                if deal.direction == ItemDealDirections.OUT and deal.status in PAID_DEAL_STATUSES:
-                    await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
-            return
-
         for deal in reversed(deals.values()):
-            await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
+            if not account.worker_initialized and (
+                deal.direction != ItemDealDirections.OUT or deal.status not in PAID_DEAL_STATUSES
+            ):
+                continue
+            try:
+                await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
+            except Exception:
+                logger.exception("Playerok deal %s processing failed", deal.id)
+        if not account.worker_initialized:
+            return
         for chat in reversed(chats):
             await self._chat(account, client, chat)
         for review in reversed(reviews):
             await self._review(account, client, review)
+
+    @staticmethod
+    async def _active_sales(client: Any) -> list[Any]:
+        deals = []
+        cursor = None
+        seen = set()
+        while True:
+            page = await client.get_deals(
+                direction=ItemDealDirections.OUT,
+                statuses=[ItemDealStatuses.PAID, ItemDealStatuses.PENDING],
+                count=24, after_cursor=cursor,
+            )
+            deals.extend(
+                deal for deal in getattr(page, "deals", None) or []
+                if getattr(deal, "status", None) in PAID_DEAL_STATUSES
+            )
+            page_info = getattr(page, "page_info", None)
+            cursor = getattr(page_info, "end_cursor", None)
+            if not cursor or cursor in seen or not getattr(page_info, "has_next_page", False):
+                return deals
+            seen.add(cursor)
 
     @staticmethod
     async def _recover_chat_sales(client: Any, deals: dict[str, Any], chats: list[Any]) -> dict[str, Any]:
@@ -288,11 +319,6 @@ class WorkerManager:
     async def _deal(self, account: PlayerokAccount, client: Any, deal: Any, chat_hint: Any = None) -> None:
         cfg = settings_for(account)
         status = getattr(deal, "status", None)
-        status_name = getattr(status, "name", "UNKNOWN")
-        new_deal = await claim_event(self.db, account.id, "deal", deal.id)
-        new_status = await claim_event(
-            self.db, account.id, "deal_status", f"{deal.id}:{status_name}"
-        )
 
         item = getattr(deal, "item", None)
         buyer = getattr(deal, "user", None)
@@ -307,8 +333,12 @@ class WorkerManager:
         if (not chat_id or not item_id) and hasattr(client, "get_deal"):
             try:
                 full_deal = await client.get_deal(deal.id)
-                if full_deal:
-                    if getattr(full_deal, "chat", None) and not chat_id:
+                if full_deal and str(getattr(full_deal, "id", deal.id)) == str(deal.id):
+                    if getattr(full_deal, "direction", None) is not None:
+                        deal.direction = full_deal.direction
+                    if getattr(full_deal, "status", None) is not None:
+                        deal.status = status = full_deal.status
+                    if getattr(getattr(full_deal, "chat", None), "id", None):
                         chat = full_deal.chat
                         chat_id = getattr(chat, "id", None)
                         deal.chat = chat
@@ -320,8 +350,11 @@ class WorkerManager:
                         buyer = full_deal.user
                         deal.user = buyer
             except Exception as exc:
-                logger.debug("Failed to fetch full deal %s: %s", deal.id, exc)
+                logger.warning("Playerok deal %s details unavailable (%s)", deal.id, type(exc).__name__)
 
+        status_name = getattr(status, "name", "UNKNOWN")
+        new_deal = await claim_event(self.db, account.id, "deal", deal.id)
+        new_status = await claim_event(self.db, account.id, "deal_status", f"{deal.id}:{status_name}")
         item_name = getattr(item, "name", None) or "Товар"
         buyer_name = getattr(buyer, "username", None) or "покупатель"
         price = getattr(item, "price", None)

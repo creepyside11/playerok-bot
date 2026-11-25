@@ -94,6 +94,8 @@ class ItemEdit(StatesGroup):
 
 
 class TelegramAccountsState(StatesGroup):
+    diagnose_deal = State()
+    rule_keyword = State()
     add_country = State()
     add_phone = State()
     add_code = State()

@@ -21,7 +21,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     "telegram_account_deals": {
         "intro_sent": "BOOLEAN",
         "intro_attempted_at": "TIMESTAMP WITH TIME ZONE",
+        "intro_error": "VARCHAR(128)",
     },
+    "telegram_account_lot_rules": {"keyword": "VARCHAR(128)"},
     "telegram_users": {
         "web_login": "VARCHAR(64)",
         "web_password_hash": "VARCHAR(128)",

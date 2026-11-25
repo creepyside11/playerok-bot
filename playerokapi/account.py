@@ -21,6 +21,7 @@ from .exceptions import *
 from .parser import *
 from .enums import *
 from .misc import (
+    DEAL_READ_QUERIES,
     LISTING_READ_QUERIES,
     PERSISTED_QUERIES,
     PUBLISH_ITEM_RESULT_QUERY,
@@ -243,6 +244,8 @@ class Account:
         listing_paths = {
             "createItem": "/sell", "updateItem": "/products/[slug]/edit",
             "publishItem": "/products/[slug]", "itemPriorityStatuses": "/products/[slug]",
+            "deal": "/deal/[id]", "updateDeal": "/deal/[id]",
+            "createChatMessage": "/chats/[id]",
         }
         if x_gql_op in listing_paths:
             _headers["x-gql-path"] = listing_paths[x_gql_op]
@@ -488,8 +491,7 @@ class Account:
             })
         }
         
-        r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
-        return item_deal_list(r["data"]["deals"])
+        return item_deal_list(self._read_deal_api("deals", payload, headers))
 
     def get_deal(
         self, 
@@ -521,8 +523,22 @@ class Account:
             })
         } 
         
-        r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
-        return item_deal(r["data"]["deal"])
+        return item_deal(self._read_deal_api("deal", payload, headers))
+
+    def _read_deal_api(self, operation: str, payload: dict, headers: dict) -> Any:
+        url = f"{self.base_url}/graphql"
+        try:
+            response = self.request("get", url, headers, payload)
+        except RequestPlayerokError as exc:
+            if exc.error_code != "PERSISTED_QUERY_NOT_FOUND" and exc.error_message != "PersistedQueryNotFound":
+                raise
+            variables = json.loads(payload["variables"])
+            variables.pop("hasSupportAccess", None)
+            variables.pop("showForbiddenImage", None)
+            response = self.request("post", url, headers, {
+                "operationName": operation, "query": DEAL_READ_QUERIES[operation], "variables": variables,
+            })
+        return response.json()["data"][operation]
     
     def update_deal(
         self, 

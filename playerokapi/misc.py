@@ -78,3 +78,28 @@ mutation publishItem($input: PublishItemInput!) {
     }
   }
 }"""
+
+DEAL_CORE_FIELDS = """
+  id status direction createdAt statusDescription commentFromBuyer
+  user { id username }
+  chat { id }
+  transaction { id status value }
+  item { __typename id slug name status price rawPrice user { id username } category { id slug name } }
+"""
+
+DEAL_READ_QUERIES = {
+    "deals": """
+query deals($pagination: Pagination, $filter: ItemDealFilter!) {
+  deals(pagination: $pagination, filter: $filter) {
+    edges { node { ...DealCoreFields } }
+    pageInfo { startCursor endCursor hasPreviousPage hasNextPage }
+    totalCount
+  }
+}
+""" + "fragment DealCoreFields on ItemDeal {" + DEAL_CORE_FIELDS + "}",
+    "deal": """
+query deal($id: UUID!) {
+  deal(id: $id) { ...DealCoreFields }
+}
+""" + "fragment DealCoreFields on ItemDeal {" + DEAL_CORE_FIELDS + "}",
+}

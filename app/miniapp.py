@@ -521,6 +521,10 @@ class MiniApp:
         account = await self.account(request)
         body = await read_json(request)
         country = country_value(body.get("country"))
+        if "keyword" in body:
+            if "lotId" in body:
+                raise web.HTTPBadRequest(reason="Выберите лот или укажите слово из его названия.")
+            return web.json_response(await self.telegram_plugins.bind_keyword(account, body["keyword"], country), status=201)
         client = await self.gateway.get_client(account)
         item = await self.owned_listing(client, account, resource_id(body.get("lotId")))
         return web.json_response(await self.telegram_plugins.bind(account, item, country), status=201)

@@ -8,23 +8,25 @@ from sqlalchemy import func, select
 
 from .models import PlayerokAccount
 from .telegram_accounts_manager import (
-    COUNTRY_PRESETS, DEFAULT_TG_API_HASH, DEFAULT_TG_API_ID,
+    COUNTRY_PRESETS, default_telegram_api_hash, default_telegram_api_id,
     TelegramAccountLotRule, TelegramAccountStock, TelegramAccountsConfig,
+    bind_keyword, valid_keyword,
 )
 
 
 def rules_json(rules: Any) -> list[dict[str, Any]]:
     return [
-        {"id": row.id, "lotId": row.lot_id, "title": row.lot_title, "country": row.country, "enabled": row.enabled}
+        {"id": row.id, "lotId": None if row.keyword else row.lot_id, "keyword": row.keyword,
+         "title": row.lot_title, "country": row.country, "enabled": row.enabled}
         for row in rules
     ]
 
 
 def config_json(row: TelegramAccountsConfig | None) -> dict[str, Any]:
     return {
-        "apiId": row.api_id if row else DEFAULT_TG_API_ID,
-        "apiHashSet": bool(row.api_hash) if row else bool(DEFAULT_TG_API_HASH),
-        "defaults": not row or (row.api_id, row.api_hash) == (DEFAULT_TG_API_ID, DEFAULT_TG_API_HASH),
+        "apiId": row.api_id if row else default_telegram_api_id(),
+        "apiHashSet": bool((row.api_hash if row else "") or default_telegram_api_hash()),
+        "defaults": not row or (row.api_id, row.api_hash) == (default_telegram_api_id(), default_telegram_api_hash()),
     }
 
 
@@ -81,11 +83,11 @@ class TelegramPluginSettings:
             ))
             if row is None:
                 row = TelegramAccountsConfig(
-                    account_id=account.id, api_id=DEFAULT_TG_API_ID, api_hash=DEFAULT_TG_API_HASH,
+                    account_id=account.id, api_id=default_telegram_api_id(), api_hash=default_telegram_api_hash(),
                 )
                 session.add(row)
             if reset:
-                row.api_id, row.api_hash = DEFAULT_TG_API_ID, DEFAULT_TG_API_HASH
+                row.api_id, row.api_hash = default_telegram_api_id(), default_telegram_api_hash()
             if api_id is not None:
                 row.api_id = api_id
             if api_hash is not None:
@@ -105,6 +107,11 @@ class TelegramPluginSettings:
             row.lot_title, row.country = str(item.name or "Лот")[:256], country
             await session.commit()
             return rules_json([row])[0]
+
+    async def bind_keyword(self, account: PlayerokAccount, keyword: Any, country: str) -> dict[str, Any]:
+        if not valid_keyword(keyword):
+            raise web.HTTPBadRequest(reason="Укажите слово или фразу длиной до 128 символов.")
+        return rules_json([await bind_keyword(self.db, account, keyword, country)])[0]
 
     async def update_rule(
         self, account: PlayerokAccount, rule_id: int, body: dict[str, Any] | None,

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from hashlib import sha256
 import html
 import logging
+import os
 import re
 from typing import Any
 
@@ -14,8 +16,16 @@ from .models import Base, PlayerokAccount
 
 logger = logging.getLogger("telegram_accounts")
 
-DEFAULT_TG_API_ID = 2040
-DEFAULT_TG_API_HASH = "b1844dd2b70111dd37c342977a944a31"
+def default_telegram_api_id() -> int:
+    try:
+        return max(1, int(os.getenv("TELEGRAM_API_ID", "2040")))
+    except ValueError:
+        return 2040
+
+
+def default_telegram_api_hash() -> str:
+    value = os.getenv("TELEGRAM_API_HASH", "").strip()
+    return value if re.fullmatch(r"[0-9a-fA-F]{32}", value) else ""
 
 COUNTRY_PRESETS = [
     ("🇷🇺 Россия", "+7"),
@@ -38,6 +48,7 @@ class TelegramAccountLotRule(Base):
         ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     lot_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    keyword: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lot_title: Mapped[str] = mapped_column(String(256), nullable=False)
     country: Mapped[str] = mapped_column(String(128), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -84,6 +95,7 @@ class TelegramAccountDeal(Base):
     country: Mapped[str] = mapped_column(String(128), nullable=False)
     intro_sent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     intro_attempted_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=True)
+    intro_error: Mapped[str | None] = mapped_column(String(128), nullable=True)
     code_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     code_sent: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deal_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -104,11 +116,77 @@ class TelegramAccountsConfig(Base):
     account_id: Mapped[Any] = mapped_column(
         ForeignKey("playerok_accounts.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
     )
-    api_id: Mapped[int] = mapped_column(Integer, default=DEFAULT_TG_API_ID, nullable=False)
-    api_hash: Mapped[str] = mapped_column(String(128), default=DEFAULT_TG_API_HASH, nullable=False)
+    api_id: Mapped[int] = mapped_column(Integer, default=default_telegram_api_id, nullable=False)
+    api_hash: Mapped[str] = mapped_column(String(128), default=default_telegram_api_hash, nullable=False)
     updated_at: Mapped[Any] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+def normalized_keyword(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def valid_keyword(text: Any) -> bool:
+    return isinstance(text, str) and 1 <= len(text.strip()) <= 128 and any(ch.isalnum() for ch in text)
+
+
+async def bind_keyword(db: Any, account: PlayerokAccount, keyword: str, country: str) -> TelegramAccountLotRule:
+    label = " ".join(keyword.split())
+    key = "keyword:" + sha256(normalized_keyword(label).encode()).hexdigest()
+    async with db() as session:
+        await session.get(PlayerokAccount, account.id, with_for_update=True)
+        row = await session.scalar(select(TelegramAccountLotRule).where(
+            TelegramAccountLotRule.account_id == account.id, TelegramAccountLotRule.lot_id == key,
+        ))
+        if row is None:
+            row = TelegramAccountLotRule(account_id=account.id, lot_id=key, enabled=True)
+            session.add(row)
+        row.keyword = row.lot_title = label
+        row.country = country
+        await session.commit()
+        return row
+
+
+async def bound_lot_rule(
+    session: Any, account_id: Any, lot_id: str, lot_title: str = "",
+) -> TelegramAccountLotRule | None:
+    rules = select(TelegramAccountLotRule).where(TelegramAccountLotRule.account_id == account_id)
+    if lot_id:
+        direct = await session.scalar(rules.where(
+            TelegramAccountLotRule.lot_id == lot_id, TelegramAccountLotRule.keyword.is_(None),
+        ))
+        if direct is not None:
+            return direct
+    if not lot_title:
+        return None
+    title = normalized_keyword(lot_title)
+    keywords = await session.scalars(rules.where(
+        TelegramAccountLotRule.keyword.is_not(None), TelegramAccountLotRule.enabled.is_(True),
+    ))
+    matches = [rule for rule in keywords if normalized_keyword(rule.keyword) in title]
+    return min(matches, key=lambda rule: (-len(normalized_keyword(rule.keyword)), rule.id), default=None)
+
+
+def country_key(country: str) -> str:
+    key = " ".join(country.casefold().split())
+    for preset, _ in COUNTRY_PRESETS:
+        tag, name = preset.casefold().split(" ", 1)
+        if key in {f"{tag} {name}", name}:
+            return name
+    return key
+
+
+async def available_stock_query(session: Any, account_id: Any, country: str) -> Any:
+    # A custom country can be entered without the flag used by the stock menu.
+    available = (
+        TelegramAccountStock.account_id == account_id,
+        TelegramAccountStock.status == "available",
+    )
+    countries = await session.scalars(select(TelegramAccountStock.country).where(*available).distinct())
+    key = country_key(country)
+    labels = [label for label in countries if country_key(label) == key]
+    return select(TelegramAccountStock).where(*available, TelegramAccountStock.country.in_(labels))
 
 
 def extract_5digit_code(text: str) -> str | None:
