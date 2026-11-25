@@ -11,6 +11,8 @@ COPY . .
 
 RUN mkdir -p /data
 ENV DATABASE_URL=sqlite+aiosqlite:////data/playerok.db
+ENV PORT=3000
+EXPOSE 3000
 VOLUME ["/data"]
 
 CMD ["python", "bot.py"]

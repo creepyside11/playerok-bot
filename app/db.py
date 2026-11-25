@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # SQLite не поддерживает ADD COLUMN IF NOT EXISTS, поэтому проверяем PRAGMA
 # table_info, а PostgreSQL использует IF NOT EXISTS.
 MIGRATIONS: dict[str, dict[str, str]] = {
+    "plugin_states": {"enabled_explicit": "BOOLEAN NOT NULL DEFAULT FALSE"},
     "telegram_users": {
         "web_login": "VARCHAR(64)",
         "web_password_hash": "VARCHAR(128)",

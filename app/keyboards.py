@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from .config import mini_app_url
 
-def main_menu() -> InlineKeyboardMarkup:
+
+def main_menu(*, private: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    url = mini_app_url()
+    if url and private:
+        b.button(text="🟢 Открыть Mini App", web_app=WebAppInfo(url=url))
+    else:
+        b.button(text="🟢 Mini App", callback_data="menu:web")
     for text, data in [
-        ("🌐 Веб-панель", "menu:web"),
         ("👤 Профиль", "menu:profile"),
         ("💰 Баланс", "menu:balance"),
         ("💬 Чаты", "menu:chats"),

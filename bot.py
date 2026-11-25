@@ -7,7 +7,8 @@ import logging
 import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
-from aiogram.types import ErrorEvent
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import ErrorEvent, MenuButtonWebApp, WebAppInfo
 
 from app.config import Settings
 from app.crypto import SecretCipher
@@ -24,6 +25,7 @@ from app.bot_store_ui import router as bot_store_router
 from app.kosell_ui import router as kosell_router
 from app.autosmm_ui import router as autosmm_router
 from app.handlers import Services, configure_handlers
+from app.miniapp import start_miniapp
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
 from app.telegram_plugin_runtime import ExternalAPI
@@ -83,7 +85,19 @@ async def main() -> None:
         poll_interval=settings.poll_interval,
         plugin_manager=plugin_manager,
     )
-    worker_task = asyncio.create_task(worker.run(), name="playerok-worker")
+    worker_task = None
+    web_runner = None
+
+    @dispatcher.startup()
+    async def configure_miniapp_button(bot: Bot) -> None:
+        if not settings.mini_app_url:
+            return
+        try:
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="Панель продавца", web_app=WebAppInfo(url=settings.mini_app_url),
+            ))
+        except TelegramAPIError as exc:
+            logging.getLogger("bot").warning("Не удалось обновить кнопку Mini App: %s", type(exc).__name__)
 
     @dispatcher.errors()
     async def handle_update_error(event: ErrorEvent) -> None:
@@ -104,12 +118,17 @@ async def main() -> None:
             pass
 
     try:
+        web_runner = await start_miniapp(settings, session_factory, gateway, plugin_manager)
+        worker_task = asyncio.create_task(worker.run(), name="playerok-worker")
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         worker.stop()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        if worker_task is not None:
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+        if web_runner is not None:
+            await web_runner.cleanup()
         await bot.session.close()
         await http_client.aclose()
         await engine.dispose()

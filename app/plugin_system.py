@@ -146,6 +146,7 @@ class PluginManager:
         self.catalog_dir = Path(catalog_dir)
         self.plugins: dict[str, PluginSpec] = {}
         self.load_errors: dict[str, str] = {}
+        self._state_lock = asyncio.Lock()
         self.telethon = TelethonManager()
         self.external_api: ExternalAPI | None = None
         self.cipher: Any = None
@@ -254,9 +255,8 @@ class PluginManager:
         if row and isinstance(row.config, dict):
             config.update(row.config)
 
-        # Если плагин явно включен в БД
-        if row and row.enabled:
-            return True, config
+        if row and (row.enabled_explicit or row.enabled):
+            return row.enabled, config
 
         # Умный fallback: если плагин встроенный (например gmail_seller, telegram_accounts, universal_accounts)
         # и у него в базе есть активные привязанные правила (лоты), считаем его активным
@@ -333,47 +333,38 @@ class PluginManager:
 
         return bool(row.enabled) if row else False, config
 
-    async def set_enabled(self, account_id: Any, plugin: PluginSpec, enabled: bool) -> None:
-        async with self.db() as session:
+    async def configure_state(
+        self,
+        account_id: Any,
+        plugin: PluginSpec,
+        *,
+        enabled: bool | None = None,
+        values: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._state_lock, self.db() as session:
             row = await session.scalar(
                 select(PluginState).where(
                     PluginState.account_id == account_id, PluginState.plugin_id == plugin.id
-                )
+                ).with_for_update()
             )
-            if not row:
+            if row is None:
                 row = PluginState(
-                    account_id=account_id,
-                    plugin_id=plugin.id,
-                    enabled=enabled,
-                    config=plugin.defaults(),
+                    account_id=account_id, plugin_id=plugin.id,
+                    enabled=False, config=plugin.defaults(),
                 )
                 session.add(row)
-            else:
+            if enabled is not None:
                 row.enabled = enabled
+                row.enabled_explicit = True
+            if values:
+                row.config = {**(row.config or {}), **values}
             await session.commit()
 
+    async def set_enabled(self, account_id: Any, plugin: PluginSpec, enabled: bool) -> None:
+        await self.configure_state(account_id, plugin, enabled=enabled)
+
     async def set_setting(self, account_id: Any, plugin: PluginSpec, key: str, value: Any) -> None:
-        async with self.db() as session:
-            row = await session.scalar(
-                select(PluginState).where(
-                    PluginState.account_id == account_id, PluginState.plugin_id == plugin.id
-                )
-            )
-            if not row:
-                config = plugin.defaults()
-                config[key] = value
-                row = PluginState(
-                    account_id=account_id,
-                    plugin_id=plugin.id,
-                    enabled=False,
-                    config=config,
-                )
-                session.add(row)
-            else:
-                current_config = dict(row.config or {})
-                current_config[key] = value
-                row.config = current_config
-            await session.commit()
+        await self.configure_state(account_id, plugin, values={key: value})
 
     async def count_enabled(self, account_id: Any) -> int:
         total = 0
