@@ -33,15 +33,18 @@ async def get_item_data_fields(
 
 
 def buyer_message_field_id(fields: list[GameCategoryDataField]) -> str | None:
+    fallback = None
     for field in fields:
-        label = str(field.label or "").casefold()
-        russian = any(word in label for word in ("сообщение", "текст")) and any(
+        label = str(field.label or "").casefold().strip().rstrip(":* ").strip()
+        russian = any(word in label for word in ("сообщение", "текст", "комментарий")) and any(
             word in label for word in ("покупател", "после покупк", "после оплат")
         )
         english = "message" in label and any(word in label for word in ("buyer", "purchase", "payment"))
         if russian or english:
             return str(field.id)
-    return None
+        if label in {"комментарий", "comment"}:
+            fallback = str(field.id)
+    return fallback
 
 
 def valid_buyer_message(text: str) -> bool:

@@ -13,14 +13,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .handlers import active_account, clip, edit, require_account, svc
 from playerokapi.enums import ItemStatuses
-from playerokapi.exceptions import RequestPlayerokError
+from playerokapi.exceptions import (
+    BotCheckDetectedException, RequestFailedError, RequestPlayerokError, UnauthorizedError,
+)
 
 from .item_delivery import (
     BUYER_MESSAGE_ERROR, BUYER_MESSAGE_PROMPT, buyer_message_field_id,
     get_item_data_fields, item_delivery_payload, valid_buyer_message,
 )
 from .item_publication import (
-    PublicationChanged, can_publish, confirm_publication, parse_discount_price, publication_balance,
+    PublicationChanged, PublicationUnconfirmed, can_publish, confirm_publication, parse_discount_price,
+    publication_balance,
     publication_tariffs, rubles, tariff_price,
 )
 from .keyboards import back_menu
@@ -706,32 +709,67 @@ async def item_publish_action(call: CallbackQuery, state: FSMContext) -> None:
     await _show_publication(call, state, account, item_id, in_wizard)
 
 
+def _publication_actions(item_id: str, back: str, slug: str | None = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Обновить статус лота", callback_data=f"item:view:{item_id}")
+    if slug:
+        builder.button(text="Открыть лот на Playerok", url=f"https://playerok.com/products/{slug}")
+    if back != f"item:view:{item_id}":
+        builder.button(text="Назад", callback_data=back)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _listing_error_detail(exc: Exception) -> str:
+    if isinstance(exc, RequestPlayerokError):
+        code = f" [{exc.error_code}]" if exc.error_code else ""
+        return f"\n<code>{html.escape(clip(exc.error_message + code, 450))}</code>"
+    if isinstance(exc, (BotCheckDetectedException, UnauthorizedError)):
+        return "\nPlayerok запросил проверку входа. Откройте сайт и проверьте подключение аккаунта."
+    if isinstance(exc, RequestFailedError):
+        return f"\nHTTP {exc.status_code} от Playerok."
+    return ""
+
+
 async def _show_publication(
     call: CallbackQuery, state: FSMContext, account: Any, item_id: str,
     in_wizard: bool, notice: str = "",
 ) -> None:
     await state.update_data(publication=None)
     back = "itemdraft:review" if in_wizard else f"item:view:{item_id}"
+    item = None
+    step = "загрузить лот"
     try:
         client = await svc().gateway.get_client(account)
         item = await client.get_item(item_id)
+        if item is None:
+            await edit(call, "Playerok не вернул лот. Проверьте выбранный аккаунт и список черновиков.", back_menu("items:list:drafts"))
+            return
         if not can_publish(item):
-            await edit(call, "У этого товара сейчас нет доступной публикации.", back_menu(f"item:view:{item_id}"))
+            await edit(
+                call,
+                f"Публикация сейчас недоступна. Статус на Playerok: {item_status_badge(item.status)}",
+                _publication_actions(item_id, back, getattr(item, "slug", None)),
+            )
             return
         prices = int(item.price), tariff_price(item)
+        step = "загрузить тарифы"
         tariffs = await publication_tariffs(client, item_id, prices[1])
         balance = await publication_balance(client)
-    except Exception:
-        await edit(call, "Не удалось загрузить условия публикации.", InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Повторить", callback_data=f"item:publish:{item_id}")],
-            [InlineKeyboardButton(text="Назад", callback_data=back)],
-        ]))
+    except Exception as exc:
+        logger.warning("Playerok listing %s failed to load publication terms: %s", item_id, type(exc).__name__)
+        await edit(
+            call,
+            f"Не удалось {step}.{_listing_error_detail(exc)}",
+            _publication_actions(item_id, back, getattr(item, "slug", None)),
+        )
         return
 
     token = secrets.token_hex(6)
     await state.update_data(publication={
         "token": token, "item_id": item_id, "account_id": str(account.id), "prices": prices,
         "tariffs": tariffs, "balance": balance, "in_wizard": in_wizard, "selected": None,
+        "slug": getattr(item, "slug", None),
     })
     price, base = prices
     price_text = f"<s>{base} ₽</s> → <b>{price} ₽</b>" if price < base else f"<b>{price} ₽</b>"
@@ -816,19 +854,23 @@ async def item_publish_confirm(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer("Проверяю условия публикации…")
     await state.update_data(publication=None)
     item_id, tariff = quote["item_id"], quote["selected"]
-    client = await svc().gateway.get_client(account)
+    actions = _publication_actions(item_id, f"item:view:{item_id}", quote.get("slug"))
     try:
+        client = await svc().gateway.get_client(account)
         item = await confirm_publication(client, item_id, quote["prices"], tariff, quote["balance"])
     except PublicationChanged:
-        await _show_publication(call, state, account, item_id, quote["in_wizard"],
-                                "Условия изменились. Выберите тариф заново.")
+        await _show_publication(
+            call, state, account, item_id, quote["in_wizard"], "Условия изменились. Выберите тариф заново.",
+        )
         return
-    except RequestPlayerokError as exc:
-        detail = html.escape(clip(exc.error_message, 350))
-        await edit(call, f"Playerok отклонил запрос.\n<code>{detail}</code>", back_menu(f"item:view:{item_id}"))
+    except PublicationUnconfirmed as exc:
+        current_status = item_status_badge(getattr(exc.item, "status", None))
+        detail = _listing_error_detail(exc.failure) if exc.failure else ""
+        await edit(call, f"Playerok пока не подтвердил публикацию. Статус: {current_status}{detail}", actions)
         return
-    except Exception:
-        await edit(call, "Playerok не подтвердил результат. Проверьте статус товара и баланс.", back_menu(f"item:view:{item_id}"))
+    except Exception as exc:
+        logger.warning("Playerok listing %s publication failed: %s", item_id, type(exc).__name__)
+        await edit(call, f"Не удалось опубликовать лот.{_listing_error_detail(exc)}", actions)
         return
 
     await state.clear()

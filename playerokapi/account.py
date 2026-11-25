@@ -21,7 +21,9 @@ from .exceptions import *
 from .parser import *
 from .enums import *
 from .misc import (
-    PERSISTED_QUERIES, 
+    LISTING_READ_QUERIES,
+    PERSISTED_QUERIES,
+    PUBLISH_ITEM_RESULT_QUERY,
     QUERIES
 )
 
@@ -305,7 +307,7 @@ class Account:
         try: json = resp.json()
         except: pass
         
-        if "errors" in json:
+        if isinstance(json, dict) and json.get("errors"):
             raise RequestPlayerokError(resp)
 
         if resp.status_code != 200 and not (resp.status_code == 304 and pass_304):
@@ -869,31 +871,16 @@ class Account:
         :rtype: `playerokapi.types.GameCategoryDataFieldList`
         """
 
-        headers = {"accept": "*/*"}
-        payload = {
-            "operationName": "gameCategoryDataFields",
-            "variables": json.dumps({
-                "pagination": {
-                    "first": count,
-                    "after": after_cursor
-                },
-                "filter": {
-                    "gameCategoryId": game_category_id,
-                    "obtainingTypeId": obtaining_type_id,
-                    "type": type.name if type else None
-                }
-            }),
-            "extensions": json.dumps({
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": PERSISTED_QUERIES.get("gameCategoryDataFields")
-                }
-            })
-        }
+        fields = self._read_listing_api("gameCategoryDataFields", {
+            "pagination": {"first": count, "after": after_cursor},
+            "filter": {
+                "gameCategoryId": game_category_id,
+                "obtainingTypeId": obtaining_type_id,
+                "type": type.name if type else None,
+            },
+        })
+        return game_category_data_field_list(fields)
 
-        r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
-        return game_category_data_field_list(r["data"]["gameCategoryDataFields"])
-    
     def get_chats(
         self, 
         count: int = 24, 
@@ -1310,32 +1297,35 @@ class Account:
         else:
             payload_attributes = {}
 
+        input_data = {
+            "gameCategoryId": game_category_id,
+            "name": name,
+            "price": int(price),
+            "description": description,
+        }
+        if obtaining_type_id:
+            input_data["obtainingTypeId"] = obtaining_type_id
+        if payload_attributes:
+            input_data["attributes"] = payload_attributes
         payload_data_fields = self._serialize_item_data_fields(data_fields)
+        if payload_data_fields:
+            input_data["dataFields"] = payload_data_fields
+        if comment is not None:
+            input_data["comment"] = comment
 
         headers = {"accept": "*/*"}
         operations = {
             "operationName": "createItem",
-            "query": QUERIES.get("createItem"),
+            "query": QUERIES["createItem"],
             "variables": {
-                "input": {
-                    "gameCategoryId": game_category_id,
-                    "obtainingTypeId": obtaining_type_id,
-                    "name": name,
-                    "price": int(price),
-                    "description": description,
-                    "attributes": payload_attributes,
-                    "dataFields": payload_data_fields
-                },
-                "attachments": [None] * len(attachments or [])
-            }
+                "input": input_data,
+                "attachments": [None] * len(attachments or []),
+                "showForbiddenImage": True,
+            },
         }
 
         map = {}
         files = {}
-
-        if comment is not None:
-            operations["variables"]["input"]["comment"] = comment
-
         for i, att in enumerate(attachments or [], start=1):
             filename, file_obj, content_type = self._resolve_image_file(att)
             map[str(i)] = [f"variables.attachments.{i-1}"]
@@ -1491,8 +1481,24 @@ class Account:
             }
         }
 
-        r = self.request("post", f"{self.base_url}/graphql", headers, payload).json()
-        return item(r["data"]["publishItem"])
+        payload["variables"]["showForbiddenImage"] = True
+        try:
+            response = self.request("post", f"{self.base_url}/graphql", headers, payload)
+        except RequestPlayerokError as exc:
+            errors = exc.json.get("errors") or []
+            if exc.json.get("data") or not errors or any(
+                (error.get("extensions") or {}).get("code") != "GRAPHQL_VALIDATION_FAILED"
+                for error in errors
+            ):
+                raise
+            # GraphQL rejected the document before executing the mutation.
+            response = self.request("post", f"{self.base_url}/graphql", headers, {
+                "operationName": "publishItem",
+                "query": PUBLISH_ITEM_RESULT_QUERY,
+                "variables": {"input": payload["variables"]["input"]},
+            })
+        data = response.json()["data"]["publishItem"]
+        return item_by_typename(data) or item(data)
 
     def get_my_items(
         self, 
@@ -1632,6 +1638,29 @@ class Account:
         r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
         return item_profile_list(r["data"]["items"])
 
+    def _read_listing_api(self, operation: str, variables: dict) -> Any:
+        headers = {"accept": "*/*"}
+        url = f"{self.base_url}/graphql"
+        try:
+            response = self.request("get", url, headers, {
+                "operationName": operation,
+                "variables": json.dumps(variables),
+                "extensions": json.dumps({
+                    "persistedQuery": {"version": 1, "sha256Hash": PERSISTED_QUERIES[operation]},
+                }),
+            })
+        except RequestPlayerokError as exc:
+            if exc.error_code != "PERSISTED_QUERY_NOT_FOUND" and exc.error_message != "PersistedQueryNotFound":
+                raise
+            if operation == "item":
+                variables = {key: value for key, value in variables.items() if key != "hasSupportAccess"}
+            response = self.request("post", url, headers, {
+                "operationName": operation,
+                "query": LISTING_READ_QUERIES[operation],
+                "variables": variables,
+            })
+        return response.json()["data"][operation]
+
     def get_item(
         self, 
         id: str | None = None, 
@@ -1654,25 +1683,10 @@ class Account:
         if not any((id, slug)):
             raise TypeError("Не был передан ни один из обязательных аргументов: id, slug")
         
-        headers = {"accept": "*/*"}
-        payload = {
-            "operationName": "item",
-            "variables": json.dumps({
-                "id": id,
-                "slug": slug,
-                "hasSupportAccess": False,
-                "showForbiddenImage": True
-            }),
-            "extensions": json.dumps({
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": PERSISTED_QUERIES.get("item")
-                }
-            })
-        }
-        
-        r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
-        return item_by_typename(r["data"]["item"])
+        data = self._read_listing_api("item", {
+            "id": id, "slug": slug, "hasSupportAccess": False, "showForbiddenImage": True,
+        })
+        return item_by_typename(data)
 
     def get_item_priority_statuses(
         self, 
@@ -1692,23 +1706,10 @@ class Account:
         :rtype: `list[playerokapi.types.ItemPriorityStatus]`
         """
 
-        headers = {"accept": "*/*"}
-        payload = {
-            "operationName": "itemPriorityStatuses",
-            "variables": json.dumps({
-                "itemId": item_id,
-                "price": int(item_price)
-            }),
-            "extensions": json.dumps({
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": PERSISTED_QUERIES.get("itemPriorityStatuses")
-                }
-            })
-        }
-
-        r = self.request("get", f"{self.base_url}/graphql", headers, payload).json()
-        return [item_priority_status(status) for status in r["data"]["itemPriorityStatuses"]]
+        statuses = self._read_listing_api("itemPriorityStatuses", {
+            "itemId": item_id, "price": item_price if isinstance(item_price, (int, float)) else float(item_price),
+        })
+        return [item_priority_status(status) for status in statuses or []]
 
     def increase_item_priority_status(
         self, 

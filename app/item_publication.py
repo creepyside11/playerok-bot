@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from playerokapi.exceptions import RequestFailedError, RequestPlayerokError, RequestSendingError
+
 
 @dataclass(frozen=True)
 class PublicationTariff:
@@ -14,6 +16,17 @@ class PublicationTariff:
 
 class PublicationChanged(Exception):
     """Playerok changed the price, balance or available options."""
+
+
+class PublicationUnconfirmed(Exception):
+    def __init__(self, item: Any, failure: Exception | None = None):
+        self.item = item
+        self.failure = failure
+
+
+def publication_confirmed(item: Any) -> bool:
+    status = getattr(item, "status", None)
+    return getattr(status, "name", status) in {"APPROVED", "PENDING_APPROVAL", "PENDING_MODERATION"}
 
 
 def amount(value: Any) -> Decimal | None:
@@ -81,4 +94,24 @@ async def confirm_publication(
         current_balance = await publication_balance(client)
         if current_balance is None or current_balance < tariff.fee or current_balance != balance:
             raise PublicationChanged()
-    return await client.publish_item(item_id, tariff.id)
+    result = None
+    failure = None
+    try:
+        result = await client.publish_item(item_id, tariff.id)
+    except RequestPlayerokError as exc:
+        if not exc.json.get("data"):
+            raise
+        failure = exc
+    except (RequestFailedError, RequestSendingError, KeyError, TypeError, ValueError) as exc:
+        # A response error can arrive after the marketplace has accepted the listing.
+        failure = exc
+
+    if publication_confirmed(result):
+        return result
+    try:
+        current = await client.get_item(item_id)
+    except Exception:
+        current = result
+    if publication_confirmed(current):
+        return current
+    raise PublicationUnconfirmed(current or result, failure)

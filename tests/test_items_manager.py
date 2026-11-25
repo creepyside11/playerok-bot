@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from playerokapi.account import Account
+from playerokapi.exceptions import RequestPlayerokError
 
 
 def item_status_badge(status):
@@ -236,7 +237,8 @@ def test_create_item_without_obtaining_type_and_with_range_attributes():
     assert len(captured_requests) == 1
     req = captured_requests[0]
     inp = req["payload"]["variables"]["input"]
-    assert inp["obtainingTypeId"] is None
+    assert "obtainingTypeId" not in inp
+    assert "dataFields" not in inp
     assert inp["attributes"] == {"level": 25, "property": 5000000}
 
 
@@ -270,3 +272,63 @@ def test_selector_pagination_logic():
 
 
 
+
+
+def graphql_error(message, code=None):
+    error = {"message": message}
+    if code:
+        error["extensions"] = {"code": code}
+    response = MagicMock()
+    response.json.return_value = {"errors": [error]}
+    return RequestPlayerokError(response)
+
+
+def test_priority_query_recovers_from_missing_persisted_document(monkeypatch):
+    account = object.__new__(Account)
+    account.base_url = "https://playerok.com"
+    response = MagicMock()
+    response.json.return_value = {"data": {"itemPriorityStatuses": [
+        {"id": "free", "name": "Обычный", "type": "DEFAULT", "price": 0},
+    ]}}
+    request = MagicMock(side_effect=[graphql_error("PersistedQueryNotFound"), response])
+    monkeypatch.setattr(account, "request", request)
+
+    assert account.get_item_priority_statuses("lot", 900)[0].id == "free"
+    first, second = request.call_args_list
+    assert first.args[0] == "get"
+    assert second.args[0] == "post"
+    assert "query itemPriorityStatuses" in second.args[3]["query"]
+    assert second.args[3]["variables"] == {"itemId": "lot", "price": 900}
+
+
+def test_publish_known_document_validation_failure_can_retry_without_old_fields(monkeypatch):
+    account = object.__new__(Account)
+    account.base_url = "https://playerok.com"
+    response = MagicMock()
+    response.json.return_value = {"data": {"publishItem": {
+        "__typename": "MyItem", "id": "lot", "price": 900, "status": "APPROVED",
+    }}}
+    request = MagicMock(side_effect=[
+        graphql_error("Cannot query field on MyItem", "GRAPHQL_VALIDATION_FAILED"), response,
+    ])
+    monkeypatch.setattr(account, "request", request)
+
+    result = account.publish_item("lot", "regular")
+    assert result.status.name == "APPROVED"
+    first, second = request.call_args_list
+    assert len(second.args[3]["query"]) < len(first.args[3]["query"])
+    assert first.args[3]["variables"]["input"] == second.args[3]["variables"]["input"] == {
+        "itemId": "lot", "priorityStatuses": ["regular"], "transactionProviderId": "LOCAL",
+    }
+
+
+def test_publish_business_rejection_is_not_retried(monkeypatch):
+    account = object.__new__(Account)
+    account.base_url = "https://playerok.com"
+    error = graphql_error("Этот товар можно выставить только платно.")
+    request = MagicMock(side_effect=error)
+    monkeypatch.setattr(account, "request", request)
+
+    with pytest.raises(RequestPlayerokError, match="только платно"):
+        account.publish_item("lot", "regular")
+    assert request.call_count == 1

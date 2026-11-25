@@ -15,6 +15,7 @@ from app.crypto import SecretCipher
 from app.db import init_db, make_engine, make_session_factory
 from app.item_publication import (
     PublicationChanged,
+    PublicationUnconfirmed,
     confirm_publication,
     parse_discount_price,
     publication_tariffs,
@@ -23,6 +24,7 @@ from app.models import DeliveryRule, PlayerokAccount, TelegramUser
 from app.states import ItemCreate, ItemEdit
 from app.worker import WorkerManager
 from playerokapi.enums import GameCategoryDataFieldTypes, ItemStatuses
+from playerokapi.exceptions import RequestSendingError
 
 
 def item(price=900, status=ItemStatuses.DRAFT):
@@ -124,7 +126,7 @@ async def test_telegram_shows_amount_and_balance_and_consumes_confirmation(monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema", ["text", "fields_and_text", "fields_with_message"])
+@pytest.mark.parametrize("schema", ["text", "fields_and_text", "fields_with_message", "fields_with_comment"])
 async def test_wizard_requires_native_buyer_message(monkeypatch, schema):
     engine = make_engine("sqlite+aiosqlite:///:memory:")
     try:
@@ -154,9 +156,10 @@ async def test_wizard_requires_native_buyer_message(monkeypatch, schema):
             fields.append(SimpleNamespace(
                 id="code", label="Код товара", type=GameCategoryDataFieldTypes.ITEM_DATA, required=True,
             ))
-        if schema == "fields_with_message":
+        if schema in {"fields_with_message", "fields_with_comment"}:
+            label = "Комментарий" if schema == "fields_with_comment" else "Сообщение покупателю после покупки"
             fields.append(SimpleNamespace(
-                id="message", label="Сообщение покупателю после покупки",
+                id="message", label=label,
                 type=GameCategoryDataFieldTypes.ITEM_DATA, required=False,
             ))
 
@@ -203,7 +206,7 @@ async def test_wizard_requires_native_buyer_message(monkeypatch, schema):
         await handlers.create_draft(message, state, 21)
 
         params = client.create_item.await_args.kwargs
-        if schema == "fields_with_message":
+        if schema in {"fields_with_message", "fields_with_comment"}:
             assert params["data_fields"] == {"code": "ABC-123", "message": "Инструкция после покупки"}
             assert params["comment"] is None
         else:
@@ -278,3 +281,22 @@ async def test_edit_buyer_message_preserves_native_category_fields(monkeypatch):
         "lot", data_fields={"code": "ABC", "message": "Новое сообщение"}
     )
     assert await state.get_state() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_after_publish", [ItemStatuses.PENDING_APPROVAL, ItemStatuses.DRAFT])
+async def test_ambiguous_publication_checks_actual_status_without_resending(state_after_publish):
+    client = client_with_tariffs()
+    client.get_item.side_effect = [item(), item(status=state_after_publish)]
+    client.publish_item.side_effect = RequestSendingError("https://playerok.com/graphql", "timeout")
+    free = (await publication_tariffs(client, "lot", 1000))[0]
+
+    if state_after_publish == ItemStatuses.DRAFT:
+        with pytest.raises(PublicationUnconfirmed) as result:
+            await confirm_publication(client, "lot", (900, 1000), free, None)
+        assert result.value.item.status == ItemStatuses.DRAFT
+    else:
+        result = await confirm_publication(client, "lot", (900, 1000), free, None)
+        assert result.status == state_after_publish
+    client.publish_item.assert_awaited_once_with("lot", "free")
+    assert client.get_item.await_count == 2
