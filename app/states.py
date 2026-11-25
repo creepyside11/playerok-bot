@@ -101,6 +101,7 @@ class TelegramAccountsState(StatesGroup):
     add_code = State()
     add_password = State()
     add_raw_session = State()
+    add_session_file = State()
     custom_country = State()
     rule_country = State()
     api_id = State()

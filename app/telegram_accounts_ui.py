@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import html
+from io import BytesIO
 import logging
 import re
 from typing import Any
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.enums import ChatType
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -33,6 +36,7 @@ from .telegram_accounts_manager import (
     bound_lot_rule,
     valid_keyword,
 )
+from .telegram_session_file import MAX_SESSION_BYTES, SessionFileError, verify_session_file
 
 logger = logging.getLogger("telegram_accounts_ui")
 router = Router(name="telegram_accounts_ui")
@@ -40,6 +44,14 @@ router = Router(name="telegram_accounts_ui")
 # In-memory dictionary for pending interactive Telethon logins
 # key: tg_user_id -> dict(client, phone, hash, country, account_id)
 PENDING_PHONE_AUTHS: dict[int, dict[str, Any]] = {}
+LOGIN_CODE_CHANNELS = {
+    "SentCodeTypeApp": "Telegram указал доставку в служебный чат приложения на уже авторизованном устройстве.",
+    "SentCodeTypeSms": "Telegram указал доставку по SMS.",
+    "SentCodeTypeSmsWord": "Telegram указал доставку слова по SMS.",
+    "SentCodeTypeSmsPhrase": "Telegram указал доставку фразы по SMS.",
+    "SentCodeTypeEmailCode": "Telegram указал доставку на привязанную почту.",
+    "SentCodeTypeCall": "Telegram продиктует код по телефону.",
+}
 
 
 async def cleanup_pending_auth(tg_user_id: int) -> None:
@@ -247,6 +259,7 @@ async def tgacc_manager_menu(call: CallbackQuery, state: FSMContext) -> None:
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить акк: Номер + Код (Telethon)", callback_data="tgacc:add:country")],
+        [InlineKeyboardButton(text="📎 Добавить файл .session (Telethon)", callback_data="tgacc:add:file")],
         [InlineKeyboardButton(text="📝 Добавить готовую StringSession", callback_data="tgacc:add:raw_start")],
         [InlineKeyboardButton(text="📋 Список всех номеров", callback_data="tgacc:stock:list:0")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="tgacc:open")],
@@ -256,7 +269,7 @@ async def tgacc_manager_menu(call: CallbackQuery, state: FSMContext) -> None:
         "👥 <b>Менеджер аккаунтов Telegram</b>\n\n"
         "<b>Наличие по странам:</b>\n"
         f"{breakdown_text}\n\n"
-        "Для добавления нажмите кнопку ниже. Бот запросит код подтверждения через официальный MTProto/Telethon."
+        "Выберите способ добавления профиля."
     )
     await call.answer()
     await edit(call, text, markup)
@@ -264,12 +277,18 @@ async def tgacc_manager_menu(call: CallbackQuery, state: FSMContext) -> None:
 
 # --- Добавление: Выбор страны ---
 
-@router.callback_query(F.data == "tgacc:add:country")
+@router.callback_query(F.data.in_({"tgacc:add:country", "tgacc:add:file"}))
 async def tgacc_add_choose_country(call: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     account = await require_account(call)
     if not account:
         return
+    session_file = call.data == "tgacc:add:file"
+    if session_file and call.message.chat.type != ChatType.PRIVATE:
+        await call.answer("Импорт файла доступен в личном чате с ботом.", show_alert=True)
+        return
+    await cleanup_pending_auth(call.from_user.id)
+    await state.clear()
+    await state.update_data(stock_account_id=str(account.id), stock_session_file=session_file)
 
     b = InlineKeyboardBuilder()
     for name, prefix in COUNTRY_PRESETS:
@@ -289,6 +308,10 @@ async def tgacc_add_choose_country(call: CallbackQuery, state: FSMContext) -> No
 
 @router.callback_query(F.data.startswith("tgacc:addc:"))
 async def tgacc_add_country_selected(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("stock_account_id"):
+        await call.answer("Откройте «Менеджер аккаунтов» и выберите способ добавления заново.", show_alert=True)
+        return
     country = call.data.split(":", 2)[2]
     if country == "custom":
         await state.set_state(TelegramAccountsState.custom_country)
@@ -301,29 +324,36 @@ async def tgacc_add_country_selected(call: CallbackQuery, state: FSMContext) -> 
         return
 
     await state.update_data(chosen_country=country)
-    await state.set_state(TelegramAccountsState.add_phone)
+    session_file = data.get("stock_session_file")
+    await state.set_state(TelegramAccountsState.add_session_file if session_file else TelegramAccountsState.add_phone)
     await call.answer()
     await edit(
         call,
-        f"🌍 Страна: <b>{html.escape(country)}</b>\n\n"
-        "📱 Введите номер телефона в международном формате\n"
-        "<i>Пример: <code>+79991234567</code> или <code>+12025550123</code>:</i>",
+        stock_entry_prompt(country, session_file),
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="tgacc:manager")]]),
     )
 
 
-@router.message(TelegramAccountsState.custom_country)
+def stock_entry_prompt(country: str, session_file: bool) -> str:
+    entry = (
+        "Пришлите файл Telethon <code>.session</code> документом. Бот проверит действующую сессию и получит номер из неё."
+        if session_file else
+        "Введите номер телефона в международном формате. Например, <code>+12025550123</code>."
+    )
+    return f"🌍 Страна: <b>{html.escape(country)}</b>\n\n{entry}"
+
+
+@router.message(TelegramAccountsState.custom_country, F.text, ~F.text.startswith("/"))
 async def tgacc_custom_country_entered(message: Message, state: FSMContext) -> None:
     country = (message.text or "").strip()
-    if not country:
-        await message.answer("Введите корректное название страны:")
+    if not 1 <= len(country) <= 128:
+        await message.answer("Введите название страны длиной до 128 символов.")
         return
+    session_file = (await state.get_data()).get("stock_session_file")
     await state.update_data(chosen_country=country)
-    await state.set_state(TelegramAccountsState.add_phone)
+    await state.set_state(TelegramAccountsState.add_session_file if session_file else TelegramAccountsState.add_phone)
     await message.answer(
-        f"🌍 Страна: <b>{html.escape(country)}</b>\n\n"
-        "📱 Введите номер телефона в международном формате\n"
-        "<i>Пример: <code>+79991234567</code>:</i>",
+        stock_entry_prompt(country, session_file),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="tgacc:manager")]]),
         parse_mode="HTML",
     )
@@ -332,8 +362,9 @@ async def tgacc_custom_country_entered(message: Message, state: FSMContext) -> N
 @router.message(TelegramAccountsState.add_phone)
 async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
     account = await active_account(message.from_user.id)
-    if not account:
-        await message.answer("Аккаунт Playerok не выбран.")
+    data = await state.get_data()
+    if not account or data.get("stock_account_id") != str(account.id):
+        await message.answer("Откройте добавление заново для выбранного аккаунта.", reply_markup=back_menu("tgacc:manager"))
         await state.clear()
         return
 
@@ -346,7 +377,6 @@ async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Некорректный формат номера. Введите номер с кодом страны, например: <code>+79991234567</code>", parse_mode="HTML")
         return
 
-    data = await state.get_data()
     country = data.get("chosen_country", "Другая")
 
     cfg = await get_or_create_config(account.id)
@@ -358,6 +388,7 @@ async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
 
     status_msg = await message.answer("⏳ Подключаюсь к Telegram и отправляю код запроса…")
 
+    client = None
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
@@ -373,8 +404,23 @@ async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В менеджер", callback_data="tgacc:manager")]]),
             parse_mode="HTML",
         )
-        await cleanup_pending_auth(message.from_user.id)
+        if client is not None:
+            with suppress(Exception):
+                await client.disconnect()
         await state.clear()
+        return
+
+    channel = getattr(res, "type", None)
+    channel_name = type(channel).__name__
+    code_notice = LOGIN_CODE_CHANNELS.get(channel_name)
+    if not code_notice or not getattr(res, "phone_code_hash", None):
+        with suppress(Exception):
+            await client.disconnect()
+        await state.clear()
+        await status_msg.edit_text(
+            "Telegram выбрал способ подтверждения, который бот не может принять. Можно добавить готовую сессию.",
+            reply_markup=back_menu("tgacc:add:file"),
+        )
         return
 
     # Сохраняем активный клиент в памяти
@@ -384,17 +430,92 @@ async def tgacc_phone_entered(message: Message, state: FSMContext) -> None:
         "phone_code_hash": res.phone_code_hash,
         "country": country,
         "account_id": account.id,
+        "text_code": channel_name in {"SentCodeTypeSmsWord", "SentCodeTypeSmsPhrase"},
     }
 
     await state.set_state(TelegramAccountsState.add_code)
     await status_msg.edit_text(
-        f"📨 <b>Код отправлен в Telegram!</b>\n\n"
+        f"📨 <b>{code_notice}</b>\n\n"
         f"📱 Номер: <code>{html.escape(clean_phone)}</code>\n"
         f"🌍 Страна: <b>{html.escape(country)}</b>\n\n"
-        "Введите 5-значный код подтверждения (например: <code>12345</code> или <code>1 2 3 4 5</code>):",
+        "Введите код подтверждения.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="tgacc:cancel_auth")]]),
         parse_mode="HTML",
     )
+
+
+@router.message(TelegramAccountsState.add_session_file, F.chat.type == ChatType.PRIVATE, F.document)
+async def tgacc_session_file_entered(message: Message, state: FSMContext, bot: Bot) -> None:
+    account = await active_account(message.from_user.id)
+    data = await state.get_data()
+    country = data.get("chosen_country")
+    if not account or data.get("stock_account_id") != str(account.id) or not country:
+        await state.clear()
+        await message.answer("Откройте импорт заново для выбранного аккаунта.", reply_markup=back_menu("tgacc:manager"))
+        return
+
+    document = message.document
+    if not (document.file_name or "").casefold().endswith(".session"):
+        await message.answer("Пришлите файл Telethon с расширением .session.")
+        return
+    if not document.file_size or document.file_size > MAX_SESSION_BYTES:
+        await message.answer("Пришлите непустой файл .session размером до 8 МБ.")
+        return
+    cfg = await get_or_create_config(account.id)
+    api_hash = cfg.api_hash or default_telegram_api_hash()
+    if not api_hash:
+        await message.answer("Сначала задайте API ID и API Hash.", reply_markup=back_menu("tgacc:settings"))
+        return
+    api_id = cfg.api_id if cfg.api_hash else default_telegram_api_id()
+
+    status = await message.answer("Проверяю сессию в Telegram…")
+    try:
+        with BytesIO() as buffer:
+            await bot.download(document, destination=buffer, timeout=25)
+            contents = buffer.getvalue()
+        phone, session_string = await verify_session_file(contents, api_id, api_hash)
+    except SessionFileError as exc:
+        await status.edit_text(str(exc), reply_markup=back_menu("tgacc:manager"))
+        return
+    except Exception as exc:
+        logger.warning("Telegram session file import failed (%s)", type(exc).__name__)
+        await status.edit_text(
+            "Не удалось скачать файл или подключиться к Telegram. Попробуйте ещё раз.",
+            reply_markup=back_menu("tgacc:manager"),
+        )
+        return
+
+    async with svc().db() as session:
+        seller = await session.get(PlayerokAccount, account.id, with_for_update=True)
+        if seller is None or seller.tg_user_id != message.from_user.id:
+            await state.clear()
+            await status.edit_text("Аккаунт Playerok больше недоступен.", reply_markup=back_menu("tgacc:manager"))
+            return
+        existing = await session.scalar(select(TelegramAccountStock.id).where(
+            TelegramAccountStock.account_id == account.id,
+            TelegramAccountStock.phone.in_([phone, phone.lstrip("+")]),
+        ).limit(1))
+        if existing is not None:
+            await status.edit_text("Этот номер уже есть на складе.", reply_markup=back_menu("tgacc:manager"))
+            return
+        session.add(TelegramAccountStock(
+            account_id=account.id, phone=phone, country=country,
+            session_encrypted=svc().cipher.encrypt(session_string),
+        ))
+        await session.commit()
+
+    await state.clear()
+    await status.edit_text(
+        "Сессия проверена и добавлена на склад.\n\n"
+        f"Номер: <code>{html.escape(phone)}</code>\nСтрана: <b>{html.escape(country)}</b>",
+        reply_markup=back_menu("tgacc:manager"),
+        parse_mode="HTML",
+    )
+
+
+@router.message(TelegramAccountsState.add_session_file, F.chat.type == ChatType.PRIVATE, ~F.document, ~F.text.startswith("/"))
+async def tgacc_session_file_expected(message: Message) -> None:
+    await message.answer("Пришлите .session как файл через «Документ».", reply_markup=back_menu("tgacc:manager"))
 
 
 @router.callback_query(F.data == "tgacc:cancel_auth")
@@ -414,9 +535,9 @@ async def tgacc_code_entered(message: Message, state: FSMContext) -> None:
         return
 
     code_raw = (message.text or "").strip()
-    clean_code = re.sub(r"\D", "", code_raw)
+    clean_code = code_raw if auth_data.get("text_code") else re.sub(r"\D", "", code_raw)
     if not clean_code:
-        await message.answer("Введите цифровой код:")
+        await message.answer("Введите код подтверждения.")
         return
 
     client = auth_data["client"]
