@@ -51,8 +51,10 @@ class RequestPlayerokError(Exception):
         self.response = response
         self.json = response.json()
         error = next((error for error in self.json.get("errors") or [] if isinstance(error, dict)), {})
-        self.error_code = (error.get("extensions") or {}).get("code")
-        self.error_message = error.get("message") or "Playerok не сообщил причину ошибки."
+        extensions = error.get("extensions")
+        self.error_code = extensions.get("code") if isinstance(extensions, dict) else None
+        message = error.get("message")
+        self.error_message = message if isinstance(message, str) and message.strip() else "Playerok не сообщил причину ошибки."
 
     def __str__(self):
         msg = (

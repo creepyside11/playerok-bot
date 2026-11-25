@@ -47,6 +47,11 @@ VIEWER_QUERY = """query viewer {
 }"""
 
 
+BALANCE_QUERY = """query viewerBalance {
+  viewer { id balance { value available frozen pendingIncome withdrawable } }
+}"""
+
+
 _PLAYEROK_INIT_LOCK = threading.RLock()
 
 
@@ -164,6 +169,22 @@ class PlayerokSession:
                 )
             return await asyncio.to_thread(_load)
 
+    async def balance(self) -> dict[str, Any]:
+        async with self.lock:
+            def _load() -> dict[str, Any]:
+                response = self.account.request(
+                    "post", f"{self.account.base_url}/graphql", {"accept": "application/json"},
+                    {"operationName": "viewerBalance", "query": BALANCE_QUERY, "variables": {}},
+                ).json()
+                viewer = (response.get("data") or {}).get("viewer")
+                if not viewer:
+                    raise UnauthorizedError()
+                balance = viewer.get("balance")
+                if not isinstance(balance, dict):
+                    raise ValueError("Missing Playerok balance")
+                return balance
+            return await asyncio.to_thread(_load)
+
     async def get_deals(self, *args: Any, **kwargs: Any) -> Any:
         return await self.call("get_deals", *args, **kwargs)
 
@@ -261,7 +282,7 @@ class PlayerokGateway:
     def __init__(self, cipher: SecretCipher):
         self.cipher = cipher
         self._cache: dict[str, tuple[str, PlayerokSession]] = {}
-        self._lock = asyncio.Lock()
+        self._locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _fingerprint(record: PlayerokAccount) -> str:
@@ -271,7 +292,7 @@ class PlayerokGateway:
     async def get_client(self, record: PlayerokAccount) -> PlayerokSession:
         key = str(record.id)
         fingerprint = self._fingerprint(record)
-        async with self._lock:
+        async with self._locks.setdefault(key, asyncio.Lock()):
             cached = self._cache.get(key)
             if cached and cached[0] == fingerprint:
                 return cached[1]
@@ -282,13 +303,14 @@ class PlayerokGateway:
                 requests_timeout=25,
             )
             client = PlayerokSession(account)
+            await client.refresh()
             self._cache[key] = (fingerprint, client)
-        await client.refresh()
-        return client
+            return client
 
     async def invalidate(self, account_id: Any) -> None:
-        async with self._lock:
-            self._cache.pop(str(account_id), None)
+        key = str(account_id)
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            self._cache.pop(key, None)
 
     async def validate_raw(
         self, cookies: str, proxy: str | None, user_agent: str = DEFAULT_USER_AGENT

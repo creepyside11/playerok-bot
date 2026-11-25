@@ -24,7 +24,7 @@ from app.models import DeliveryRule, PlayerokAccount, TelegramUser
 from app.states import ItemCreate, ItemEdit
 from app.worker import WorkerManager
 from playerokapi.enums import GameCategoryDataFieldTypes, ItemStatuses
-from playerokapi.exceptions import RequestSendingError
+from playerokapi.exceptions import RequestFailedError, RequestPlayerokError, RequestSendingError
 
 
 def item(price=900, status=ItemStatuses.DRAFT):
@@ -194,6 +194,7 @@ async def test_wizard_requires_native_buyer_message(monkeypatch, schema):
             message.text = "ABC-123"
             await handlers.item_fields(message, state)
         assert await state.get_state() == ItemCreate.buyer_message.state
+        assert "Комментарий" in message.answer.await_args.args[0]
         message.text = "-"
         await handlers.item_create_buyer_message(message, state)
         assert await state.get_state() == ItemCreate.buyer_message.state
@@ -300,3 +301,17 @@ async def test_ambiguous_publication_checks_actual_status_without_resending(stat
         assert result.status == state_after_publish
     client.publish_item.assert_awaited_once_with("lot", "free")
     assert client.get_item.await_count == 2
+
+def test_publication_details_include_nested_rejection_and_wire_reason():
+    response = MagicMock(status_code=400, text="")
+    response.json.return_value = {"errors": [
+        {"message": "Bad Request", "extensions": {
+            "code": "BAD_USER_INPUT", "originalError": {"message": ["Укажите комментарий покупателю."]},
+        }},
+    ]}
+    for error in (RequestPlayerokError(response), RequestFailedError(response)):
+        rendered = items_manager_ui._listing_error_detail(error)
+        assert "Укажите комментарий покупателю." in rendered
+    assert "тайм-аут" in items_manager_ui._listing_error_detail(RequestSendingError("playerok.com", "тайм-аут"))
+    listing = SimpleNamespace(status_description="Не заполнены данные товара")
+    assert "Не заполнены данные товара" in items_manager_ui._publication_status_detail(listing)

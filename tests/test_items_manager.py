@@ -318,7 +318,7 @@ def test_publish_known_document_validation_failure_can_retry_without_old_fields(
     first, second = request.call_args_list
     assert len(second.args[3]["query"]) < len(first.args[3]["query"])
     assert first.args[3]["variables"]["input"] == second.args[3]["variables"]["input"] == {
-        "itemId": "lot", "priorityStatuses": ["regular"], "transactionProviderId": "LOCAL",
+        "itemId": "lot", "priorityStatuses": ["regular"], "transactionProviderId": "LOCAL", "keepInSale": False,
     }
 
 

@@ -75,10 +75,16 @@ async def publication_tariffs(client: Any, item_id: str, price: int) -> list[Pub
 
 async def publication_balance(client: Any) -> Decimal | None:
     try:
-        viewer = await client.viewer()
+        balance = await client.balance()
+        available = amount(balance.get("available")) if isinstance(balance, dict) else None
+        if available is not None:
+            return available
+    except Exception:
+        pass
+    try:
+        return amount((await client.viewer()).available_balance)
     except Exception:
         return None
-    return amount(viewer.available_balance)
 
 
 async def confirm_publication(

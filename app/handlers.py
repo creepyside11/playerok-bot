@@ -11,13 +11,12 @@ from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from playerokapi.exceptions import RequestPlayerokError
 
 from .config import mini_app_url
 from .crypto import SecretCipher
@@ -28,6 +27,7 @@ from .item_delivery import (
 from .item_publication import parse_discount_price, tariff_price
 from .keyboards import auth_method_menu, back_menu, delivery_mode_menu, main_menu
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, PlayerokAccount, TelegramUser, fresh_settings
+from .playerok_errors import playerok_error_text
 from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, normalize_proxy
 from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate
 
@@ -129,9 +129,18 @@ def settings(account: PlayerokAccount) -> dict[str, Any]:
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
+async def start(message: Message, state: FSMContext, command: CommandObject | None = None) -> None:
     await state.clear()
     account = await active_account(message.from_user.id)
+    if command and command.args == "tg_accounts" and account and message.chat.type == ChatType.PRIVATE:
+        await message.answer(
+            f"ТГ-аккаунты · @{account.username}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть склад в боте", callback_data="tgacc:manager")],
+                [InlineKeyboardButton(text="Управление плагином", callback_data="tgacc:open")],
+            ]),
+        )
+        return
     tail = f"\n\nАктивный: <b>{html.escape(account.username)}</b>" if account else "\n\nPlayerok аккаунт не подключён."
     await message.answer(
         "🤖 <b>Playerok Bot</b>\nУправление магазином и автоматизация." + tail,
@@ -1757,12 +1766,16 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
             attachments=[base64.b64decode(photo) for photo in data.get("attachments_b64", [])],
             comment=comment,
         )
+        if item is None or not item.id:
+            raise ValueError("Missing Playerok draft")
+        prices = int(item.price), tariff_price(item)
     except Exception as exc:
         logger.warning("Playerok draft creation failed (%s)", type(exc).__name__)
-        if isinstance(exc, RequestPlayerokError):
-            detail = f"Playerok отклонил черновик:\n<code>{html.escape(clip(exc.error_message, 300))}</code>"
-        else:
-            detail = "Playerok не подтвердил создание. Проверьте список товаров перед повтором."
+        detail = (
+            "Playerok не подтвердил создание черновика.\n"
+            f"<code>{html.escape(playerok_error_text(exc))}</code>\n"
+            "Перед повтором проверьте список черновиков."
+        )
         await wait_msg.edit_text(
             detail,
             parse_mode="HTML",
@@ -1774,7 +1787,7 @@ async def create_draft(target: Message, state: FSMContext, tg_id: int) -> None:
         return
 
     await state.update_data(
-        new_item_id=str(item.id), item_sale_price=int(item.price), item_price=tariff_price(item),
+        new_item_id=str(item.id), item_sale_price=prices[0], item_price=prices[1],
         attachments_b64=[], data_field_values={}, buyer_message=None,
     )
     await state.set_state(ItemCreate.priority)
@@ -1809,7 +1822,7 @@ async def _show_draft_review(target: CallbackQuery | Message, data: dict[str, An
     text = (
         f"📝 <b>Черновик · {html.escape(data['item_name'])}</b>\n\n"
         f"Цена продажи: {price_line}\n"
-        "Сообщение покупателю сохранено в лоте Playerok."
+        "Комментарий покупателю сохранён в лоте Playerok."
     )
     if isinstance(target, CallbackQuery):
         await edit(target, text, markup)

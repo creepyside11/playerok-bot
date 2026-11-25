@@ -13,13 +13,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .handlers import active_account, clip, edit, require_account, svc
 from playerokapi.enums import ItemStatuses
-from playerokapi.exceptions import (
-    BotCheckDetectedException, RequestFailedError, RequestPlayerokError, UnauthorizedError,
-)
 
 from .item_delivery import (
-    BUYER_MESSAGE_ERROR, BUYER_MESSAGE_PROMPT, buyer_message_field_id,
-    get_item_data_fields, item_delivery_payload, valid_buyer_message,
+    BUYER_MESSAGE_ERROR, BUYER_MESSAGE_PROMPT, ListingFieldsUnavailable,
+    listing_comment_update, valid_buyer_message,
 )
 from .item_publication import (
     PublicationChanged, PublicationUnconfirmed, can_publish, confirm_publication, parse_discount_price,
@@ -27,6 +24,7 @@ from .item_publication import (
     publication_tariffs, rubles, tariff_price,
 )
 from .keyboards import back_menu
+from .playerok_errors import playerok_error_text, strip_error_detail
 from .states import ItemCreate, ItemEdit
 
 logger = logging.getLogger("items_manager")
@@ -191,7 +189,7 @@ async def render_item_card(target: CallbackQuery | Message, account: Any, client
         InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"item:edit:desc:{item_id}"),
     )
     builder.row(
-        InlineKeyboardButton(text="✉️ Сообщение после покупки", callback_data=f"item:edit:goods:{item_id}"),
+        InlineKeyboardButton(text="✉️ Комментарий покупателю", callback_data=f"item:edit:goods:{item_id}"),
     )
     builder.row(
         InlineKeyboardButton(text=f"🖼 Фото ({photos_count})", callback_data=f"item:edit:photo:{item_id}"),
@@ -493,39 +491,21 @@ async def item_save_buyer_message(message: Message, state: FSMContext) -> None:
     try:
         client = await svc().gateway.get_client(account)
         item = await client.get_item(item_id)
-        obtaining_id = getattr(item.obtaining_type, "id", None)
-        fields = await get_item_data_fields(client, str(item.category.id), obtaining_id)
-        message_field_id = buyer_message_field_id(fields)
-        if message_field_id is None:
-            await client.update_item(item_id, comment=text)
-        else:
-            other_fields = {str(field.id): field for field in fields if str(field.id) != message_field_id}
-            current = {str(field.id): field.value for field in item.data_fields if field and str(field.id) in other_fields}
-            unreadable = any(
-                not current.get(field_id) and (field.required or field_id in current)
-                for field_id, field in other_fields.items()
-            )
-            if unreadable:
-                markup = InlineKeyboardBuilder()
-                if item.slug:
-                    markup.button(text="Редактировать на Playerok", url=f"https://playerok.com/products/{item.slug}/edit")
-                markup.button(text="Назад к лоту", callback_data=f"item:view:{item_id}")
-                markup.adjust(1)
-                await message.answer(
-                    "Playerok скрыл часть полей этого лота. Откройте его на сайте, чтобы изменить сообщение и сохранить поля.",
-                    reply_markup=markup.as_markup(),
-                )
-                return
-            _, values = item_delivery_payload(text, message_field_id, current)
-            await client.update_item(item_id, data_fields=values)
-    except RequestPlayerokError as exc:
-        await message.answer(f"Playerok не принял сообщение: {clip(exc.error_message, 300)}")
+        patch = await listing_comment_update(client, item, text)
+        await client.update_item(item_id, **patch)
+    except ListingFieldsUnavailable as exc:
+        markup = InlineKeyboardBuilder()
+        if item.slug:
+            markup.button(text="Редактировать на Playerok", url=f"https://playerok.com/products/{item.slug}/edit")
+        markup.button(text="Назад к лоту", callback_data=f"item:view:{item_id}")
+        markup.adjust(1)
+        await message.answer(str(exc), reply_markup=markup.as_markup())
         return
-    except Exception:
-        await message.answer("Не удалось сохранить сообщение в Playerok. Попробуйте ещё раз.")
+    except Exception as exc:
+        await message.answer(f"Не удалось сохранить комментарий.\n{playerok_error_text(exc)}")
         return
     await state.clear()
-    await message.answer("Сообщение покупателю сохранено в Playerok.")
+    await message.answer("Комментарий покупателю сохранён в Playerok.")
     await render_item_card(message, account, client, item_id)
 
 
@@ -721,14 +701,17 @@ def _publication_actions(item_id: str, back: str, slug: str | None = None) -> In
 
 
 def _listing_error_detail(exc: Exception) -> str:
-    if isinstance(exc, RequestPlayerokError):
-        code = f" [{exc.error_code}]" if exc.error_code else ""
-        return f"\n<code>{html.escape(clip(exc.error_message + code, 450))}</code>"
-    if isinstance(exc, (BotCheckDetectedException, UnauthorizedError)):
-        return "\nPlayerok запросил проверку входа. Откройте сайт и проверьте подключение аккаунта."
-    if isinstance(exc, RequestFailedError):
-        return f"\nHTTP {exc.status_code} от Playerok."
-    return ""
+    return f"\n<code>{html.escape(playerok_error_text(exc))}</code>"
+
+
+def _publication_status_detail(item: Any) -> str:
+    payment = getattr(item, "status_payment", None)
+    messages = [
+        strip_error_detail(text)
+        for model in (item, payment)
+        if isinstance((text := getattr(model, "status_description", None)), str) and text.strip()
+    ]
+    return "".join(f"\n<code>{html.escape(text)}</code>" for text in dict.fromkeys(messages))
 
 
 async def _show_publication(
@@ -748,7 +731,8 @@ async def _show_publication(
         if not can_publish(item):
             await edit(
                 call,
-                f"Публикация сейчас недоступна. Статус на Playerok: {item_status_badge(item.status)}",
+                f"Публикация сейчас недоступна. Статус на Playerok: {item_status_badge(item.status)}"
+                + (_publication_status_detail(item) or "\nPlayerok не указал причину ограничения."),
                 _publication_actions(item_id, back, getattr(item, "slug", None)),
             )
             return
@@ -865,7 +849,11 @@ async def item_publish_confirm(call: CallbackQuery, state: FSMContext) -> None:
         return
     except PublicationUnconfirmed as exc:
         current_status = item_status_badge(getattr(exc.item, "status", None))
-        detail = _listing_error_detail(exc.failure) if exc.failure else ""
+        detail = _publication_status_detail(exc.item)
+        if exc.failure:
+            detail += _listing_error_detail(exc.failure)
+        if not detail:
+            detail = "\nPlayerok вернул этот статус без пояснения. Проверьте карточку лота на сайте."
         await edit(call, f"Playerok пока не подтвердил публикацию. Статус: {current_status}{detail}", actions)
         return
     except Exception as exc:

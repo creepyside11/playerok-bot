@@ -240,12 +240,18 @@ class Account:
             "x-timezone-offset": "-240",
             "x-apollo-operation-name": x_gql_op
         }
-        headers = {k: v for k, v in _headers.items() if k not in headers.keys()}
+        listing_paths = {
+            "createItem": "/sell", "updateItem": "/products/[slug]/edit",
+            "publishItem": "/products/[slug]", "itemPriorityStatuses": "/products/[slug]",
+        }
+        if x_gql_op in listing_paths:
+            _headers["x-gql-path"] = listing_paths[x_gql_op]
+        headers = {**_headers, **headers}
 
         def make_req():
             err = ""
 
-            attempts = 1 if x_gql_op in {"createItem", "publishItem"} else 3
+            attempts = 1 if x_gql_op in {"createItem", "updateItem", "publishItem"} else 3
             for _ in range(attempts):
                 try:
                     if method == "get":
@@ -1476,7 +1482,8 @@ class Account:
                 "input": {
                     "transactionProviderId": transaction_provider_id.name,
                     "priorityStatuses": [priority_status_id],
-                    "itemId": item_id
+                    "itemId": item_id,
+                    "keepInSale": False
                 }
             }
         }

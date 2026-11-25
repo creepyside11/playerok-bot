@@ -8,12 +8,14 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
 import pytest
+from aiohttp import FormData
 from aiohttp.test_utils import TestClient, TestServer
 
 from app.db import init_db, make_engine, make_session_factory
 from app.miniapp import MAX_AUTH_AGE, MiniApp, validate_telegram_user
 from app.models import PlayerokAccount, TelegramUser
 from app.plugin_system import PluginManager, PluginSpec
+from app.telegram_accounts_manager import TelegramAccountStock
 
 
 TOKEN = "12345:local_test_token"
@@ -152,5 +154,77 @@ async def test_portal_uses_owned_accounts_shared_plugin_state_and_chats(tmp_path
             updated = await client.patch(f"{base}/notifications", headers=authorize(), json={"new_message": False})
             assert (await updated.json())["new_message"] is False
             assert (await (await client.get(f"{base}/notifications", headers=authorize())).json())["new_message"] is False
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_balance_listing_edits_and_telegram_settings_are_scoped(tmp_path):
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/seller.db")
+    await init_db(engine)
+    db = make_session_factory(engine)
+    try:
+        async with db() as session:
+            session.add(TelegramUser(id=101))
+            await session.flush()
+            account = PlayerokAccount(
+                tg_user_id=101, playerok_user_id="seller-1", username="seller",
+                cookies_encrypted="private", user_agent="test",
+            )
+            session.add(account)
+            await session.flush()
+            session.add(TelegramAccountStock(
+                account_id=account.id, country="🇺🇸 США", phone="hidden-phone",
+                session_encrypted="private-session",
+            ))
+            await session.commit()
+
+        lot = NS(id="owned-lot", name="Свой лот", description="Описание", price=190, raw_price=190,
+                 status="DRAFT", slug="owned", is_editable=True, attachments=[], user=NS(id="seller-1"))
+        foreign = NS(id="foreign-lot", user=NS(id="someone-else"))
+        pok = AsyncMock()
+        pok.balance.return_value = {"available": "17.50", "value": 20, "frozen": 2.5}
+        pok.get_item.side_effect = lambda item_id: {"owned-lot": lot, "foreign-lot": foreign}.get(item_id)
+        pok.update_item.return_value = NS(**(vars(lot) | {"name": "Новое название", "price": 210}))
+        gateway = NS(get_client=AsyncMock(return_value=pok))
+
+        async with TestClient(TestServer(MiniApp(db, gateway, PluginManager(db), TOKEN).create_app())) as client:
+            base = f"/api/accounts/{account.id}"
+            headers = authorize()
+            balance = await client.get(f"{base}/balance", headers=headers)
+            assert (await balance.json())["available"] == "17.50"
+            entry = await client.get(f"{base}/listings/owned-lot", headers=headers)
+            assert (await entry.json())["name"] == "Свой лот"
+            forbidden = await client.patch(f"{base}/listings/foreign-lot", headers=headers, json={"price": 1})
+            assert forbidden.status == 404
+            saved = await client.patch(f"{base}/listings/owned-lot", headers=headers, json={"name": "Новое название", "price": 210})
+            assert saved.status == 200
+            assert (await saved.json())["price"] == 210
+            pok.update_item.assert_awaited_once_with("owned-lot", name="Новое название", price=210)
+            payload = FormData()
+            payload.add_field("image", b"\x89PNG\r\n\x1a\nimage", filename="cover.png", content_type="image/png")
+            uploaded = await client.post(f"{base}/listings/owned-lot/photo", headers=headers, data=payload)
+            assert uploaded.status == 200
+
+            group = f"{base}/telegram-accounts"
+            contents = await client.get(group, headers=headers)
+            data = await contents.json()
+            assert data["stock"][0]["available"] == 1
+            assert "hidden-phone" not in str(data) and "private-session" not in str(data)
+            secret = "a" * 32
+            updated = await client.patch(group, headers=headers, json={"apiId": 4321, "apiHash": secret})
+            stored = await updated.json()
+            assert stored == {"apiId": 4321, "apiHashSet": True, "defaults": False}
+            assert secret not in str(stored)
+            wrong = await client.post(f"{group}/rules", headers=headers, json={"lotId": "foreign-lot", "country": "🇺🇸 США"})
+            assert wrong.status == 404
+            rule = await client.post(f"{group}/rules", headers=headers, json={"lotId": "owned-lot", "country": "🇺🇸 США"})
+            assert rule.status == 201
+            rule_path = f"{group}/rules/{(await rule.json())['id']}"
+            changed = await client.patch(rule_path, headers=headers, json={"enabled": False, "country": "🇩🇪 Германия"})
+            assert (await changed.json())["enabled"] is False
+            result = await client.get(group, headers=headers)
+            assert (await result.json())["rules"][0]["country"] == "🇩🇪 Германия"
+            removed = await client.delete(rule_path, headers=headers)
+            assert removed.status == 200
     finally:
         await engine.dispose()

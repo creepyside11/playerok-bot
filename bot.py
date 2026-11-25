@@ -118,7 +118,7 @@ async def main() -> None:
             pass
 
     try:
-        web_runner = await start_miniapp(settings, session_factory, gateway, plugin_manager)
+        web_runner = await start_miniapp(settings, session_factory, gateway, plugin_manager, bot_profile=bot.me)
         worker_task = asyncio.create_task(worker.run(), name="playerok-worker")
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:

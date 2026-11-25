@@ -6,9 +6,9 @@ from playerokapi.enums import GameCategoryDataFieldTypes
 from playerokapi.types import GameCategoryDataField
 
 
-BUYER_MESSAGE_LABEL = "Сообщение покупателю после покупки"
+BUYER_MESSAGE_LABEL = "Комментарий · сообщение покупателю после покупки"
 BUYER_MESSAGE_PROMPT = f"✉️ <b>{BUYER_MESSAGE_LABEL}</b>\n\n"
-BUYER_MESSAGE_ERROR = "Введите сообщение покупателю от 2 до 2048 символов. Это обязательное поле."
+BUYER_MESSAGE_ERROR = "Введите комментарий покупателю от 2 до 2048 символов. Это обязательное поле."
 SKIP_VALUES = {"", "-", "—", "пропуск", "пропустить", "skip"}
 
 
@@ -60,3 +60,30 @@ def item_delivery_payload(
     if message_field_id is None:
         return message.strip(), fields
     return None, {**fields, message_field_id: message.strip()}
+
+
+class ListingFieldsUnavailable(ValueError):
+    pass
+
+
+async def listing_comment_update(client: Any, item: Any, text: str) -> dict[str, Any]:
+    method = getattr(item.obtaining_type, "id", None)
+    fields = await get_item_data_fields(client, str(item.category.id), method)
+    message_id = buyer_message_field_id(fields)
+    if message_id is None:
+        return {"comment": text}
+
+    other_fields = {str(field.id): field for field in fields if str(field.id) != message_id}
+    current = {
+        str(field.id): field.value
+        for field in item.data_fields or [] if field and str(field.id) in other_fields
+    }
+    if any(
+        not current.get(field_id) and (field.required or field_id in current)
+        for field_id, field in other_fields.items()
+    ):
+        raise ListingFieldsUnavailable(
+            "Playerok скрыл часть полей лота. Измените комментарий на сайте, чтобы сохранить остальные данные."
+        )
+    _, values = item_delivery_payload(text, message_id, current)
+    return {"data_fields": values}

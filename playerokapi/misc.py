@@ -73,7 +73,8 @@ mutation publishItem($input: PublishItemInput!) {
     __typename id name slug status price rawPrice
     ... on MyItem {
       priority
-      statusPayment { id status props { paymentURL } }
+      statusDescription
+      statusPayment { id status statusDescription props { paymentURL } }
     }
   }
 }"""

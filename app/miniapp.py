@@ -17,11 +17,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from playerokapi.enums import ChatTypes, ItemDealDirections, ItemStatuses
-from playerokapi.exceptions import BotCheckDetectedException, UnauthorizedError
+from playerokapi.exceptions import (
+    BotCheckDetectedException, RequestFailedError, RequestPlayerokError, RequestSendingError, UnauthorizedError,
+)
+from playerokapi.types import MyItem
 
 from .config import Settings
+from .item_delivery import BUYER_MESSAGE_ERROR, ListingFieldsUnavailable, listing_comment_update, valid_buyer_message
+from .item_publication import amount
+from .miniapp_telegram import TelegramPluginSettings, country_value
 from .models import DEFAULT_SETTINGS, PlayerokAccount, TelegramUser
 from .playerok import PlayerokGateway
+from .playerok_errors import playerok_error_text
 from .plugin_system import PluginManager, PluginSpec
 
 
@@ -29,6 +36,7 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).with_name("miniapp_static")
 MAX_AUTH_AGE = 12 * 60 * 60
 PAGE_SIZE = 20
+MAX_PHOTO_SIZE = 10 * 1024 * 1024
 CHAT_TYPES = {kind.name: kind for kind in ChatTypes}
 SECRET_KEY = re.compile(r"token|secret|password|passwd|apikey|apihash|cookie|session|proxy|privatekey|goldenkey|accesskey|authorization|credentials")
 NOTIFICATIONS = DEFAULT_SETTINGS["notifications"]
@@ -139,6 +147,36 @@ def listing_json(item: Any) -> dict[str, Any]:
     }
 
 
+def listing_details_json(item: Any) -> dict[str, Any]:
+    return {
+        **listing_json(item),
+        "description": getattr(item, "description", "") or "",
+        "basePrice": getattr(item, "raw_price", None),
+        "editable": getattr(item, "is_editable", None) is not False,
+        "photos": [
+            {"id": str(photo.id), "url": url}
+            for photo in getattr(item, "attachments", None) or []
+            if (url := media_url(getattr(photo, "url", None)))
+        ],
+    }
+
+
+def balance_json(balance: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        dest: format(value, "f") if (value := amount(balance.get(source))) is not None else None
+        for dest, source in {
+            "total": "value", "available": "available", "frozen": "frozen",
+            "pending": "pendingIncome", "withdrawable": "withdrawable",
+        }.items()
+    }
+
+
+def resource_id(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+        raise web.HTTPBadRequest(reason="Некорректный ID лота.")
+    return value
+
+
 def deal_json(deal: Any) -> dict[str, Any]:
     item = getattr(deal, "item", None)
     chat = getattr(deal, "chat", None)
@@ -215,12 +253,14 @@ def setting_value(meta: dict[str, Any], value: Any) -> Any:
 class MiniApp:
     def __init__(
         self, db: async_sessionmaker[AsyncSession], gateway: PlayerokGateway,
-        plugins: PluginManager, token: str,
+        plugins: PluginManager, token: str, bot_profile: Any = None,
     ) -> None:
         self.db = db
         self.gateway = gateway
         self.plugins = plugins
         self.token = token
+        self.bot_profile = bot_profile
+        self.telegram_plugins = TelegramPluginSettings(db)
 
     @web.middleware
     async def middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
@@ -237,8 +277,8 @@ class MiniApp:
             return await handler(request)
         except web.HTTPException as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
-        except (BotCheckDetectedException, UnauthorizedError):
-            return web.json_response({"error": "Проверьте подключение аккаунта Playerok в боте."}, status=502)
+        except (BotCheckDetectedException, UnauthorizedError, RequestFailedError, RequestPlayerokError, RequestSendingError) as exc:
+            return web.json_response({"error": playerok_error_text(exc)}, status=502)
         except Exception as exc:
             logger.warning("Mini App %s failed: %s", request.match_info.route.name, type(exc).__name__)
             return web.json_response({"error": "Playerok временно не вернул данные. Попробуйте обновить экран."}, status=502)
@@ -283,8 +323,15 @@ class MiniApp:
             ).order_by(PlayerokAccount.created_at)))
         active = next((row for row in accounts if user and row.id == user.active_account_id), None)
         active = active or next(iter(accounts), None)
+        bot_name = None
+        if self.bot_profile is not None:
+            try:
+                bot_name = getattr(await self.bot_profile(), "username", None)
+            except Exception:
+                pass
         return web.json_response({
             "name": str(identity.get("first_name") or "Продавец")[:80],
+            "botUsername": bot_name,
             "accounts": [account_json(row) for row in accounts],
             "activeAccountId": str(active.id) if active else None,
         })
@@ -300,21 +347,28 @@ class MiniApp:
     async def overview(self, request: web.Request) -> web.Response:
         account = await self.account(request)
         client = await self.gateway.get_client(account)
-        viewer, lots, deals, enabled = await asyncio.gather(
-            client.viewer(),
+        balance, lots, deals, enabled = await asyncio.gather(
+            client.balance(),
             client.call("get_my_items", statuses=[ItemStatuses.APPROVED], count=1),
             client.get_deals(direction=ItemDealDirections.OUT, count=5),
             self.plugins.count_enabled(account.id),
             return_exceptions=True,
         )
+        details = balance_json(balance) if isinstance(balance, dict) else None
         return web.json_response({
-            "balance": getattr(viewer, "available_balance", None),
+            "balance": details["available"] if details else None,
+            "balanceDetails": details,
             "unread": getattr(getattr(client, "account", None), "unread_chats_counter", None),
             "lots": getattr(lots, "total_count", None),
             "plugins": enabled if isinstance(enabled, int) else None,
             "deals": [deal_json(deal) for deal in getattr(deals, "deals", []) or [] if deal],
-            "partial": any(isinstance(result, Exception) for result in (viewer, lots, deals, enabled)),
+            "partial": any(isinstance(result, Exception) for result in (balance, lots, deals, enabled)),
         })
+
+    async def balance(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        return web.json_response(balance_json(await client.balance()))
 
     async def chats(self, request: web.Request) -> web.Response:
         account = await self.account(request)
@@ -379,6 +433,104 @@ class MiniApp:
         page = await client.call("get_my_items", statuses=states, count=PAGE_SIZE, after_cursor=cursor(request))
         return web.json_response(paginate(page, "items", listing_json))
 
+    @staticmethod
+    async def owned_listing(client: Any, account: PlayerokAccount, item_id: str) -> Any:
+        item = await client.get_item(resource_id(item_id))
+        owner = getattr(getattr(item, "user", None), "id", None)
+        if item is None or (str(owner) != account.playerok_user_id and (owner or not isinstance(item, MyItem))):
+            raise web.HTTPNotFound(reason="Лот этого аккаунта не найден.")
+        return item
+
+    async def listing(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        item = await self.owned_listing(client, account, request.match_info["item_id"])
+        if request.method == "GET":
+            return web.json_response(listing_details_json(item))
+        if getattr(item, "is_editable", None) is False:
+            raise web.HTTPForbidden(reason="Playerok пока не разрешает редактировать этот лот.")
+        body = await read_json(request)
+        if not body or set(body) - {"name", "description", "price", "comment"}:
+            raise web.HTTPBadRequest(reason="Некорректные поля лота.")
+        patch: dict[str, Any] = {}
+        for key, label, limit in (("name", "Название", 120), ("description", "Описание", 4096)):
+            if key in body:
+                value = body[key]
+                if not isinstance(value, str) or not 1 <= len(value.strip()) <= limit:
+                    raise web.HTTPBadRequest(reason=f"{label} должно содержать от 1 до {limit} символов.")
+                patch[key] = value.strip()
+        if "price" in body:
+            if type(body["price"]) is not int or not 1 <= body["price"] <= 10_000_000:
+                raise web.HTTPBadRequest(reason="Введите целую цену от 1 до 10 000 000 ₽.")
+            patch["price"] = body["price"]
+        if "comment" in body:
+            text = body["comment"]
+            if not isinstance(text, str) or not valid_buyer_message(text):
+                raise web.HTTPBadRequest(reason=BUYER_MESSAGE_ERROR)
+            try:
+                patch.update(await listing_comment_update(client, item, text.strip()))
+            except ListingFieldsUnavailable as exc:
+                raise web.HTTPConflict(reason=str(exc)) from exc
+        updated = await client.update_item(str(item.id), **patch)
+        if updated is None:
+            raise web.HTTPBadGateway(reason="Playerok не подтвердил сохранение. Обновите лот перед повтором.")
+        return web.json_response(listing_details_json(updated))
+
+    async def photo(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        item = await self.owned_listing(client, account, request.match_info["item_id"])
+        if getattr(item, "is_editable", None) is False:
+            raise web.HTTPForbidden(reason="Playerok пока не разрешает редактировать этот лот.")
+        if request.content_type != "multipart/form-data":
+            raise web.HTTPUnsupportedMediaType(reason="Ожидается файл изображения.")
+        remove = request.query.get("replace")
+        attachments = getattr(item, "attachments", None) or []
+        if remove and remove not in {str(entry.id) for entry in attachments}:
+            raise web.HTTPBadRequest(reason="Фотография лота не найдена.")
+        if not remove and len(attachments) >= 10:
+            raise web.HTTPBadRequest(reason="У лота уже десять фотографий. Выберите фото для замены.")
+        reader = await request.multipart()
+        entry = await reader.next()
+        if entry is None or entry.name != "image" or not entry.filename:
+            raise web.HTTPBadRequest(reason="Выберите фотографию.")
+        picture = bytearray()
+        while chunk := await entry.read_chunk(65536):
+            picture.extend(chunk)
+            if len(picture) > MAX_PHOTO_SIZE:
+                raise web.HTTPRequestEntityTooLarge(max_size=MAX_PHOTO_SIZE, actual_size=len(picture))
+        if not (
+            picture.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"))
+            or picture[:4] == b"RIFF" and picture[8:12] == b"WEBP"
+        ):
+            raise web.HTTPBadRequest(reason="Поддерживаются изображения JPEG, PNG и WebP.")
+        updated = await client.update_item(
+            str(item.id), add_attachments=[bytes(picture)], remove_attachments=[remove] if remove else None,
+        )
+        if updated is None:
+            raise web.HTTPBadGateway(reason="Playerok не подтвердил загрузку. Обновите лот перед повтором.")
+        return web.json_response(listing_details_json(updated))
+
+    async def telegram_plugin(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        if request.method == "GET":
+            return web.json_response(await self.telegram_plugins.panel(account))
+        return web.json_response(await self.telegram_plugins.configure(account, await read_json(request)))
+
+    async def telegram_plugin_bind(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        body = await read_json(request)
+        country = country_value(body.get("country"))
+        client = await self.gateway.get_client(account)
+        item = await self.owned_listing(client, account, resource_id(body.get("lotId")))
+        return web.json_response(await self.telegram_plugins.bind(account, item, country), status=201)
+
+    async def telegram_plugin_rule(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        rule_id = int(request.match_info["rule_id"])
+        body = None if request.method == "DELETE" else await read_json(request)
+        return web.json_response(await self.telegram_plugins.update_rule(account, rule_id, body))
+
     async def plugin_json(self, account: PlayerokAccount, plugin: PluginSpec) -> dict[str, Any]:
         enabled, config = await self.plugins.resolved_state(account.id, plugin)
         fields = []
@@ -396,6 +548,7 @@ class MiniApp:
         return {
             "id": plugin.id, "name": plugin.name, "version": plugin.version,
             "description": plugin.description, "enabled": enabled, "fields": fields,
+            "telegramAccounts": plugin.id == "telegram_accounts",
         }
 
     async def installed_plugins(self, request: web.Request) -> web.Response:
@@ -451,12 +604,21 @@ class MiniApp:
         for method, path, handler in (
             ("PATCH", "/active", self.select_account),
             ("GET", "/overview", self.overview),
+            ("GET", "/balance", self.balance),
             ("GET", "/chats", self.chats),
             ("GET", "/chats/{chat_id}", self.history),
             ("POST", "/chats/{chat_id}/reply", self.reply),
             ("POST", "/chats/{chat_id}/read", self.read_chat),
             ("GET", "/deals", self.deals),
             ("GET", "/listings", self.listings),
+            ("GET", "/listings/{item_id}", self.listing),
+            ("PATCH", "/listings/{item_id}", self.listing),
+            ("POST", "/listings/{item_id}/photo", self.photo),
+            ("GET", "/telegram-accounts", self.telegram_plugin),
+            ("PATCH", "/telegram-accounts", self.telegram_plugin),
+            ("POST", "/telegram-accounts/rules", self.telegram_plugin_bind),
+            ("PATCH", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),
+            ("DELETE", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),
             ("GET", "/plugins", self.installed_plugins),
             ("PATCH", "/plugins/{plugin_id}", self.update_plugin),
             ("GET", "/notifications", self.notification_settings),
@@ -468,8 +630,9 @@ class MiniApp:
 
 async def start_miniapp(
     settings: Settings, db: async_sessionmaker[AsyncSession], gateway: PlayerokGateway, plugins: PluginManager,
+    *, bot_profile: Any = None,
 ) -> web.AppRunner:
-    runner = web.AppRunner(MiniApp(db, gateway, plugins, settings.bot_token).create_app(), access_log=None)
+    runner = web.AppRunner(MiniApp(db, gateway, plugins, settings.bot_token, bot_profile).create_app(), access_log=None)
     await runner.setup()
     try:
         await web.TCPSite(runner, "0.0.0.0", settings.port).start()

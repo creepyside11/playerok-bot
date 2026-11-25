@@ -68,6 +68,13 @@ let chatHistory = null;
 let chatError = null;
 let replyDraft = "";
 let toastTimer = 0;
+let latestBalance = null;
+let editedListing = null;
+let telegramPanel = null;
+let telegramTab = "stock";
+let telegramLots = [];
+let telegramLotsCursor = null;
+let drawerSequence = 0;
 
 function icon(name, extra = "") {
   return `<svg class="icon ${extra}" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -119,8 +126,9 @@ function path(section = "") {
 
 async function request(url, { method = "GET", body } = {}) {
   const headers = { Authorization: `tma ${initData}` };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const form = body instanceof FormData;
+  if (!form && body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(url, { method, headers, body: form || body === undefined ? body : JSON.stringify(body) });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || "Не удалось получить данные.");
   return data;
@@ -210,6 +218,7 @@ function overview() {
         <div class="panel">${panel.deals.length ? dealRows(panel.deals) : placeholder("Сделок пока нет", "", "bag")}</div>
       </section>
       <section>${title("Управление")}<div class="quick-list">
+        ${quick("Мои лоты", "Просмотр и редактирование", "layers", "myListings")}
         ${quick("Плагины", panel.plugins === null ? "Настройки плагинов" : `Активных: ${count(panel.plugins)}`, "plug", "nav", "plugins")}
         ${quick("Уведомления", "Настроить события бота", "bell", "nav", "accounts")}
       </div></section>
@@ -289,18 +298,15 @@ function chats() {
 }
 
 function listingRows(list) {
-  return list.map((entry) => {
-    const inner = `${avatar(entry.name, entry.cover)}<span class="row-text"><strong>${safe(entry.name)}</strong></span>
-      <span class="row-right"><strong>${rubles(entry.price)}</strong>${status(entry.status)}</span>`;
-    const data = `class="listing-row" data-search="${safe(entry.name)}"`;
-    return entry.slug
-      ? `<button ${data} data-action="listing" data-value="${safe(entry.slug)}" title="Открыть на Playerok">${inner}${icon("external", "caret")}</button>`
-      : `<div ${data}>${inner}</div>`;
-  }).join("");
+  return list.map((entry) => `<button class="listing-row" data-search="${safe(entry.name)}"
+      data-action="editListing" data-value="${safe(entry.id)}" title="Открыть лот">
+    ${avatar(entry.name, entry.cover)}<span class="row-text"><strong>${safe(entry.name)}</strong></span>
+    <span class="row-right"><strong>${rubles(entry.price)}</strong>${status(entry.status)}</span>
+    ${icon("settings", "caret")}</button>`).join("");
 }
 
 function sales() {
-  const bar = `<div class="toolbar">${tabs([["deals", "Сделки"], ["listings", "Лоты"]], salesTab, "salesTab", "Раздел продаж")}${search("Поиск по товарам")}</div>`;
+  const bar = `<div class="toolbar">${tabs([["deals", "Сделки"], ["listings", "Мои лоты"]], salesTab, "salesTab", "Раздел продаж")}${search("Поиск по товарам")}</div>`;
   const filters = salesTab === "listings" ? tabs(listingFilters, listingType, "listingType", "Статус лота") : "";
   return `${hero("sales")}${bar}${filters}${panel ? `<div class="panel">
     ${panel.items.length ? (salesTab === "deals" ? dealRows(panel.items) : listingRows(panel.items)) : placeholder("Здесь пока пусто", "", "bag")}
@@ -323,7 +329,9 @@ function pluginCard(plugin) {
     <div class="plugin-foot">
       <span class="plugin-state ${plugin.enabled ? "on" : ""}"><span class="signal ${plugin.enabled ? "live" : ""}"></span>
       ${plugin.enabled ? "Включён" : "Выключен"}</span>
-      ${button("Настройки", "plugin", { value: plugin.id, glyph: "settings" })}
+      ${plugin.telegramAccounts
+        ? button("Управление", "telegramPlugin", { glyph: "settings" })
+        : button("Настройки", "plugin", { value: plugin.id, glyph: "settings" })}
     </div></article>`;
 }
 
@@ -375,6 +383,7 @@ function render() {
     <div class="rail-foot"><span class="signal ${currentAccount ? "live" : ""}"></span>${currentAccount ? "Аккаунт выбран" : "Подключите аккаунт"}</div></aside>
     <div class="shell"><main class="workspace">
       <div class="topbar">${brand()}<span class="topbar-label">Панель продавца</span><div class="top-actions">
+      ${currentAccount ? `<button class="account-pill balance-pill" data-action="balance" aria-label="Баланс" title="Баланс">${icon("wallet")}<span>${latestBalance === null ? "Баланс" : rubles(latestBalance.available)}</span></button>` : ""}
       ${iconButton("Обновить экран", "reload", "refresh")}
       <button class="account-pill" data-action="selectDrawer" title="Выбрать аккаунт">${avatar(accountName)}
         <span class="account-name">${safe(currentAccount ? `@${accountName}` : accountName)}</span>${icon("down")}</button>
@@ -419,6 +428,7 @@ async function loadPanel({ fresh = false } = {}) {
     const result = await request(panelUrl());
     if (sequence !== panelSequence) return;
     panel = result;
+    if (tab === "overview") latestBalance = result.balanceDetails || null;
   } catch (error) {
     if (sequence !== panelSequence) return;
     panel = null;
@@ -436,6 +446,7 @@ async function boot() {
     const result = await request("/api/bootstrap");
     bootstrap = result;
     currentAccount = result.accounts.find((account) => account.id === result.activeAccountId);
+    latestBalance = null;
     if (currentAccount) await loadPanel({ fresh: true });
     else render();
   } catch (error) {
@@ -572,6 +583,7 @@ async function chooseAccount(id, trigger) {
   try {
     await request(`/api/accounts/${encodeURIComponent(id)}/active`, { method: "PATCH" });
     currentAccount = account;
+    latestBalance = null;
     drawer.close();
     go("overview");
   } catch (error) {
@@ -661,6 +673,221 @@ async function flip(target, id, type) {
   }
 }
 
+async function balanceDrawer() {
+  const sequence = ++drawerSequence;
+  const account = currentAccount.id;
+  showDrawer("Баланс Playerok", skeleton());
+  try {
+    const result = await request(path("/balance"));
+    if (sequence !== drawerSequence || currentAccount.id !== account) return;
+    latestBalance = result;
+    render();
+    showDrawer("Баланс Playerok", `<div class="detail-rows">
+      ${Object.entries({ available: "Доступно", total: "Всего", frozen: "Заморожено", pending: "Ожидает зачисления", withdrawable: "Доступно к выводу" })
+      .map(([key, label]) => `<div><span>${label}</span><strong>${rubles(result[key])}</strong></div>`).join("")}
+    </div>`);
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("Баланс Playerok", placeholder("Баланс недоступен", error.message, "wallet", button("Обновить", "balance")));
+  }
+}
+
+function editedListingPath(suffix = "") {
+  return path(`/listings/${encodeURIComponent(editedListing.id)}${suffix}`);
+}
+
+function renderListingPhotos() {
+  const pictures = editedListing.photos;
+  return `<section id="listing-photos" class="seller-subsection">
+    <h3>Фотографии</h3>
+    ${pictures.length ? `<div class="photo-grid">${pictures.map((photo, index) => image(photo.url, `Фото ${index + 1}`)).join("")}</div>` : "<p>У лота пока нет фотографий.</p>"}
+    ${editedListing.editable ? `<form id="listing-photo-form">
+      <label class="field">Загрузить JPEG, PNG или WebP<input name="image" type="file" required accept="image/jpeg,image/png,image/webp"></label>
+      ${pictures.length ? `<label class="field">Действие<select name="replace"><option value="">Добавить фото</option>
+        ${pictures.map((photo, index) => `<option value="${safe(photo.id)}">Заменить фото ${index + 1}</option>`).join("")}</select></label>` : ""}
+      <p class="form-error" role="alert" hidden></p><button class="button" type="submit">Загрузить фото</button>
+    </form>` : ""}
+  </section>`;
+}
+
+function showListingEditor() {
+  const entry = editedListing;
+  showDrawer("Лот Playerok", `
+    <div class="detail-rows"><div><span>Статус</span>${status(entry.status)}</div>
+    ${entry.basePrice && Number(entry.price) < Number(entry.basePrice) ? `<div><span>Базовая цена</span><strong>${rubles(entry.basePrice)}</strong></div>` : ""}</div>
+    ${entry.editable ? `<form id="listing-form">
+      <label class="field">Название<input name="name" value="${safe(entry.name)}" maxlength="120" required></label>
+      <label class="field">Цена, ₽<input type="number" name="price" min="1" max="10000000" step="1" value="${safe(entry.price)}" required></label>
+      <label class="field">Описание<textarea name="description" rows="4" maxlength="4096" required>${safe(entry.description)}</textarea></label>
+      <label class="field">Комментарий покупателю после покупки<textarea name="comment" rows="2" maxlength="2048" placeholder="Введите новый комментарий, если хотите его изменить"></textarea></label>
+      <p class="form-error" role="alert" hidden></p><div class="detail-buttons"><button class="button primary" type="submit">Сохранить лот</button>
+      ${entry.slug ? button("На Playerok", "listing", { value: entry.slug, glyph: "external" }) : ""}</div></form>`
+      : `<p>${safe(entry.name)} · ${rubles(entry.price)}</p><p>${safe(entry.description)}</p><p>Playerok пока не разрешает редактировать этот лот.</p>
+        ${entry.slug ? button("На Playerok", "listing", { value: entry.slug, glyph: "external" }) : ""}`}
+    ${renderListingPhotos()}`);
+}
+
+async function editListing(id) {
+  const sequence = ++drawerSequence;
+  showDrawer("Лот Playerok", skeleton());
+  try {
+    const item = await request(path(`/listings/${encodeURIComponent(id)}`));
+    if (sequence !== drawerSequence) return;
+    editedListing = item;
+    showListingEditor();
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("Лот Playerok", placeholder("Не удалось открыть лот", error.message, "info", button("Повторить", "editListing", { value: id })));
+  }
+}
+
+function saveListingToList(item) {
+  if (tab === "sales" && salesTab === "listings" && panel) {
+    panel.items = panel.items.map((entry) => entry.id === item.id ? item : entry);
+    render();
+  }
+}
+
+async function saveListingForm(form) {
+  const entry = editedListing;
+  const name = form.elements.name.value.trim();
+  const price = form.elements.price.valueAsNumber;
+  const description = form.elements.description.value.trim();
+  const comment = form.elements.comment.value.trim();
+  const patch = {};
+  if (name !== entry.name) patch.name = name;
+  if (price !== Number(entry.price)) patch.price = price;
+  if (description !== entry.description) patch.description = description;
+  if (comment) patch.comment = comment;
+  if (!Object.keys(patch).length) return;
+  const sequence = drawerSequence;
+  const updated = await request(editedListingPath(), { method: "PATCH", body: patch });
+  if (sequence !== drawerSequence) return;
+  editedListing = updated;
+  saveListingToList(updated);
+  showListingEditor();
+  notify("Лот сохранён");
+}
+
+async function sendPhotoForm(form) {
+  const file = form.elements.image.files[0];
+  if (!file) return;
+  if (file.size > 10 * 1024 * 1024) throw new Error("Фотография должна быть не больше 10 МБ.");
+  const replace = form.elements.replace?.value;
+  const body = new FormData();
+  body.append("image", file);
+  const sequence = drawerSequence;
+  const updated = await request(editedListingPath("/photo" + (replace ? `?replace=${encodeURIComponent(replace)}` : "")), { method: "POST", body });
+  if (sequence !== drawerSequence) return;
+  editedListing = updated;
+  saveListingToList(updated);
+  drawer.querySelector("#listing-photos").outerHTML = renderListingPhotos();
+  notify("Фотография сохранена");
+}
+
+function renderTelegramPlugin() {
+  const options = tabs([["stock", "Склад"], ["rules", "Привязки лотов"], ["api", "Telegram API"]], telegramTab, "telegramTab", "Настройки ТГ-аккаунтов");
+  const countryOptions = `<datalist id="tg-countries">${telegramPanel.countries.map((country) => `<option value="${safe(country)}"></option>`).join("")}</datalist>`;
+  let content = "";
+  if (telegramTab === "stock") {
+    const stock = telegramPanel.stock;
+    content = stock.length ? `<div class="panel">${stock.map((entry) =>
+      `<div class="preference"><span>${safe(entry.country)}</span><span>${count(entry.available)} доступно · ${count(entry.issued)} выдано${entry.other ? ` · ${count(entry.other)} прочее` : ""}</span></div>`).join("")}</div>`
+      : placeholder("На складе пока пусто", "Добавление профилей доступно в меню бота.", "layers");
+    if (bootstrap?.botUsername) content += `<div class="detail-buttons">${button("Открыть склад в боте", "telegramStockBot", { glyph: "external" })}</div>`;
+  } else if (telegramTab === "api") {
+    const config = telegramPanel.config;
+    content = `<form id="telegram-api-form">
+      <label class="field">API ID<input name="apiId" type="number" min="1" max="2147483647" value="${safe(config.apiId)}" required></label>
+      <label class="field">API Hash<input name="apiHash" type="password" maxlength="32" autocomplete="new-password" placeholder="${config.apiHashSet ? "Сохранён. Введите новый при необходимости" : "Не задан"}"></label>
+      <p class="form-error" role="alert" hidden></p><div class="detail-buttons"><button class="button primary" type="submit">Сохранить API</button>
+      ${!config.defaults ? button("Сбросить API", "telegramReset") : ""}</div></form>`;
+  } else {
+    const rules = telegramPanel.rules;
+    content = `${countryOptions}<form id="telegram-bind-form">
+      <label class="field">Лот<select name="lotId" required><option value="">Выберите свой лот</option>
+      ${telegramLots.map((item) => `<option value="${safe(item.id)}">${safe(item.name)}</option>`).join("")}</select></label>
+      ${telegramLotsCursor ? button("Загрузить ещё лоты", "telegramMoreLots") : ""}
+      <label class="field">Страна<input name="country" list="tg-countries" maxlength="128" required></label>
+      <p class="form-error" role="alert" hidden></p><button class="button primary" type="submit">Привязать лот</button></form>
+      <div class="seller-subsection"><h3>Привязанные лоты</h3>
+      ${rules.length ? rules.map((rule) => `<form class="panel telegram-rule" data-rule="${rule.id}">
+        <div class="preference"><span>${safe(rule.title)}</span>${toggle("Активность привязки", rule.enabled, "telegramRuleSwitch", rule.id)}</div>
+        <label class="field">Страна<input name="country" list="tg-countries" maxlength="128" value="${safe(rule.country)}" required></label>
+        <div class="detail-buttons"><button class="button" type="submit">Сохранить страну</button>${button("Удалить", "telegramDeleteRule", { value: rule.id, variant: "flat" })}</div>
+        <p class="form-error" role="alert" hidden></p></form>`).join("")
+        : '<p>Привязок пока нет.</p>'}</div>`;
+  }
+  showDrawer("ТГ-аккаунты", `<div class="telegram-panel">${options}${content}</div>`);
+}
+
+async function loadTelegramLots(append = false) {
+  const seq = drawerSequence;
+  const next = append && telegramLotsCursor ? `?${new URLSearchParams({ cursor: telegramLotsCursor })}` : "";
+  const data = await request(path("/listings" + next));
+  if (seq !== drawerSequence || telegramTab !== "rules") return;
+  const seen = new Set(append ? telegramLots.map((item) => item.id) : []);
+  telegramLots = [...(append ? telegramLots : []), ...data.items.filter((item) => !seen.has(item.id))];
+  telegramLotsCursor = data.cursor;
+  renderTelegramPlugin();
+}
+
+async function telegramPluginDrawer() {
+  const sequence = ++drawerSequence;
+  telegramTab = "stock";
+  telegramLots = [];
+  telegramLotsCursor = null;
+  showDrawer("ТГ-аккаунты", skeleton());
+  try {
+    const data = await request(path("/telegram-accounts"));
+    if (sequence !== drawerSequence) return;
+    telegramPanel = data;
+    renderTelegramPlugin();
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("ТГ-аккаунты", placeholder("Меню недоступно", error.message, "info", button("Повторить", "telegramPlugin")));
+  }
+}
+
+async function telegramChangeTab(value) {
+  telegramTab = value;
+  renderTelegramPlugin();
+  if (value === "rules" && !telegramLots.length) await loadTelegramLots();
+}
+
+async function telegramConfig(patch) {
+  const sequence = drawerSequence;
+  const result = await request(path("/telegram-accounts"), { method: "PATCH", body: patch });
+  if (sequence !== drawerSequence) return;
+  telegramPanel.config = result;
+  renderTelegramPlugin();
+  notify("Настройки API сохранены");
+}
+
+async function telegramRule(id, method, body) {
+  const sequence = drawerSequence;
+  const url = path(id ? `/telegram-accounts/rules/${encodeURIComponent(id)}` : "/telegram-accounts/rules");
+  const result = await request(url, { method, body });
+  if (sequence !== drawerSequence) return;
+  telegramPanel.rules = telegramPanel.rules.filter((row) => String(row.id) !== String(id) && row.id !== result.id);
+  if (method !== "DELETE") telegramPanel.rules.unshift(result);
+  renderTelegramPlugin();
+  notify(method === "DELETE" ? "Привязка удалена" : "Привязка сохранена");
+}
+
+function askConfirmation(message, action) {
+  if (telegram?.isVersionAtLeast?.("6.2") && telegram.showConfirm) {
+    telegram.showConfirm(message, (confirmed) => { if (confirmed) action().catch((error) => notify(error.message, true)); });
+  } else if (window.confirm(message)) {
+    action().catch((error) => notify(error.message, true));
+  }
+}
+
+function openTelegramStock() {
+  const username = bootstrap?.botUsername;
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(username || "")) return;
+  const url = `https://t.me/${username}?start=tg_accounts`;
+  if (telegram?.openTelegramLink) telegram.openTelegramLink(url);
+  else window.open(url, "_blank", "noopener,noreferrer");
+}
+
 function listingLink(slug) {
   if (!slug) return;
   const url = `https://playerok.com/products/${encodeURIComponent(slug)}`;
@@ -678,6 +905,23 @@ document.addEventListener("click", (event) => {
     if (tab === "chats" && currentChat) openChat(currentChat, { mark: false });
     else loadPanel();
   }
+  if (action === "balance") balanceDrawer();
+  if (action === "myListings") {
+    salesTab = "listings";
+    go("sales");
+  }
+  if (action === "editListing") editListing(value);
+  if (action === "telegramPlugin") telegramPluginDrawer();
+  if (action === "telegramTab") telegramChangeTab(value).catch((error) => notify(error.message, true));
+  if (action === "telegramMoreLots") loadTelegramLots(true).catch((error) => notify(error.message, true));
+  if (action === "telegramStockBot") openTelegramStock();
+  if (action === "telegramReset") askConfirmation("Сбросить Telegram API к стандартным значениям?", () => telegramConfig({ reset: true }));
+  if (action === "telegramRuleSwitch") {
+    target.disabled = true;
+    telegramRule(value, "PATCH", { enabled: target.getAttribute("aria-checked") !== "true" })
+      .catch((error) => notify(error.message, true)).finally(() => { target.disabled = false; });
+  }
+  if (action === "telegramDeleteRule") askConfirmation("Удалить привязку этого лота?", () => telegramRule(value, "DELETE"));
   if (action === "selectDrawer") switchDrawer();
   if (action === "selectAccount") chooseAccount(value, target);
   if (action === "page") readPage(target);
@@ -716,6 +960,8 @@ document.addEventListener("click", (event) => {
   if (action === "closeDrawer") drawer.close();
 });
 
+drawer.addEventListener("close", () => { drawerSequence += 1; });
+
 document.addEventListener("input", (event) => {
   if (event.target.id === "screen-search") {
     filterText = event.target.value;
@@ -731,6 +977,22 @@ document.addEventListener("submit", async (event) => {
   if (!submit || submit.disabled) return;
   submit.disabled = true;
   try {
+    if (form.id === "listing-form") await saveListingForm(form);
+    if (form.id === "listing-photo-form") await sendPhotoForm(form);
+    if (form.id === "telegram-api-form") {
+      const patch = {};
+      const apiId = form.elements.apiId.valueAsNumber;
+      const apiHash = form.elements.apiHash.value.trim();
+      if (apiId !== telegramPanel.config.apiId) patch.apiId = apiId;
+      if (apiHash) patch.apiHash = apiHash;
+      if (Object.keys(patch).length) await telegramConfig(patch);
+    }
+    if (form.id === "telegram-bind-form") {
+      await telegramRule(null, "POST", { lotId: form.elements.lotId.value, country: form.elements.country.value.trim() });
+    }
+    if (form.matches(".telegram-rule")) {
+      await telegramRule(form.dataset.rule, "PATCH", { country: form.elements.country.value.trim() });
+    }
     if (form.id === "reply-form") {
       const text = form.elements.text.value.trim();
       if (!text) return;
