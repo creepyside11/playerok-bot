@@ -1016,7 +1016,8 @@ def item_deal(data: dict) -> "ItemDeal":
     from .types import ItemDeal
     if not data:
         return None
-    
+    deal_item = data.get("item")
+
     return ItemDeal(
         id=data.get("id"),
         status=ItemDealStatuses.__members__.get(data.get("status")),
@@ -1035,7 +1036,7 @@ def item_deal(data: dict) -> "ItemDeal":
         transaction=transaction(data.get("transaction")),
         user=user_profile(data.get("user")),
         chat=chat(data.get("chat")),
-        item=item_by_typename(data.get("item")),
+        item=item_by_typename(deal_item) or item(deal_item),
         review=review(data.get("testimonial")),
         obtaining_fields=[game_category_data_field(field) for field in (data.get("obtainingFields") or [])],
         comment_from_buyer=data.get("commentFromBuyer"),

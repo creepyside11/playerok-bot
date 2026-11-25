@@ -20,6 +20,7 @@ from app.telegram_accounts_manager import (
 )
 from app.worker import WorkerManager
 from playerokapi.enums import ItemDealDirections, ItemDealStatuses
+from playerokapi.parser import chat_list, item_deal, item_deal_list
 from plugins import telegram_accounts
 
 
@@ -129,5 +130,95 @@ async def test_paid_sale_recovers_missing_initial_message(
             assert len(records) == 1 and records[0].intro_sent is True
             stock = list(await session.scalars(select(TelegramAccountStock).order_by(TelegramAccountStock.id)))
             assert [item.status for item in stock] == ["issued", "available"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,event,status,expected", [
+    ("list_error", "ITEM_PAID", "PAID", True),
+    ("list_empty", "OFFICIAL_ITEM_PAID", "PENDING", True),
+    ("partial_list", "ITEM_PAID", "PAID", True),
+    ("list_error", "ITEM_PAID", "ROLLED_BACK", False),
+    ("list_empty", "ITEM_PAID", "SENT", False),
+    ("list_empty", None, "PAID", True),
+    ("different_chat", "ITEM_PAID", "PAID", False),
+    ("incoming_deal", "ITEM_PAID", "PAID", False),
+])
+async def test_first_poll_processes_payment_from_actual_chat_shape(tmp_path, source, event, status, expected):
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/payments.db")
+    await init_db(engine)
+    db = make_session_factory(engine)
+    try:
+        async with db() as session:
+            session.add(TelegramUser(id=10))
+            await session.flush()
+            seller = PlayerokAccount(
+                tg_user_id=10, playerok_user_id="seller", username="seller",
+                cookies_encrypted="fixture", user_agent="test",
+            )
+            session.add(seller)
+            await session.flush()
+            session.add(TelegramAccountLotRule(
+                account_id=seller.id, lot_id="lot", lot_title="Лот", country="Страна",
+            ))
+            session.add(TelegramAccountStock(
+                account_id=seller.id, country="Страна", phone="sample-number", session_encrypted="fixture",
+            ))
+            await session.commit()
+
+        raw_sale = {
+            "id": "sale", "direction": "OUT", "status": status,
+            "item": {"id": "lot", "name": "Лот", "user": {"id": "seller"}},
+        }
+        payload = {"edges": [{"node": {
+            "id": "buyer-chat", "type": "PM",
+            "lastMessage": {"id": "notification", "event": event, "text": "{{ITEM_PAID}}" if not event else None,
+                            "deal": {**raw_sale, "status": "PAID"}},
+        }}]}
+
+        async def get_deals(direction, **_):
+            if direction == ItemDealDirections.OUT:
+                if source == "list_error":
+                    raise TimeoutError()
+                if source == "partial_list":
+                    return item_deal_list({"edges": [{"node": raw_sale}]})
+            return item_deal_list({"edges": []})
+
+        client = NS(
+            get_deals=AsyncMock(side_effect=get_deals),
+            get_deal=AsyncMock(return_value=item_deal({
+                **raw_sale,
+                "direction": "IN" if source == "incoming_deal" else "OUT",
+                "chat": {"id": "different-chat" if source == "different_chat" else "buyer-chat"},
+            })),
+            get_chats=AsyncMock(return_value=chat_list(payload)),
+            get_my_reviews=AsyncMock(return_value=NS(reviews=[])),
+            send_message=AsyncMock(return_value=NS(id="sent")),
+        )
+        manager = PluginManager(db)
+        manager.plugins["telegram_accounts"] = PluginSpec(
+            "telegram_accounts", "Telegram Accounts", "1", "", "",
+            telegram_accounts.PLUGIN_META["settings"], telegram_accounts,
+        )
+        worker = WorkerManager(
+            NS(send_message=AsyncMock()), db, NS(get_client=AsyncMock(return_value=client)), None, 15, manager,
+        )
+        await worker._poll(seller)
+        if expected:
+            client.send_message.assert_awaited_once_with(
+                "buyer-chat", format_delivery_message("Страна", "sample-number"), mark_chat_as_read=False,
+            )
+        else:
+            client.send_message.assert_not_awaited()
+        if source == "partial_list":
+            client.get_deal.assert_not_awaited()
+        else:
+            client.get_deal.assert_awaited_once_with("sale")
+        async with db() as session:
+            record = await session.scalar(select(TelegramAccountDeal))
+            assert bool(record) is expected
+            if record:
+                assert record.intro_sent is True
     finally:
         await engine.dispose()

@@ -19,7 +19,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from playerokapi.enums import ChatTypes, ItemDealDirections, ItemDealStatuses
+from playerokapi.enums import ChatMessageEvents, ChatTypes, ItemDealDirections, ItemDealStatuses
 
 from .crypto import SecretCipher
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, PlayerokAccount, ProcessedEvent
@@ -28,6 +28,8 @@ from .plugin_system import PluginManager
 
 
 logger = logging.getLogger(__name__)
+PAID_DEAL_STATUSES = {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}
+PAYMENT_CHAT_EVENTS = {ChatMessageEvents.ITEM_PAID, ChatMessageEvents.OFFICIAL_ITEM_PAID}
 
 
 def settings_for(account: PlayerokAccount) -> dict[str, Any]:
@@ -158,29 +160,24 @@ class WorkerManager:
         reviews_page = reviews_res if not isinstance(reviews_res, Exception) else None
 
         if isinstance(deals_out_res, Exception):
-            logger.warning("Playerok sales polling failed for %s (%s)", account.id, type(deals_out_res).__name__)
-        deals = []
+            logger.warning(
+                "Playerok sales polling failed for %s (%s, %s)", account.id,
+                type(deals_out_res).__name__, getattr(deals_out_res, "error_code", None),
+            )
+        deals: dict[str, Any] = {}
         for page, direction in ((deals_out_page, ItemDealDirections.OUT), (deals_in_page, ItemDealDirections.IN)):
             for deal in getattr(page, "deals", None) or []:
-                if deal is not None:
+                if deal_id := getattr(deal, "id", None):
                     if getattr(deal, "direction", None) is None:
                         deal.direction = direction
-                    deals.append(deal)
+                    deals.setdefault(str(deal_id), deal)
         chats = list(getattr(chats_page, "chats", []) or [])
         reviews = list(getattr(reviews_page, "reviews", []) or [])
 
-        # Deduplicate deals by ID if any overlap
-        seen_deals: set[str] = set()
-        unique_deals = []
-        for d in deals:
-            did = str(getattr(d, "id", ""))
-            if did and did not in seen_deals:
-                seen_deals.add(did)
-                unique_deals.append(d)
-        deals = unique_deals
+        sale_chats = await self._recover_chat_sales(client, deals, chats)
 
         if not account.worker_initialized:
-            for deal in deals:
+            for deal in deals.values():
                 status = getattr(getattr(deal, "status", None), "name", "UNKNOWN")
                 await claim_event(self.db, account.id, "deal", deal.id)
                 await claim_event(self.db, account.id, "deal_status", f"{deal.id}:{status}")
@@ -201,14 +198,62 @@ class WorkerManager:
                 if row:
                     row.worker_initialized = True
                     await session.commit()
+            for deal in reversed(deals.values()):
+                if deal.direction == ItemDealDirections.OUT and deal.status in PAID_DEAL_STATUSES:
+                    await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
             return
 
-        for deal in reversed(deals):
-            await self._deal(account, client, deal, chats)
+        for deal in reversed(deals.values()):
+            await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
         for chat in reversed(chats):
             await self._chat(account, client, chat)
         for review in reversed(reviews):
             await self._review(account, client, review)
+
+    @staticmethod
+    async def _recover_chat_sales(client: Any, deals: dict[str, Any], chats: list[Any]) -> dict[str, Any]:
+        deal_chats: dict[str, Any] = {}
+        payment_chats: dict[str, Any] = {}
+        for chat in chats:
+            if not getattr(chat, "id", None) or getattr(chat, "type", None) != ChatTypes.PM:
+                continue
+            for deal in getattr(chat, "deals", None) or []:
+                if deal_id := getattr(deal, "id", None):
+                    deal_chats.setdefault(str(deal_id), chat)
+            message = getattr(chat, "last_message", None)
+            event = getattr(message, "event", None)
+            text = (getattr(message, "text", None) or "").strip()
+            if event not in PAYMENT_CHAT_EVENTS and text not in {"{{ITEM_PAID}}", "{{OFFICIAL_ITEM_PAID}}"}:
+                continue
+            hint = getattr(message, "deal", None)
+            if getattr(hint, "direction", None) == ItemDealDirections.IN:
+                continue
+            if deal_id := getattr(hint, "id", None):
+                payment_chats.setdefault(str(deal_id), chat)
+
+        deal_chats.update(payment_chats)
+        for deal_id, chat in payment_chats.items():
+            if getattr(deals.get(deal_id), "status", None) is not None:
+                continue
+            try:
+                deal = await client.get_deal(deal_id)
+            except Exception as exc:
+                logger.warning(
+                    "Playerok payment event %s: deal lookup failed (%s, %s)",
+                    deal_id, type(exc).__name__, getattr(exc, "error_code", None),
+                )
+                continue
+            if (str(getattr(deal, "id", "")) != deal_id
+                    or getattr(deal, "direction", None) != ItemDealDirections.OUT
+                    or getattr(deal, "status", None) not in PAID_DEAL_STATUSES):
+                continue
+            chat_id = getattr(getattr(deal, "chat", None), "id", None)
+            if chat_id and str(chat_id) != str(chat.id):
+                logger.warning("Playerok payment event %s refers to a different buyer chat", deal_id)
+                continue
+            deals[deal_id] = deal
+            logger.debug("Playerok sale %s found in buyer chat payment events", deal_id)
+        return deal_chats
 
     async def _review(self, account: PlayerokAccount, client: Any, review: Any) -> None:
         rid = getattr(review, "id", None)
@@ -240,7 +285,7 @@ class WorkerManager:
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
             )
 
-    async def _deal(self, account: PlayerokAccount, client: Any, deal: Any, chats: list[Any] | None = None) -> None:
+    async def _deal(self, account: PlayerokAccount, client: Any, deal: Any, chat_hint: Any = None) -> None:
         cfg = settings_for(account)
         status = getattr(deal, "status", None)
         status_name = getattr(status, "name", "UNKNOWN")
@@ -255,17 +300,9 @@ class WorkerManager:
         chat_id = getattr(chat, "id", None)
         item_id = str(getattr(item, "id", "") or "")
 
-        # Гарантируем заполнение chat_id и item_id, если get_deals вернул неполный объект
-        if not chat_id and chats:
-            for c in chats:
-                for d in getattr(c, "deals", []) or []:
-                    if str(getattr(d, "id", "")) == str(deal.id):
-                        chat = c
-                        chat_id = getattr(c, "id", None)
-                        deal.chat = c
-                        break
-                if chat_id:
-                    break
+        if not chat_id and chat_hint is not None:
+            chat_id = chat_hint.id
+            deal.chat = chat_hint
 
         if (not chat_id or not item_id) and hasattr(client, "get_deal"):
             try:
