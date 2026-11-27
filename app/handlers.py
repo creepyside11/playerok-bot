@@ -30,6 +30,7 @@ from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, Pl
 from .playerok_errors import playerok_error_text
 from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, normalize_proxy
 from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate
+from .withdrawal_history import PLAYEROK_CONTACTS_URL, PLAYEROK_URL, payout_history
 
 
 logger = logging.getLogger(__name__)
@@ -477,7 +478,49 @@ async def balance(call: CallbackQuery) -> None:
         text = f"💰 <b>Баланс {html.escape(account.username)}</b>\n\n<b>{html.escape(str(value))} ₽</b>"
     except Exception as exc:
         text = f"❌ Ошибка баланса:\n<code>{html.escape(str(exc))[:1600]}</code>"
-    await edit(call, text, back_menu())
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Вывод", callback_data="balance:withdrawals")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu:balance")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
+    ])
+    await edit(call, text, markup)
+
+
+@router.callback_query(F.data == "balance:withdrawals")
+async def withdrawals(call: CallbackQuery) -> None:
+    if not call.message or call.message.chat.type != ChatType.PRIVATE:
+        await call.answer("Откройте раздел в личном чате с ботом.", show_alert=True)
+        return
+    account = await require_account(call)
+    if not account:
+        return
+    if account.tg_user_id != call.from_user.id:
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await call.answer("Проверяю историю…")
+    parts = [f"💸 <b>Вывод средств · @{html.escape(account.username)}</b>",
+             "Оформление выплаты и ввод полных реквизитов — только на сайте Playerok.",
+             "<b>Последние выплаты</b>"]
+    try:
+        client = await svc().gateway.get_client(account)
+        result = await payout_history(client, account.playerok_user_id)
+        for entry in result["items"]:
+            money = html.escape(entry["amount"] or "—")
+            label = html.escape(entry["statusLabel"])
+            details = html.escape(entry["details"] or "—")
+            created = html.escape((entry["time"] or "—")[:30])
+            parts.append(f"<b>{money} ₽</b> · {label}\nРеквизиты: {details}\nДата: {created}")
+        if not result["items"]:
+            parts.append("На этой странице выплат нет.")
+    except Exception:
+        parts.append("Не удалось получить историю. Проверьте статус на сайте Playerok.")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Оформить на Playerok", url=PLAYEROK_URL)],
+        [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data="balance:withdrawals")],
+        [InlineKeyboardButton(text="Помощь с выплатами", url=PLAYEROK_CONTACTS_URL)],
+        [InlineKeyboardButton(text="⬅️ Баланс", callback_data="menu:balance")],
+    ])
+    await edit(call, "\n\n".join(parts), markup)
 
 
 async def notifications_markup(account: PlayerokAccount) -> InlineKeyboardMarkup:

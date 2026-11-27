@@ -685,10 +685,62 @@ async function balanceDrawer() {
     showDrawer("Баланс Playerok", `<div class="detail-rows">
       ${Object.entries({ available: "Доступно", total: "Всего", frozen: "Заморожено", pending: "Ожидает зачисления", withdrawable: "Доступно к выводу" })
       .map(([key, label]) => `<div><span>${label}</span><strong>${rubles(result[key])}</strong></div>`).join("")}
-    </div>`);
+    </div>
+    ${button("Вывод", "withdrawals", { glyph: "wallet", variant: "primary" })}`);
   } catch (error) {
-    if (sequence === drawerSequence) showDrawer("Баланс Playerok", placeholder("Баланс недоступен", error.message, "wallet", button("Обновить", "balance")));
+    if (sequence === drawerSequence && currentAccount?.id === account) showDrawer("Баланс Playerok",
+      `${placeholder("Баланс недоступен", error.message, "wallet", button("Обновить", "balance"))}
+        ${button("Вывод", "withdrawals", { glyph: "wallet", variant: "primary" })}`);
   }
+}
+
+function payoutStatus(entry) {
+  const colors = { PENDING: "amber", PROCESSING: "amber", CONFIRMED: "green", ROLLED_BACK: "red", FAILED: "red" };
+  return `<span class="status ${colors[entry.status] || ""}">${safe(entry.statusLabel)}</span>`;
+}
+
+function payoutActions() {
+  return `<div class="payout-actions">
+    ${button("Оформить на Playerok", "payoutSite", { glyph: "external", variant: "primary" })}
+    ${button("Обновить статусы", "withdrawals", { glyph: "refresh", variant: "flat" })}
+    ${button("Помощь с выплатами", "payoutContacts", { glyph: "info", variant: "flat" })}
+    ${button("К балансу", "balance", { glyph: "back", variant: "flat" })}
+  </div>`;
+}
+
+async function withdrawalsDrawer(pageCursor = "") {
+  if (!currentAccount) return;
+  const sequence = ++drawerSequence;
+  const account = currentAccount.id;
+  showDrawer("Вывод средств", skeleton());
+  try {
+    const query = pageCursor ? `?cursor=${encodeURIComponent(pageCursor)}` : "";
+    const result = await request(path("/withdrawals") + query);
+    if (sequence !== drawerSequence || currentAccount?.id !== account) return;
+    const rows = result.items.map((entry) => `<article class="payout-row">
+      <div class="detail-rows">
+        <div><span>Сумма</span><strong>${safe(rubles(entry.amount))}</strong></div>
+        <div><span>Статус</span>${payoutStatus(entry)}</div>
+        <div><span>Реквизиты</span><strong>${safe(entry.details || "—")}</strong></div>
+        <div><span>Комиссия</span><strong>${safe(rubles(entry.fee))}</strong></div>
+        <div><span>Дата</span><strong>${safe(dateTime(entry.time, true) || "—")}</strong></div>
+      </div>
+    </article>`).join("");
+    showDrawer("Вывод средств", `<p class="payout-note">Оформляйте вывод и вводите полные реквизиты на официальном сайте Playerok. Здесь — история уже созданных выплат и их статусы.</p>
+      ${payoutActions()}
+      <h3>История вывода</h3>
+      ${rows || placeholder("Нет выплат на этой странице", "", "wallet")}
+      ${result.cursor ? button("Следующая страница", "withdrawals", { value: result.cursor, glyph: "right", variant: "flat" }) : ""}`);
+  } catch (error) {
+    if (sequence !== drawerSequence || currentAccount?.id !== account) return;
+    showDrawer("Вывод средств", `${placeholder("История недоступна", error.message, "wallet")}${payoutActions()}`);
+  }
+}
+
+function openPayoutSite(contacts = false) {
+  const url = contacts ? "https://playerok.com/contacts" : "https://playerok.com/";
+  if (telegram?.openLink) telegram.openLink(url);
+  else window.open(url, "_blank", "noopener,noreferrer");
 }
 
 function editedListingPath(suffix = "") {
@@ -913,6 +965,9 @@ document.addEventListener("click", (event) => {
     else loadPanel();
   }
   if (action === "balance") balanceDrawer();
+  if (action === "withdrawals") withdrawalsDrawer(value);
+  if (action === "payoutSite") openPayoutSite();
+  if (action === "payoutContacts") openPayoutSite(true);
   if (action === "myListings") {
     salesTab = "listings";
     go("sales");

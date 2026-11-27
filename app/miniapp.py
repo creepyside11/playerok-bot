@@ -30,6 +30,7 @@ from .models import DEFAULT_SETTINGS, PlayerokAccount, TelegramUser
 from .playerok import PlayerokGateway
 from .playerok_errors import playerok_error_text
 from .plugin_system import PluginManager, PluginSpec
+from .withdrawal_history import payout_history
 
 
 logger = logging.getLogger(__name__)
@@ -370,6 +371,14 @@ class MiniApp:
         client = await self.gateway.get_client(account)
         return web.json_response(balance_json(await client.balance()))
 
+    async def withdrawals(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        page_cursor = cursor(request)
+        client = await self.gateway.get_client(account)
+        return web.json_response(await payout_history(
+            client, account.playerok_user_id, after_cursor=page_cursor,
+        ))
+
     async def chats(self, request: web.Request) -> web.Response:
         account = await self.account(request)
         kind = request.query.get("type")
@@ -609,6 +618,7 @@ class MiniApp:
             ("PATCH", "/active", self.select_account),
             ("GET", "/overview", self.overview),
             ("GET", "/balance", self.balance),
+            ("GET", "/withdrawals", self.withdrawals),
             ("GET", "/chats", self.chats),
             ("GET", "/chats/{chat_id}", self.history),
             ("POST", "/chats/{chat_id}/reply", self.reply),

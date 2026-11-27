@@ -16,6 +16,7 @@ from app.miniapp import MAX_AUTH_AGE, MiniApp, validate_telegram_user
 from app.models import PlayerokAccount, TelegramUser
 from app.plugin_system import PluginManager, PluginSpec
 from app.telegram_accounts_manager import TelegramAccountStock
+from playerokapi.enums import TransactionOperations
 
 
 TOKEN = "12345:local_test_token"
@@ -118,6 +119,7 @@ async def test_portal_uses_owned_accounts_shared_plugin_state_and_chats(tmp_path
             base = f"/api/accounts/{own.id}"
             for route, headers in (
                 (f"/api/accounts/{foreign.id}/chats", authorize()),
+                (f"/api/accounts/{foreign.id}/withdrawals", authorize()),
                 (f"{base}/plugins", authorize(102)),
                 (f"{base}/chats/other", authorize()),
             ):
@@ -192,6 +194,24 @@ async def test_balance_listing_edits_and_telegram_settings_are_scoped(tmp_path):
             headers = authorize()
             balance = await client.get(f"{base}/balance", headers=headers)
             assert (await balance.json())["available"] == "17.50"
+            pok.call.return_value = NS(transactions=[
+                NS(operation=TransactionOperations.WITHDRAW, user=NS(id="seller-1"),
+                   status="CONFIRMED", value=500, fee=60, created_at=None,
+                   props=NS(payment_account=NS(value="4111111111111111"))),
+                NS(operation=TransactionOperations.WITHDRAW, user=NS(id="another-seller"),
+                   status="PENDING", value=999),
+            ], page_info=NS(has_next_page=False))
+            withdrawal = await client.get(f"{base}/withdrawals", headers=headers)
+            assert withdrawal.status == 200
+            data = await withdrawal.json()
+            assert len(data["items"]) == 1
+            assert data["items"][0]["status"] == "CONFIRMED"
+            assert data["items"][0]["details"] == "•••• 1111"
+            assert "4111111111111111" not in str(data)
+            assert data["cursor"] is None
+            pok.call.assert_awaited_with("get_transactions", operation=TransactionOperations.WITHDRAW,
+                                         count=10, after_cursor=None)
+            assert (await client.post(f"{base}/withdrawals", headers=headers, json={})).status == 405
             entry = await client.get(f"{base}/listings/owned-lot", headers=headers)
             assert (await entry.json())["name"] == "Свой лот"
             forbidden = await client.patch(f"{base}/listings/foreign-lot", headers=headers, json={"price": 1})
