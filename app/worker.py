@@ -116,15 +116,20 @@ class WorkerManager:
 
     async def run(self) -> None:
         logger.info("Playerok worker started")
+        loop = asyncio.get_running_loop()
         while not self._stop.is_set():
+            started = loop.time()
             try:
                 async with self.db() as session:
                     accounts = list((await session.scalars(select(PlayerokAccount))).all())
                 await asyncio.gather(*(self._guarded(account) for account in accounts))
             except Exception:
                 logger.exception("Worker cycle failed")
+            # Пауза считается от начала цикла: иначе период = время работы + poll_interval,
+            # и на медленном аккаунте уведомления приходят заметно позже.
+            delay = max(0.0, self.poll_interval - (loop.time() - started))
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval)
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 
@@ -180,6 +185,21 @@ class WorkerManager:
         chats = list(getattr(chats_page, "chats", []) or [])
         reviews = list(getattr(reviews_page, "reviews", []) or [])
 
+        # Уведомления о сообщениях — до любой тяжёлой работы: _recover_chat_sales делает
+        # по get_deal на каждый оплаченный чат (под общим локом сессии), сделки запускают
+        # выдачу и плагины. Раньше всё это шло впереди уведомлений, и на активном аккаунте
+        # сообщение «приходило» через минуты, хотя в Mini App было видно сразу.
+        pending_messages: list[tuple[Any, Any]] = []
+        if account.worker_initialized:
+            for chat in chats:
+                try:
+                    message = await self._chat_notify(account, chat)
+                except Exception:
+                    logger.exception("Playerok chat notification failed for %s", getattr(chat, "id", ""))
+                    continue
+                if message is not None:
+                    pending_messages.append((chat, message))
+
         sale_chats = await self._recover_chat_sales(client, deals, chats)
 
         if not account.worker_initialized:
@@ -205,18 +225,19 @@ class WorkerManager:
                     row.worker_initialized = True
                     await session.commit()
         for deal in reversed(deals.values()):
-            if not account.worker_initialized and (
-                deal.direction != ItemDealDirections.OUT or deal.status not in PAID_DEAL_STATUSES
-            ):
-                continue
             try:
                 await self._deal(account, client, deal, sale_chats.get(str(deal.id)))
             except Exception:
                 logger.exception("Playerok deal %s processing failed", deal.id)
-        if not account.worker_initialized:
-            return
-        for chat in reversed(chats):
-            await self._chat(account, client, chat)
+
+        # Ответы, автоправила и плагины (#код) — после сделок: им нужна запись,
+        # которую создаёт плагин при обработке оплаченной сделки.
+        for chat, message in pending_messages:
+            try:
+                await self._chat_handle(account, client, chat, message)
+            except Exception:
+                logger.exception("Playerok chat handling failed for %s", getattr(chat, "id", ""))
+
         for review in reversed(reviews):
             await self._review(account, client, review)
 
@@ -586,18 +607,28 @@ class WorkerManager:
             raise
 
     async def _chat(self, account: PlayerokAccount, client: Any, chat: Any) -> None:
+        message = await self._chat_notify(account, chat)
+        if message is not None:
+            await self._chat_handle(account, client, chat, message)
+
+    async def _chat_notify(self, account: PlayerokAccount, chat: Any) -> Any:
+        """Шлёт уведомление о новом сообщении. Возвращает сообщение, если оно новое.
+
+        Вынесено из _chat, чтобы уведомления отправлялись до обработки сделок:
+        иначе на активных аккаунтах они ждали всей выдачи и сетевых вызовов.
+        """
         message = getattr(chat, "last_message", None)
         if not message:
-            return
+            return None
         sender = getattr(message, "user", None)
         sender_id = str(getattr(sender, "id", "") or "")
         # Don't notify about our own outgoing messages
         if sender_id and sender_id == str(account.playerok_user_id):
-            return
+            return None
         if getattr(message, "is_auto_response", False):
-            return
+            return None
         if not await claim_event(self.db, account.id, "message", message.id):
-            return
+            return None
 
         text = str(getattr(message, "text", "") or "")
         images = list(getattr(message, "images", []) or [])
@@ -641,22 +672,28 @@ class WorkerManager:
                 f"{images_info}",
                 markup,
             )
+        return message
+
+    async def _chat_handle(self, account: PlayerokAccount, client: Any, chat: Any, message: Any) -> None:
+        """Плагины и автоправила для уже отправленного уведомления."""
+        text = str(getattr(message, "text", "") or "")
 
         if self.plugins:
             await self.plugins.dispatch_message(account, client, self.bot, chat, message)
 
-        if text:
-            async with self.db() as session:
-                rules = list((await session.scalars(
-                    select(AutoReplyRule)
-                    .where(AutoReplyRule.account_id == account.id, AutoReplyRule.enabled.is_(True))
-                    .order_by(AutoReplyRule.id)
-                )).all())
-            lower = text.casefold()
-            for rule in rules:
-                if rule.trigger == "*" or rule.trigger.casefold() in lower:
-                    await client.send_message(str(chat.id), rule.response, mark_chat_as_read=True)
-                    break
+        if not text:
+            return
+        async with self.db() as session:
+            rules = list((await session.scalars(
+                select(AutoReplyRule)
+                .where(AutoReplyRule.account_id == account.id, AutoReplyRule.enabled.is_(True))
+                .order_by(AutoReplyRule.id)
+            )).all())
+        lower = text.casefold()
+        for rule in rules:
+            if rule.trigger == "*" or rule.trigger.casefold() in lower:
+                await client.send_message(str(chat.id), rule.response, mark_chat_as_read=True)
+                break
 
     async def _notify(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
         try:
