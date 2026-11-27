@@ -69,6 +69,7 @@ let chatError = null;
 let replyDraft = "";
 let toastTimer = 0;
 let latestBalance = null;
+let payoutOptions = null;
 let editedListing = null;
 let telegramPanel = null;
 let telegramTab = "stock";
@@ -701,7 +702,7 @@ function payoutStatus(entry) {
 
 function payoutActions() {
   return `<div class="payout-actions">
-    ${button("Оформить на Playerok", "payoutSite", { glyph: "external", variant: "primary" })}
+    ${button("Создать выплату", "newPayout", { glyph: "wallet", variant: "primary" })}
     ${button("Обновить статусы", "withdrawals", { glyph: "refresh", variant: "flat" })}
     ${button("Помощь с выплатами", "payoutContacts", { glyph: "info", variant: "flat" })}
     ${button("К балансу", "balance", { glyph: "back", variant: "flat" })}
@@ -726,7 +727,7 @@ async function withdrawalsDrawer(pageCursor = "") {
         <div><span>Дата</span><strong>${safe(dateTime(entry.time, true) || "—")}</strong></div>
       </div>
     </article>`).join("");
-    showDrawer("Вывод средств", `<p class="payout-note">Оформляйте вывод и вводите полные реквизиты на официальном сайте Playerok. Здесь — история уже созданных выплат и их статусы.</p>
+    showDrawer("Вывод средств", `<p class="payout-note">Выплату можно создать здесь: способ вывода, реквизиты и сумма. Реквизиты передаются в Playerok один раз и не сохраняются.</p>
       ${payoutActions()}
       <h3>История вывода</h3>
       ${rows || placeholder("Нет выплат на этой странице", "", "wallet")}
@@ -737,8 +738,139 @@ async function withdrawalsDrawer(pageCursor = "") {
   }
 }
 
+function payoutProviderData(id) {
+  return payoutOptions?.providers.find((provider) => provider.id === id) || null;
+}
+
+function payoutHints() {
+  return {
+    card_number: "0000 0000 0000 0000", phone: "+7 999 123-45-67",
+    wallet: "T… адрес USDT TRC20", account: "Номер счёта",
+  };
+}
+
+function payoutEstimate(provider, amount) {
+  if (!provider || !Number.isFinite(amount) || amount <= 0) return null;
+  const percent = Number(provider.fee) || 0;
+  let fee = Math.round(amount * percent) / 100;
+  const floor = provider.minFee === null || provider.minFee === undefined ? null : Number(provider.minFee);
+  if (floor !== null && fee < floor) fee = floor;
+  return { fee, payout: Math.round((amount - fee) * 100) / 100, percent, floor };
+}
+
+function payoutBody(provider, amount = "") {
+  if (!provider) return "";
+  const hints = payoutHints();
+  const fields = [];
+  if (provider.requisites === "card_id") {
+    fields.push(`<label class="field">Привязанная карта<select id="payout-card">
+      ${payoutOptions.cards.map((card) => `<option value="${safe(card.id)}">•••• ${safe(card.lastFour)} · ${safe(card.type || "карта")}</option>`).join("")}
+    </select></label>`);
+  } else {
+    if (provider.needsBank) {
+      fields.push(`<label class="field">Банк СБП<select id="payout-bank">
+        ${payoutOptions.banks.map((bank) => `<option value="${safe(bank.id)}">${safe(bank.name)}</option>`).join("")}
+      </select></label>`);
+    }
+    fields.push(`<label class="field">${safe(provider.requisitesTitle)}<input id="payout-account" autocomplete="off"
+      inputmode="${provider.requisites === "phone" ? "tel" : "text"}"
+      placeholder="${safe(hints[provider.requisites] || hints.account)}"></label>`);
+  }
+  if (provider.paymentMethods.length > 1) {
+    fields.push(`<label class="field">Платёжная система<select id="payout-method">
+      ${provider.paymentMethods.map((method) => `<option value="${safe(method.id)}">${safe(method.name || method.id)}</option>`).join("")}
+    </select></label>`);
+  }
+  const limit = provider.minValue !== null || provider.maxValue !== null
+    ? `<p class="payout-note">Лимит способа: ${rubles(provider.minValue)} – ${rubles(provider.maxValue)}</p>` : "";
+  return `${fields.join("")}
+    <label class="field">Сумма, ₽<input id="payout-amount" type="number" min="1" step="1" inputmode="numeric"
+      placeholder="500" value="${safe(amount)}"></label>
+    ${limit}
+    <div class="detail-rows" id="payout-estimate"></div>
+    <label class="field inline">Реквизиты мои, подтверждаю выплату<input type="checkbox" id="payout-confirm"></label>
+    <p class="form-error" role="alert" hidden></p>
+    <div class="form-actions"><button class="button primary" type="submit">Создать выплату</button></div>`;
+}
+
+function refreshPayoutEstimate() {
+  const provider = payoutProviderData(document.querySelector("#payout-provider")?.value);
+  const amount = Number(document.querySelector("#payout-amount")?.value);
+  const box = document.querySelector("#payout-estimate");
+  if (!box) return;
+  const estimate = payoutEstimate(provider, amount);
+  box.innerHTML = estimate ? `
+    <div><span>Комиссия</span><strong>${rubles(estimate.fee)} · ${estimate.percent}%</strong></div>
+    <div><span>К получению</span><strong>${rubles(estimate.payout)}</strong></div>
+    <div><span>Доступно к выводу</span><strong>${rubles(payoutOptions?.withdrawable)}</strong></div>` : "";
+}
+
+function renderPayoutDrawer(providerId = "", amount = "") {
+  if (!payoutOptions) return;
+  const providers = payoutOptions.providers;
+  if (!providers.length) {
+    showDrawer("Вывод средств", placeholder("Нет доступных способов вывода", "Проверьте статус аккаунта на Playerok.", "wallet",
+      button("К истории", "withdrawals", { glyph: "back", variant: "flat" })));
+    return;
+  }
+  const provider = payoutProviderData(providerId) || providers[0];
+  const warning = payoutOptions.fundsProtection
+    ? `<p class="payout-note">⚠️ Включена «Защита средств»: на новые реквизиты Playerok запросит код из почты. Код вводится только на сайте.</p>` : "";
+  const cardHint = provider.requisites === "card_id" && !payoutOptions.cards.length
+    ? `<p class="payout-note">${safe(payoutOptions.cardHint)}</p>` : "";
+  showDrawer("Вывод средств", `${warning}${cardHint}
+    <form id="payout-form">
+      <label class="field">Способ вывода<select id="payout-provider">
+        ${providers.map((entry) => `<option value="${safe(entry.id)}"${entry.id === provider.id ? " selected" : ""}>${safe(entry.name)}${entry.fee !== null ? ` · ${entry.fee}%` : ""}</option>`).join("")}
+      </select></label>
+      <div id="payout-body">${payoutBody(provider, amount)}</div>
+    </form>
+    ${button("Кошелёк и привязка карты на Playerok", "payoutSite", { glyph: "external", variant: "flat" })}
+    ${button("К истории вывода", "withdrawals", { glyph: "back", variant: "flat" })}`);
+  refreshPayoutEstimate();
+}
+
+async function payoutDrawer() {
+  if (!currentAccount) return;
+  const sequence = ++drawerSequence;
+  const account = currentAccount.id;
+  showDrawer("Вывод средств", skeleton());
+  try {
+    const result = await request(path("/withdrawal-methods"));
+    if (sequence !== drawerSequence || currentAccount?.id !== account) return;
+    payoutOptions = result;
+    renderPayoutDrawer();
+  } catch (error) {
+    if (sequence !== drawerSequence || currentAccount?.id !== account) return;
+    showDrawer("Вывод средств", `${placeholder("Вывод недоступен", error.message, "wallet")}
+      ${button("К истории", "withdrawals", { glyph: "back", variant: "flat" })}`);
+  }
+}
+
+async function submitPayout(form) {
+  const provider = payoutProviderData(form.querySelector("#payout-provider").value);
+  if (!provider) throw new Error("Выберите способ вывода.");
+  const card = form.querySelector("#payout-card");
+  const account = provider.requisites === "card_id"
+    ? (card ? card.value : "")
+    : (form.querySelector("#payout-account")?.value || "").trim();
+  if (!account) throw new Error(provider.requisites === "card_id"
+    ? "Привяжите карту на Playerok." : "Укажите реквизиты выплаты.");
+  const value = Number(form.querySelector("#payout-amount").value);
+  if (!Number.isInteger(value) || value <= 0) throw new Error("Введите сумму целыми рублями.");
+  if (!form.querySelector("#payout-confirm").checked) throw new Error("Подтвердите выплату.");
+  const method = form.querySelector("#payout-method")?.value || null;
+  const bank = form.querySelector("#payout-bank")?.value || null;
+  const result = await request(path("/withdrawals"), {
+    method: "POST",
+    body: { provider: provider.id, account, value, paymentMethodId: method, sbpBankMemberId: bank, confirm: true },
+  });
+  notify(`Выплата ${rubles(result.amount)} создана`);
+  await withdrawalsDrawer();
+}
+
 function openPayoutSite(contacts = false) {
-  const url = contacts ? "https://playerok.com/contacts" : "https://playerok.com/";
+  const url = contacts ? "https://playerok.com/contacts" : "https://playerok.com/wallet/withdraw";
   if (telegram?.openLink) telegram.openLink(url);
   else window.open(url, "_blank", "noopener,noreferrer");
 }
@@ -954,6 +1086,20 @@ function listingLink(slug) {
   else window.open(url, "_blank", "noopener,noreferrer");
 }
 
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (target.id !== "payout-provider") return;
+  const provider = payoutProviderData(target.value);
+  const body = document.querySelector("#payout-body");
+  const amount = document.querySelector("#payout-amount")?.value || "";
+  if (body && provider) body.innerHTML = payoutBody(provider, amount);
+  refreshPayoutEstimate();
+});
+
+document.addEventListener("input", (event) => {
+  if (event.target.id === "payout-amount") refreshPayoutEstimate();
+});
+
 document.addEventListener("click", (event) => {
   const target = event.target.closest("[data-action]");
   if (!target) return;
@@ -966,6 +1112,7 @@ document.addEventListener("click", (event) => {
   }
   if (action === "balance") balanceDrawer();
   if (action === "withdrawals") withdrawalsDrawer(value);
+  if (action === "newPayout") payoutDrawer();
   if (action === "payoutSite") openPayoutSite();
   if (action === "payoutContacts") openPayoutSite(true);
   if (action === "myListings") {
@@ -1039,6 +1186,7 @@ document.addEventListener("submit", async (event) => {
   if (!submit || submit.disabled) return;
   submit.disabled = true;
   try {
+    if (form.id === "payout-form") await submitPayout(form);
     if (form.id === "listing-form") await saveListingForm(form);
     if (form.id === "listing-photo-form") await sendPhotoForm(form);
     if (form.id === "telegram-api-form") {

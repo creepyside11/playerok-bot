@@ -25,6 +25,7 @@ from app.bot_store_ui import router as bot_store_router
 from app.kosell_ui import router as kosell_router
 from app.autosmm_ui import router as autosmm_router
 from app.handlers import Services, configure_handlers
+from app.withdrawal_ui import router as withdrawal_router
 from app.miniapp import start_miniapp
 from app.playerok import EmailAuthClient, PlayerokGateway
 from app.plugin_system import PluginManager
@@ -73,6 +74,7 @@ async def main() -> None:
     set_ai_plugin_manager(plugin_manager)
     dispatcher.include_router(ai_manager_router)
     dispatcher.include_router(items_manager_router)
+    dispatcher.include_router(withdrawal_router)
     dispatcher.include_router(
         configure_handlers(Services(session_factory, gateway, cipher, email_auth))
     )

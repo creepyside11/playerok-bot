@@ -211,7 +211,9 @@ async def test_balance_listing_edits_and_telegram_settings_are_scoped(tmp_path):
             assert data["cursor"] is None
             pok.call.assert_awaited_with("get_transactions", operation=TransactionOperations.WITHDRAW,
                                          count=10, after_cursor=None)
-            assert (await client.post(f"{base}/withdrawals", headers=headers, json={})).status == 405
+            rejected = await client.post(f"{base}/withdrawals", headers=headers, json={})
+            assert rejected.status == 400
+            assert "Подтвердите" in (await rejected.json())["error"]
             entry = await client.get(f"{base}/listings/owned-lot", headers=headers)
             assert (await entry.json())["name"] == "Свой лот"
             forbidden = await client.patch(f"{base}/listings/foreign-lot", headers=headers, json={"price": 1})

@@ -509,7 +509,8 @@ async def withdrawals(call: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
     await call.answer("Проверяю историю…")
     parts = [f"💸 <b>Вывод средств · @{html.escape(account.username)}</b>",
-             "Оформление выплаты и ввод полных реквизитов — только на сайте Playerok.",
+             "Выплату можно создать прямо здесь: способ вывода, реквизиты и сумма. "
+             "Реквизиты не сохраняются.",
              "<b>Последние выплаты</b>"]
     try:
         client = await svc().gateway.get_client(account)
@@ -525,8 +526,9 @@ async def withdrawals(call: CallbackQuery, state: FSMContext) -> None:
     except Exception:
         parts.append("Не удалось получить историю. Проверьте статус на сайте Playerok.")
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Рассчитать вывод", callback_data="payout_preview:start")],
-        [InlineKeyboardButton(text="🌐 Оформить на Playerok", url=PLAYEROK_URL)],
+        [InlineKeyboardButton(text="➕ Создать выплату", callback_data="wd:start")],
+        [InlineKeyboardButton(text="📝 Рассчитать без выплаты", callback_data="payout_preview:start")],
+        [InlineKeyboardButton(text="🌐 Официальный сайт", url=PLAYEROK_URL)],
         [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data="balance:withdrawals")],
         [InlineKeyboardButton(text="Помощь с выплатами", url=PLAYEROK_CONTACTS_URL)],
         [InlineKeyboardButton(text="⬅️ Баланс", callback_data="menu:balance")],

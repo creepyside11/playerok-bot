@@ -28,6 +28,10 @@ GET_EMAIL_AUTH_CODE = """mutation getEmailAuthCode($email: String!) {
   getEmailAuthCode(input: {email: $email})
 }"""
 
+# Isolated on purpose: if Playerok ever renames this field, only the payout
+# warning degrades instead of the shared viewer query breaking every screen.
+FUNDS_PROTECTION_QUERY = """query viewer { viewer { id isFundsProtectionActive } }"""
+
 CHECK_EMAIL_AUTH_CODE = """mutation checkEmailAuthCode($input: CheckEmailAuthCodeInput!) {
   checkEmailAuthCode(input: $input) {
     id username email role hasFrozenBalance isBlocked isBlockedFor canPublishItems
@@ -131,6 +135,7 @@ class ViewerSnapshot:
     can_publish_items: bool | None
     testimonials: int | None
     available_balance: str | int | float | None = None
+    funds_protection: bool | None = None
 
 
 class PlayerokSession:
@@ -167,6 +172,23 @@ class PlayerokSession:
                     testimonials=profile.get("testimonialCounter"),
                     available_balance=(data.get("balance") or {}).get("available"),
                 )
+            return await asyncio.to_thread(_load)
+
+    async def funds_protection(self) -> bool | None:
+        """True/False when Playerok answers, None when the field is unavailable."""
+        async with self.lock:
+            def _load() -> bool | None:
+                try:
+                    response = self.account.request(
+                        "post",
+                        f"{self.account.base_url}/graphql",
+                        {"accept": "*/*"},
+                        {"operationName": "viewer", "query": FUNDS_PROTECTION_QUERY, "variables": {}},
+                    ).json()
+                    value = ((response.get("data") or {}).get("viewer") or {}).get("isFundsProtectionActive")
+                except Exception:
+                    return None
+                return value if isinstance(value, bool) else None
             return await asyncio.to_thread(_load)
 
     async def balance(self) -> dict[str, Any]:

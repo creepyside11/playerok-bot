@@ -128,3 +128,9 @@ class WithdrawalPreview(StatesGroup):
     amount = State()
     last_four = State()
     confirm = State()
+
+class WithdrawalCreate(StatesGroup):
+    requisites = State()
+    bank = State()
+    amount = State()
+    confirm = State()

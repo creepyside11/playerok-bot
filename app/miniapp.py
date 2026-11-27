@@ -31,6 +31,7 @@ from .playerok import PlayerokGateway
 from .playerok_errors import playerok_error_text
 from .plugin_system import PluginManager, PluginSpec
 from .withdrawal_history import payout_history
+from .withdrawal_request import WithdrawalError, create_withdrawal, withdrawal_methods
 
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,8 @@ class MiniApp:
         self.token = token
         self.bot_profile = bot_profile
         self.telegram_plugins = TelegramPluginSettings(db)
+        self.withdrawal_locks: dict[str, asyncio.Lock] = {}
+        self.withdrawal_cooldowns: dict[str, float] = {}
 
     @web.middleware
     async def middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
@@ -378,6 +381,56 @@ class MiniApp:
         return web.json_response(await payout_history(
             client, account.playerok_user_id, after_cursor=page_cursor,
         ))
+
+    async def withdrawal_options(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        methods = await withdrawal_methods(client)
+        balance = balance_json(await client.balance())
+        probe = getattr(client, "funds_protection", None)
+        return web.json_response({
+            **methods,
+            "withdrawable": balance.get("withdrawable"),
+            "fundsProtection": bool(await probe()) if callable(probe) else False,
+        })
+
+    async def create_payout(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        body = await read_json(request)
+        if body.get("confirm") is not True:
+            raise web.HTTPBadRequest(reason="Подтвердите выплату перед отправкой.")
+        provider = body.get("provider")
+        requisites = body.get("account")
+        value = body.get("value")
+        method = body.get("paymentMethodId")
+        bank = body.get("sbpBankMemberId")
+        if not isinstance(provider, str) or not re.fullmatch(r"[A-Z_]{2,32}", provider):
+            raise web.HTTPBadRequest(reason="Выберите способ вывода.")
+        if not isinstance(requisites, str) or not 1 <= len(requisites) <= 64:
+            raise web.HTTPBadRequest(reason="Укажите реквизиты выплаты.")
+        if type(value) is not int or not 0 < value < 100_000_000:
+            raise web.HTTPBadRequest(reason="Введите сумму целыми рублями.")
+        if method is not None and (not isinstance(method, str) or not re.fullmatch(r"[A-Z_]{2,32}", method)):
+            raise web.HTTPBadRequest(reason="Неизвестный способ оплаты.")
+        if bank is not None and (not isinstance(bank, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", bank)):
+            raise web.HTTPBadRequest(reason="Неизвестный банк СБП.")
+
+        key = str(account.id)
+        lock = self.withdrawal_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if time.monotonic() - self.withdrawal_cooldowns.get(key, 0) < 3:
+                raise web.HTTPConflict(reason="Выплата только что создана. Проверьте историю.")
+            client = await self.gateway.get_client(account)
+            try:
+                result = await create_withdrawal(
+                    client, account.playerok_user_id,
+                    provider_id=provider, account=requisites, value=value,
+                    payment_method_id=method, sbp_bank_member_id=bank,
+                )
+            except WithdrawalError as exc:
+                raise web.HTTPBadRequest(reason=str(exc)) from exc
+            self.withdrawal_cooldowns[key] = time.monotonic()
+        return web.json_response(result, status=201)
 
     async def chats(self, request: web.Request) -> web.Response:
         account = await self.account(request)
@@ -619,6 +672,8 @@ class MiniApp:
             ("GET", "/overview", self.overview),
             ("GET", "/balance", self.balance),
             ("GET", "/withdrawals", self.withdrawals),
+            ("POST", "/withdrawals", self.create_payout),
+            ("GET", "/withdrawal-methods", self.withdrawal_options),
             ("GET", "/chats", self.chats),
             ("GET", "/chats/{chat_id}", self.history),
             ("POST", "/chats/{chat_id}/reply", self.reply),
