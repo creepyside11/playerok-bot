@@ -123,3 +123,8 @@ class KosellState(StatesGroup):
     edit_template = State()
 
 
+
+class WithdrawalPreview(StatesGroup):
+    amount = State()
+    last_four = State()
+    confirm = State()

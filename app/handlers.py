@@ -5,8 +5,10 @@ import copy
 import html
 import io
 import logging
+import time
 import uuid
 from typing import Any
+from decimal import Decimal
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -29,7 +31,12 @@ from .keyboards import auth_method_menu, back_menu, delivery_mode_menu, main_men
 from .models import AutoReplyRule, DeliveryRule, DeliveryStock, ItemTemplate, PlayerokAccount, TelegramUser, fresh_settings
 from .playerok_errors import playerok_error_text
 from .playerok import DEFAULT_USER_AGENT, EmailAuthClient, PlayerokGateway, normalize_proxy
-from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate
+from .states import AddAccount, AutoReplyAdd, DeliveryAdd, ItemCreate, WithdrawalPreview
+from .withdrawal_history import PLAYEROK_CONTACTS_URL, PLAYEROK_URL, payout_history
+from .withdrawal_preview import (
+    PreviewUnavailable, current_withdrawable, format_money, parse_details_suffix,
+    parse_preview_amount, remaining_balance,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -466,7 +473,9 @@ async def profile(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu:balance")
-async def balance(call: CallbackQuery) -> None:
+async def balance(call: CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state() in WithdrawalPreview.__all_states_names__:
+        await state.clear()
     account = await require_account(call)
     if not account:
         return
@@ -477,7 +486,252 @@ async def balance(call: CallbackQuery) -> None:
         text = f"💰 <b>Баланс {html.escape(account.username)}</b>\n\n<b>{html.escape(str(value))} ₽</b>"
     except Exception as exc:
         text = f"❌ Ошибка баланса:\n<code>{html.escape(str(exc))[:1600]}</code>"
-    await edit(call, text, back_menu())
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Вывод", callback_data="balance:withdrawals")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu:balance")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
+    ])
+    await edit(call, text, markup)
+
+
+@router.callback_query(F.data == "balance:withdrawals")
+async def withdrawals(call: CallbackQuery, state: FSMContext) -> None:
+    if not call.message or call.message.chat.type != ChatType.PRIVATE:
+        await call.answer("Откройте раздел в личном чате с ботом.", show_alert=True)
+        return
+    account = await require_account(call)
+    if not account:
+        return
+    if account.tg_user_id != call.from_user.id:
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
+    if await state.get_state() in WithdrawalPreview.__all_states_names__:
+        await state.clear()
+    await call.answer("Проверяю историю…")
+    parts = [f"💸 <b>Вывод средств · @{html.escape(account.username)}</b>",
+             "Оформление выплаты и ввод полных реквизитов — только на сайте Playerok.",
+             "<b>Последние выплаты</b>"]
+    try:
+        client = await svc().gateway.get_client(account)
+        result = await payout_history(client, account.playerok_user_id)
+        for entry in result["items"]:
+            money = html.escape(entry["amount"] or "—")
+            label = html.escape(entry["statusLabel"])
+            details = html.escape(entry["details"] or "—")
+            created = html.escape((entry["time"] or "—")[:30])
+            parts.append(f"<b>{money} ₽</b> · {label}\nРеквизиты: {details}\nДата: {created}")
+        if not result["items"]:
+            parts.append("На этой странице выплат нет.")
+    except Exception:
+        parts.append("Не удалось получить историю. Проверьте статус на сайте Playerok.")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Рассчитать вывод", callback_data="payout_preview:start")],
+        [InlineKeyboardButton(text="🌐 Оформить на Playerok", url=PLAYEROK_URL)],
+        [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data="balance:withdrawals")],
+        [InlineKeyboardButton(text="Помощь с выплатами", url=PLAYEROK_CONTACTS_URL)],
+        [InlineKeyboardButton(text="⬅️ Баланс", callback_data="menu:balance")],
+    ])
+    await edit(call, "\n\n".join(parts), markup)
+
+PREVIEW_LIFETIME = 10 * 60
+
+
+def preview_cancel_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отменить", callback_data="balance:withdrawals")],
+    ])
+
+
+def preview_result_markup(nonce: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтверждаю: средства мои", callback_data=f"payout_preview:confirm:{nonce}")],
+        [InlineKeyboardButton(text="Изменить сумму", callback_data="payout_preview:start")],
+        [InlineKeyboardButton(text="Отменить", callback_data="balance:withdrawals")],
+    ])
+
+
+def preview_official_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Перейти на Playerok", url=PLAYEROK_URL)],
+        [InlineKeyboardButton(text="Помощь с выплатами", url=PLAYEROK_CONTACTS_URL)],
+        [InlineKeyboardButton(text="⬅️ История вывода", callback_data="balance:withdrawals")],
+    ])
+
+
+async def preview_account(tg_id: int, state: FSMContext) -> PlayerokAccount:
+    data = await state.get_data()
+    account = await active_account(tg_id)
+    created = data.get("preview_created")
+    if (
+        not account or account.tg_user_id != tg_id
+        or str(account.id) != data.get("preview_account")
+        or not isinstance(created, (int, float))
+        or not 0 <= time.monotonic() - created <= PREVIEW_LIFETIME
+    ):
+        await state.clear()
+        raise PreviewUnavailable("Расчёт устарел или аккаунт изменился. Начните заново.")
+    return account
+
+
+async def preview_available(account: PlayerokAccount) -> Decimal:
+    client = await svc().gateway.get_client(account)
+    return await current_withdrawable(client, account.playerok_user_id)
+
+
+async def invalidate_preview(state: FSMContext, exc: Exception) -> str:
+    await state.clear()
+    if isinstance(exc, (PreviewUnavailable, ValueError)):
+        # Internal validation errors carry a user-safe message.
+        if isinstance(exc, PreviewUnavailable):
+            return str(exc)
+        return "Сумма больше доступного остатка или расчёт устарел. Начните заново."
+    return "Не удалось проверить текущий баланс. Начните расчёт заново или откройте Playerok."
+
+
+def preview_text(account: PlayerokAccount, available: Decimal, requested: Decimal, suffix: str) -> str:
+    remainder = remaining_balance(available, requested)
+    return (
+        "📝 <b>Предварительный расчёт вывода</b>\n"
+        f"Аккаунт: @{html.escape(account.username)}\n\n"
+        f"Доступно к выводу: <b>{format_money(available)}</b>\n"
+        f"Сумма: <b>{format_money(requested)}</b>\n"
+        f"Расчётный остаток: <b>{format_money(remainder)}</b>\n"
+        f"Реквизиты: <b>•••• {suffix}</b> (проверен только формат)\n\n"
+        "Комиссия и фактический остаток определяются на сайте. "
+        "Подтвердите, что средства принадлежат вам. Это подтверждение расчёта, не перевод."
+    )
+
+
+@router.callback_query(F.data == "payout_preview:start")
+async def preview_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not call.message or call.message.chat.type != ChatType.PRIVATE:
+        await call.answer("Откройте личный чат с ботом.", show_alert=True)
+        return
+    account = await active_account(call.from_user.id)
+    if not account or account.tg_user_id != call.from_user.id:
+        await call.answer("Сначала подключите свой аккаунт.", show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Проверяю аккаунт и баланс…")
+    try:
+        available = await preview_available(account)
+    except Exception as exc:
+        await edit(call, await invalidate_preview(state, exc), preview_official_markup())
+        return
+    if available <= 0:
+        await edit(call, "Сейчас нет средств, доступных к выводу.", preview_official_markup())
+        return
+    await state.set_data({
+        "preview_account": str(account.id), "preview_created": time.monotonic(),
+    })
+    await state.set_state(WithdrawalPreview.amount)
+    await edit(call, (
+        f"📝 <b>Расчёт вывода · @{html.escape(account.username)}</b>\n\n"
+        f"Доступно к выводу: <b>{format_money(available)}</b>\n"
+        "Введите сумму в рублях (например, 500 или 500,50).\n\n"
+        "Это предварительный расчёт без списания средств."
+    ), preview_cancel_markup())
+
+
+@router.message(WithdrawalPreview.amount, F.chat.type == ChatType.PRIVATE)
+async def preview_amount(message: Message, state: FSMContext) -> None:
+    try:
+        requested = parse_preview_amount(message.text)
+    except ValueError as exc:
+        await message.answer(str(exc), reply_markup=preview_cancel_markup())
+        return
+    try:
+        account = await preview_account(message.from_user.id, state)
+        available = await preview_available(account)
+    except Exception as exc:
+        await message.answer(await invalidate_preview(state, exc), reply_markup=preview_official_markup())
+        return
+    if requested > available:
+        await message.answer(
+            f"Недостаточно средств. Доступно к выводу: {format_money(available)}. Введите меньшую сумму.",
+            reply_markup=preview_cancel_markup(),
+        )
+        return
+    await state.update_data(preview_amount=str(requested))
+    await state.set_state(WithdrawalPreview.last_four)
+    await message.answer(
+        "Введите только последние 4 цифры карты или номера телефона, чтобы сверить реквизиты. "
+        "Не отправляйте полный номер, CVV, PIN или коды подтверждения.",
+        reply_markup=preview_cancel_markup(),
+    )
+
+
+@router.message(WithdrawalPreview.last_four, F.chat.type == ChatType.PRIVATE)
+async def preview_details(message: Message, state: FSMContext) -> None:
+    # Best effort: remove the user's input even when they accidentally sent full details.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        suffix = parse_details_suffix(message.text)
+    except ValueError as exc:
+        await message.answer(str(exc), reply_markup=preview_cancel_markup())
+        return
+    try:
+        account = await preview_account(message.from_user.id, state)
+        available = await preview_available(account)
+        requested = parse_preview_amount((await state.get_data()).get("preview_amount"))
+        remaining_balance(available, requested)
+    except Exception as exc:
+        await message.answer(await invalidate_preview(state, exc), reply_markup=preview_official_markup())
+        return
+    nonce = uuid.uuid4().hex[:16]
+    await state.update_data(
+        preview_suffix=suffix, preview_available=str(available), preview_nonce=nonce,
+    )
+    await state.set_state(WithdrawalPreview.confirm)
+    await message.answer(
+        preview_text(account, available, requested, suffix),
+        reply_markup=preview_result_markup(nonce), parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("payout_preview:confirm:"))
+async def preview_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    if not call.message or call.message.chat.type != ChatType.PRIVATE:
+        await call.answer("Откройте личный чат с ботом.", show_alert=True)
+        return
+    data = await state.get_data()
+    if (
+        await state.get_state() != WithdrawalPreview.confirm.state
+        or call.data.rsplit(":", 1)[-1] != data.get("preview_nonce")
+    ):
+        await call.answer("Этот расчёт уже завершён или устарел.", show_alert=True)
+        return
+    await call.answer("Повторно проверяю баланс…")
+    try:
+        account = await preview_account(call.from_user.id, state)
+        available = await preview_available(account)
+        requested = parse_preview_amount(data.get("preview_amount"))
+        suffix = parse_details_suffix(data.get("preview_suffix"))
+        remaining_balance(available, requested)
+        quoted_balance = parse_preview_amount(data.get("preview_available"))
+    except Exception as exc:
+        await edit(call, await invalidate_preview(state, exc), preview_official_markup())
+        return
+    if available != quoted_balance:
+        nonce = uuid.uuid4().hex[:16]
+        await state.update_data(preview_available=str(available), preview_nonce=nonce)
+        await edit(call, "Баланс изменился. Проверьте расчёт повторно.\n\n" + preview_text(
+            account, available, requested, suffix,
+        ), preview_result_markup(nonce))
+        return
+    await state.clear()
+    await edit(call, (
+        "✅ <b>Расчёт подтверждён</b>\n\n"
+        f"Сумма: <b>{format_money(requested)}</b>\n"
+        f"Расчётный остаток: <b>{format_money(remaining_balance(available, requested))}</b>\n"
+        f"Реквизиты для сверки: <b>•••• {suffix}</b>\n\n"
+        "Средства не списаны, заявка не создана. Оформите выплату на Playerok; там же "
+        "проверяются полные реквизиты и комиссия. После создания заявки её статус будет доступен в истории."
+    ), preview_official_markup())
+
 
 
 async def notifications_markup(account: PlayerokAccount) -> InlineKeyboardMarkup:

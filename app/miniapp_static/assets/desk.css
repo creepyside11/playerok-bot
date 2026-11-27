@@ -300,3 +300,9 @@ svg{display:block}
   .account-pill:not(.balance-pill){max-width:111px}
 }
 @media(max-width:355px){.balance-pill>span{display:none}}
+
+/* Read-only payout history in the balance drawer. */
+.payout-note{color:var(--muted);font-size:.88rem;line-height:1.5}
+.payout-actions{display:grid;gap:8px;margin:12px 0 20px}
+.payout-row{padding:12px 0;border-top:1px solid var(--line)}
+.payout-row .detail-rows{margin-bottom:0}
