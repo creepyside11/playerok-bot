@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 from typing import Any
 import urllib.request
 import urllib.error
 
+from app.telegram_commands import (
+    ASK_ALIASES, ASK_STOP, command_argument, is_command, is_known_command,
+)
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_META = {
     "id": "ai_assistant",
-    "name": "ИИ Ассистент (#помощь)",
-    "version": "1.0.0",
+    "name": "ИИ Ассистент (#аск)",
+    "version": "1.1.0",
     "author": "Playerok Bot",
     "description": (
-        "Интеллектуальный автоответчик: активируется по команде #помощь или на все вопросы. "
-        "Использует Anthropic Messages API (прямой SDK или совместимый REST), учитывает лот и зовёт продавца при затруднении."
+        "Интеллектуальный автоответчик: покупатель вызывает его командой #аск и останавливает командой #аскстоп. "
+        "Использует Anthropic Messages API (прямой SDK или совместимый REST), учитывает лот и зовёт продавца при затруднении. "
+        "Остальные команды (#код, #продавец) продолжают работать даже во время диалога."
     ),
     "settings": {
         "api_key": {
@@ -49,6 +55,11 @@ PLUGIN_META = {
             "label": "Режим работы",
             "type": "choice",
             "choices": ["help_command_only", "always_after_help", "all_messages"],
+            "choice_labels": {
+                "help_command_only": "Только по команде #аск",
+                "always_after_help": "Диалог 30 минут после #аск",
+                "all_messages": "Отвечать на все сообщения",
+            },
             "default": "help_command_only",
         },
         "notify_tg_on_reply": {
@@ -61,6 +72,16 @@ PLUGIN_META = {
 
 # Хранилище активных диалогов с ИИ в памяти: chat_id -> timestamp последнего обращения
 _ACTIVE_AI_CHATS: dict[str, float] = {}
+DIALOG_TTL = 1800.0
+MAX_TRACKED_CHATS = 2000
+DEFAULT_QUESTION = "Здравствуйте, мне нужна помощь по заказу."
+STOP_MESSAGE = (
+    "🤖 Помощник остановлен — дальше с вами общается продавец.\n\n"
+    "Чтобы снова позвать помощника (ИИ), отправьте #аск и свой вопрос."
+)
+UNAVAILABLE_MESSAGE = (
+    "🤖 Помощник сейчас недоступен. Я передал ваш вопрос продавцу — он ответит в этом чате."
+)
 
 
 class AnthropicBridge:
@@ -206,40 +227,56 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
     if not chat_id:
         return
 
+    sender_user = getattr(message, "user", None)
+    buyer_name = getattr(sender_user, "username", "Покупатель") or "Покупатель"
+
     config = ctx.config
     api_key = str(config.get("api_key") or "").strip()
-    if not api_key:
-        return
-
     base_url = str(config.get("base_url") or "https://api.anthropic.com").strip()
-    model = str(config.get("model") or "claude-3-5-sonnet-20241022").strip()
+    model = str(config.get("model") or "").strip()
     base_prompt = str(config.get("base_prompt") or "").strip()
     mode = str(config.get("mode") or "help_command_only")
 
-    is_help_command = text.startswith("#помощь") or text.startswith("#help")
     loop = asyncio.get_running_loop()
     now = loop.time()
 
-    should_respond = False
-    clean_user_question = text
+    # #аскстоп — единственная команда, которая гасит помощника в этом чате.
+    if is_command(text, (ASK_STOP,)):
+        _ACTIVE_AI_CHATS.pop(chat_id, None)
+        await ctx.send_chat(chat_id, STOP_MESSAGE)
+        return
 
-    if is_help_command:
-        should_respond = True
-        _ACTIVE_AI_CHATS[chat_id] = now
-        parts = text.split(maxsplit=1)
-        clean_user_question = parts[1].strip() if len(parts) > 1 else "Здравствуйте, мне нужна помощь по заказу."
+    # explicit — покупатель позвал помощника сам командой #аск.
+    # Только в этом случае мы гарантированно отвечаем и зовём продавца при сбое,
+    # чтобы пассивные режимы не заваливали продавца уведомлениями.
+    explicit = False
+    if is_command(text, ASK_ALIASES):
+        explicit = should_respond = True
+        clean_user_question = command_argument(text, ASK_ALIASES) or DEFAULT_QUESTION
+        _remember(chat_id, now)
+    elif is_known_command(text):
+        # #код, #продавец и прочие команды работают даже во время диалога:
+        # помощник на них не отвечает, иначе они бы не доходили до адресата.
+        return
     elif mode == "all_messages":
         should_respond = True
-    elif mode == "always_after_help":
-        last_time = _ACTIVE_AI_CHATS.get(chat_id, 0)
-        if now - last_time < 1800:
-            should_respond = True
+        clean_user_question = text
+    elif mode == "always_after_help" and now - _ACTIVE_AI_CHATS.get(chat_id, 0) < DIALOG_TTL:
+        should_respond = True
+        clean_user_question = text
+    else:
+        should_respond = False
+        clean_user_question = text
 
     if not should_respond:
         return
 
-    sender_user = getattr(message, "user", None)
-    buyer_name = getattr(sender_user, "username", "Покупатель") or "Покупатель"
+    if not api_key or not model:
+        # Помощник не настроен: не оставляем покупателя без ответа.
+        if explicit:
+            await ctx.send_chat(chat_id, UNAVAILABLE_MESSAGE)
+            await ctx.call_seller(chat_id, buyer=buyer_name, question=clean_user_question)
+        return
 
     item_context = _extract_item_context(chat, message)
 
@@ -252,7 +289,8 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
         "ВАЖНО:\n"
         "1. Отвечай от лица поддержки продавца.\n"
         "2. Если ты не можешь помочь или вопрос требует действий продавца, добавь в ответ тег [CALL_SELLER] и напиши, что позвал продавца.\n"
-        "3. Никогда не обещай возвратов и не подтверждай ничего от лица финансового отдела площадки."
+        "3. Никогда не обещай возвратов и не подтверждай ничего от лица финансового отдела площадки.\n"
+        "4. Покупатель может остановить тебя командой #аскстоп — не спорь с этим."
     )
 
     client = AnthropicBridge(api_key=api_key, base_url=base_url)
@@ -266,14 +304,16 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
         )
     except Exception as exc:
         logger.exception("AI assistant generation failed for chat %s", chat_id)
+        if not explicit:
+            return
         await ctx.send_chat(
             chat_id,
             "🤖 Извините, произошла техническая ошибка связи с ИИ. Я уже уведомил продавца, он ответит вам в ближайшее время!",
         )
         await ctx.notify(
             f"⚠️ <b>ИИ Ассистент: ошибка вызова API</b> в чате с <b>@{buyer_name}</b>:\n"
-            f"<code>{str(exc)[:400]}</code>\n"
-            f"Вопрос покупателя: {clean_user_question}"
+            f"<code>{html.escape(str(exc)[:400])}</code>\n"
+            f"Вопрос покупателя: {html.escape(clean_user_question)}"
         )
         return
 
@@ -286,15 +326,18 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
     await ctx.send_chat(chat_id, final_reply)
 
     if needs_seller:
-        await ctx.notify(
-            f"🔔 <b>ИИ Ассистент зовёт продавца!</b>\n"
-            f"Чат с: <b>@{buyer_name}</b> (ID чата: <code>{chat_id}</code>)\n"
-            f"Вопрос покупателя: <i>{clean_user_question}</i>\n\n"
-            f"Ответ ИИ покупателю:\n{final_reply}"
-        )
+        await ctx.call_seller(chat_id, buyer=buyer_name, question=clean_user_question)
     elif config.get("notify_tg_on_reply"):
         await ctx.notify(
             f"🤖 <b>ИИ ответил покупателю @{buyer_name}</b>\n"
             f"Вопрос: <i>{clean_user_question}</i>\n\n"
             f"Ответ:\n{final_reply}"
         )
+
+
+def _remember(chat_id: str, now: float) -> None:
+    if len(_ACTIVE_AI_CHATS) > MAX_TRACKED_CHATS:
+        for key, stamp in list(_ACTIVE_AI_CHATS.items()):
+            if now - stamp >= DIALOG_TTL:
+                _ACTIVE_AI_CHATS.pop(key, None)
+    _ACTIVE_AI_CHATS[chat_id] = now

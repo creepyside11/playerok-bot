@@ -1794,9 +1794,10 @@ async def plugin_setting_click(call: CallbackQuery, state: FSMContext) -> None:
         return
     if kind == "choice":
         choices = list(meta.get("choices") or [])
+        labels = meta.get("choice_labels") or {}
         b = InlineKeyboardBuilder()
         for ci, value in enumerate(choices):
-            b.button(text=clip(value, 34), callback_data=f"pchoice:{idx}:{key}:{ci}")
+            b.button(text=clip(labels.get(value, value), 34), callback_data=f"pchoice:{idx}:{key}:{ci}")
         b.adjust(1)
         await call.answer()
         await edit(call, f"Выберите: <b>{html.escape(meta.get('label', key))}</b>", b.as_markup())

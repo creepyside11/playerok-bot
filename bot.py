@@ -131,6 +131,13 @@ async def main() -> None:
                 await worker_task
         if web_runner is not None:
             await web_runner.cleanup()
+        try:
+            # Закрываем кешированные клиенты Telethon, чтобы не оставлять сокеты.
+            from app.telegram_accounts_manager import reset_telethon_cache
+
+            await reset_telethon_cache()
+        except Exception:
+            pass
         await bot.session.close()
         await http_client.aclose()
         await engine.dispose()

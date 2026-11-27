@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import html
 import logging
 import re
+import time
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
@@ -22,7 +23,24 @@ from app.telegram_accounts_manager import (
     format_code_message,
     format_code_repeat_message,
     format_code_waiting_message,
+    format_code_after_revoke_message,
     format_delivery_message,
+    format_exit_already_revoked_message,
+    format_exit_cancelled_message,
+    format_exit_check_failed_message,
+    format_exit_confirm_message,
+    format_exit_done_message,
+    format_exit_expired_message,
+    format_exit_no_buyer_session_message,
+    format_exit_not_issued_message,
+    format_seller_called_message,
+    buyer_session_present,
+    list_authorizations,
+    logout_telethon_session,
+)
+from app.telegram_commands import (
+    CODE, EXIT_ALIASES, NO_ALIASES, SELLER_ALIASES, YES_ALIASES,
+    command_argument, is_command,
 )
 from app.worker import claim_event
 from playerokapi.enums import ItemDealDirections, ItemDealStatuses
@@ -30,16 +48,29 @@ from playerokapi.enums import ItemDealDirections, ItemDealStatuses
 logger = logging.getLogger("plugin.telegram_accounts")
 PAID_STATUSES = {ItemDealStatuses.PAID, ItemDealStatuses.PENDING}
 INTRO_RETRY_DELAY = timedelta(minutes=1)
+#: Один вызов продавца на чат в минуту — покупатель может нажать несколько раз.
+SELLER_CALL_COOLDOWN = 60.0
+_seller_calls: dict[str, float] = {}
+#: Повторный #код в пределах этого окна отвечаем мгновенно из уже известного кода,
+#: чтобы не дёргать Telethon и не ловить флуд-лимиты.
+CODE_MIN_INTERVAL = 2.5
+_code_calls: dict[str, float] = {}
+#: Сколько ждём #да/#нет после #выход: chat_id -> момент истечения (monotonic).
+EXIT_CONFIRM_TTL = 600.0
+_pending_exit: dict[str, float] = {}
 
 PLUGIN_META = {
     "id": "telegram_accounts",
     "name": "Telegram Accounts",
-    "version": "1.1.0",
+    "version": "1.3.0",
     "author": "Playerok Bot",
     "description": (
         "Автовыдача Telegram-профилей по странам с получением кода через Telethon. "
-        "После оплаты выдает номер и ожидает команду #код, по которой находит код в Telethon, "
-        "передает покупателю и автоматически переводит сделку в статус «Выполнен»."
+        "После оплаты выдает номер и ожидает команду #код (можно повторять), находит код в Telethon, "
+        "передает покупателю и автоматически переводит сделку в статус «Выполнен». "
+        "Команда #продавец зовёт продавца: в Telegram приходит крупное сообщение, закреплённое в чате. "
+        "Команда #выход (с подтверждением #да/#нет) завершает сессию продавца через auth.logOut — "
+        "профиль остаётся только у покупателя."
     ),
     "settings": {
         "default_api_id": {"label": "Telegram API ID", "type": "str", "default": str(default_telegram_api_id())},
@@ -138,6 +169,14 @@ async def on_deal(ctx: Any, deal: Any) -> bool:
 async def send_initial_message(ctx: Any, record: TelegramAccountDeal) -> None:
     now = datetime.now(timezone.utc)
     async with ctx.db() as session:
+        # Снимаем состояние ДО захвата аренды: у новой сделки intro_sent = None, и раньше
+        # это ошибочно считалось «повторной попыткой», из-за чего перед самой первой
+        # отправкой делался лишний запрос истории чата — отсюда была задержка в минуту.
+        row = (await session.execute(
+            select(TelegramAccountDeal.intro_attempted_at, TelegramAccountDeal.created_at)
+            .where(TelegramAccountDeal.id == record.id)
+        )).first()
+        prior_attempt_at, created_at = row if row else (None, None)
         lease = await session.execute(update(TelegramAccountDeal).where(
             TelegramAccountDeal.id == record.id,
             TelegramAccountDeal.intro_sent.is_not(True),
@@ -155,8 +194,10 @@ async def send_initial_message(ctx: Any, record: TelegramAccountDeal) -> None:
     text = format_delivery_message(record.country, record.phone)
     stage = "история чата"
     try:
-        previous_attempt = record.intro_sent is None or record.intro_attempted_at is not None
-        already_sent = previous_attempt and await initial_message_in_history(ctx, record, text)
+        # Сверяемся с историей, только если отправка могла пройти раньше: либо попытка
+        # уже фиксировалась, либо сделка висит дольше окна повтора (старые записи).
+        uncertain = prior_attempt_at is not None or _stale(created_at, now - INTRO_RETRY_DELAY)
+        already_sent = uncertain and await initial_message_in_history(ctx, record, text)
         if not already_sent:
             stage = "отправка"
             message = await ctx.client.send_message(record.chat_id, text, mark_chat_as_read=False)
@@ -187,6 +228,15 @@ async def send_initial_message(ctx: Any, record: TelegramAccountDeal) -> None:
         )
 
 
+def _stale(created_at: Any, threshold: datetime) -> bool:
+    """True, если запись создана раньше порога (значение из SQLite бывает без tzinfo)."""
+    if not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at < threshold
+
+
 async def notify_seller(ctx: Any, deal_id: str, text: str) -> None:
     try:
         await ctx.notify(text)
@@ -195,48 +245,58 @@ async def notify_seller(ctx: Any, deal_id: str, text: str) -> None:
 
 
 async def initial_message_in_history(ctx: Any, record: TelegramAccountDeal, text: str) -> bool:
-    """Reconcile an uncertain send before trying it again."""
+    """Reconcile an uncertain send before trying it again.
+
+    Одна страница последних сообщений: этого достаточно, чтобы понять, ушла ли
+    инструкция, и это на порядок быстрее пяти последовательных запросов.
+    """
     created = record.created_at
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
     older_than = created - timedelta(minutes=1)
-    cursor = None
-    for _ in range(5):
-        page = await ctx.client.call("get_chat_messages", record.chat_id, count=24, after_cursor=cursor)
-        if page is None:
-            break
-        for message in page.messages or []:
-            if message is None:
-                continue
-            if timestamp := getattr(message, "created_at", None):
-                try:
-                    if datetime.fromisoformat(timestamp) < older_than:
-                        return False
-                except (TypeError, ValueError):
-                    pass
-            if getattr(message, "text", None) == text and str(getattr(
-                getattr(message, "user", None), "id", "",
-            )) == str(ctx.account.playerok_user_id) and not getattr(message, "deleted_at", None):
-                return True
-        if not getattr(page.page_info, "has_next_page", False):
-            return False
-        next_cursor = getattr(page.page_info, "end_cursor", None)
-        if not next_cursor or next_cursor == cursor:
-            break
-        cursor = next_cursor
-    raise RuntimeError("Could not verify prior delivery in Playerok chat")
+    page = await ctx.client.call("get_chat_messages", record.chat_id, count=24, after_cursor=None)
+    if page is None:
+        raise RuntimeError("Could not verify prior delivery in Playerok chat")
+    for message in page.messages or []:
+        if message is None:
+            continue
+        if timestamp := getattr(message, "created_at", None):
+            try:
+                if datetime.fromisoformat(timestamp) < older_than:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        if getattr(message, "text", None) == text and str(getattr(
+            getattr(message, "user", None), "id", "",
+        )) == str(ctx.account.playerok_user_id) and not getattr(message, "deleted_at", None):
+            return True
+    return False
 
 
 async def on_message(ctx: Any, chat: Any, message: Any) -> None:
-    """Обрабатывает сообщения в чате. По команде #код запрашивает 5-значный код из Telethon."""
-    text = (getattr(message, "text", "") or "").strip().lower()
-    if not text:
-        return
-    if text != "#код" and not text.startswith("#код"):
+    """Обрабатывает сообщения в чате: #код выдаёт код, #продавец зовёт продавца."""
+    raw = getattr(message, "text", "") or ""
+    if not raw.strip():
         return
 
     chat_id = str(getattr(chat, "id", "") or "")
     if not chat_id:
+        return
+
+    if is_command(raw, SELLER_ALIASES):
+        await call_seller(ctx, chat_id, message, command_argument(raw, SELLER_ALIASES))
+        return
+    if is_command(raw, EXIT_ALIASES):
+        await request_exit(ctx, chat_id)
+        return
+    # #да / #нет — ответ на подтверждение выхода; вне подтверждения игнорируем.
+    if is_command(raw, YES_ALIASES):
+        await confirm_exit(ctx, chat_id, approved=True)
+        return
+    if is_command(raw, NO_ALIASES):
+        await confirm_exit(ctx, chat_id, approved=False)
+        return
+    if not is_command(raw, (CODE,)):
         return
 
     account = ctx.account
@@ -251,6 +311,9 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
             .order_by(TelegramAccountDeal.id.desc())
         )
         if not deal_record:
+            return
+        if deal_record.session_revoked:
+            await ctx.send_chat(chat_id, format_code_after_revoke_message())
             return
 
         stock = await session.get(TelegramAccountStock, deal_record.stock_id)
@@ -274,6 +337,17 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
     if not session_str:
         await ctx.send_chat(chat_id, "⚠️ Ошибка безопасности сессии. Свяжитесь с продавцом.")
         return
+
+    # Повторный запрос в пределах пары секунд отдаём сразу, без обращения к Telegram.
+    now = time.monotonic()
+    if now - _code_calls.get(chat_id, 0) < CODE_MIN_INTERVAL:
+        cached = (format_code_repeat_message(deal_record.code_sent) if deal_record.code_sent
+                  else format_code_waiting_message(deal_record.phone))
+        await ctx.send_chat(chat_id, cached)
+        return
+    if len(_code_calls) > 2000:
+        _code_calls.clear()
+    _code_calls[chat_id] = now
 
     # Запрашиваем последний 5-значный код из Telethon (можно запрашивать повторно сколько угодно раз)
     code, raw_text = await fetch_latest_code_from_telethon(session_str, api_id, api_hash)
@@ -320,6 +394,141 @@ async def on_message(ctx: Any, chat: Any, message: Any) -> None:
         f"Номер: <code>{html.escape(deal_record.phone)}</code>\n"
         f"Код: <code>{html.escape(code)}</code>\n\n"
         "Заказ переведён в статус «Выполнен», покупателю отправлена просьба подтвердить заказ на Playerok."
+    )
+
+
+async def call_seller(ctx: Any, chat_id: str, message: Any, question: str) -> None:
+    """#продавец: крупное закреплённое сообщение в Telegram плюс ответ покупателю."""
+    now = time.monotonic()
+    if now - _seller_calls.get(chat_id, 0) < SELLER_CALL_COOLDOWN:
+        return
+    if len(_seller_calls) > 500:
+        _seller_calls.clear()
+    _seller_calls[chat_id] = now
+
+    buyer = getattr(getattr(message, "user", None), "username", None) or "Покупатель"
+    try:
+        await ctx.send_chat(chat_id, format_seller_called_message())
+    except Exception as exc:
+        logger.warning("Не удалось ответить покупателю в чате %s (%s)", chat_id, type(exc).__name__)
+    await ctx.call_seller(chat_id, buyer=buyer, question=question)
+
+
+async def _latest_deal(ctx: Any, chat_id: str) -> Any:
+    async with ctx.db() as session:
+        return await session.scalar(
+            select(TelegramAccountDeal)
+            .where(
+                TelegramAccountDeal.account_id == ctx.account.id,
+                TelegramAccountDeal.chat_id == chat_id,
+            )
+            .order_by(TelegramAccountDeal.id.desc())
+        )
+
+
+async def _session_material(ctx: Any, record: Any) -> tuple[str, int, str] | None:
+    """Расшифрованная строка сессии и настройки API для сделки."""
+    async with ctx.db() as session:
+        stock = await session.get(TelegramAccountStock, record.stock_id)
+        if not stock or not stock.session_encrypted:
+            return None
+        cfg = await session.scalar(
+            select(TelegramAccountsConfig).where(TelegramAccountsConfig.account_id == ctx.account.id)
+        )
+        api_id = cfg.api_id if cfg and cfg.api_hash else int(ctx.config.get("default_api_id") or default_telegram_api_id())
+        api_hash = (cfg.api_hash if cfg else "") or str(ctx.config.get("default_api_hash") or default_telegram_api_hash())
+        encrypted = stock.session_encrypted
+    if not api_hash:
+        return None
+    session_str = svc().cipher.decrypt(encrypted)
+    if not session_str:
+        return None
+    return session_str, api_id, api_hash
+
+
+async def request_exit(ctx: Any, chat_id: str) -> None:
+    """#выход: просим подтверждение, потому что коды перестанут приходить."""
+    record = await _latest_deal(ctx, chat_id)
+    if record is None:
+        return
+    if record.session_revoked:
+        await ctx.send_chat(chat_id, format_exit_already_revoked_message())
+        return
+    if not record.code_sent:
+        await ctx.send_chat(chat_id, format_exit_not_issued_message())
+        return
+    if len(_pending_exit) > 2000:
+        _pending_exit.clear()
+    _pending_exit[chat_id] = time.monotonic() + EXIT_CONFIRM_TTL
+    await ctx.send_chat(chat_id, format_exit_confirm_message())
+
+
+async def confirm_exit(ctx: Any, chat_id: str, *, approved: bool) -> None:
+    """#да / #нет после #выход."""
+    deadline = _pending_exit.get(chat_id)
+    if deadline is None:
+        return
+    _pending_exit.pop(chat_id, None)
+    if time.monotonic() > deadline:
+        await ctx.send_chat(chat_id, format_exit_expired_message())
+        return
+    if not approved:
+        await ctx.send_chat(chat_id, format_exit_cancelled_message())
+        return
+    await perform_exit(ctx, chat_id)
+
+
+async def perform_exit(ctx: Any, chat_id: str) -> None:
+    """Завершает нашу сессию, но только если покупатель уже вошёл."""
+    record = await _latest_deal(ctx, chat_id)
+    if record is None:
+        return
+    if record.session_revoked:
+        await ctx.send_chat(chat_id, format_exit_already_revoked_message())
+        return
+
+    material = await _session_material(ctx, record)
+    if material is None:
+        await ctx.send_chat(chat_id, "⚠️ Данные для авторизации не найдены. Свяжитесь с продавцом.")
+        return
+    session_str, api_id, api_hash = material
+
+    # Проверка перед выходом: без устройства покупателя выходить нельзя,
+    # иначе код будет некуда прислать и заказ станет невыполнимым.
+    entries = await list_authorizations(session_str, api_id, api_hash)
+    if entries is None:
+        await ctx.send_chat(chat_id, format_exit_check_failed_message())
+        return
+    if not buyer_session_present(entries):
+        await ctx.send_chat(chat_id, format_exit_no_buyer_session_message())
+        return
+
+    if not await logout_telethon_session(session_str, api_id, api_hash):
+        await ctx.send_chat(
+            chat_id,
+            "⚠️ Не удалось завершить сессию. Попробуйте ещё раз или напишите #продавец.",
+        )
+        await notify_seller(
+            ctx, record.deal_id,
+            f"⚠️ <b>Не удалось завершить сессию</b>\n\n"
+            f"Сделка <code>{html.escape(record.deal_id)}</code>\n"
+            "Покупатель просил выход по команде #выход.",
+        )
+        return
+
+    async with ctx.db() as session:
+        saved = await session.get(TelegramAccountDeal, record.id)
+        if saved is not None:
+            saved.session_revoked = True
+            await session.commit()
+
+    await ctx.send_chat(chat_id, format_exit_done_message())
+    await notify_seller(
+        ctx, record.deal_id,
+        f"🔒 <b>Покупатель завершил сессию</b>\n\n"
+        f"Сделка <code>{html.escape(record.deal_id)}</code>\n"
+        f"Страна <b>{html.escape(record.country)}</b>\n\n"
+        "Сессия удалена из списка устройств. Строка сессии оставлена в БД как недействительная.",
     )
 
 

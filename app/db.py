@@ -22,6 +22,7 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "intro_sent": "BOOLEAN",
         "intro_attempted_at": "TIMESTAMP WITH TIME ZONE",
         "intro_error": "VARCHAR(128)",
+        "session_revoked": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "telegram_account_lot_rules": {"keyword": "VARCHAR(128)"},
     "telegram_users": {

@@ -36,9 +36,35 @@ def country_value(value: Any) -> str:
     return value.strip()
 
 
+AI_PLUGIN_ID = "ai_assistant"
+AI_HOST = re.compile(r"https?://[^\s]{1,290}|[A-Za-z0-9.\-]{1,200}(:\d{1,5})?(/[^\s]{0,80})?")
+AI_LIMITS = {"model": 200, "basePrompt": 8000, "apiToken": 512}
+
+
+def ai_config_json(enabled: bool, config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "available": True,
+        "enabled": enabled,
+        "baseUrl": str(config.get("base_url") or ""),
+        "tokenSet": bool(str(config.get("api_key") or "").strip()),
+        "model": str(config.get("model") or ""),
+        "basePrompt": str(config.get("base_prompt") or ""),
+        "mode": str(config.get("mode") or "help_command_only"),
+        "modes": list((settings.get("mode") or {}).get("choices") or []),
+        "modeLabels": dict((settings.get("mode") or {}).get("choice_labels") or {}),
+        "notifyTg": bool(config.get("notify_tg_on_reply")),
+        "defaults": {
+            "baseUrl": (settings.get("base_url") or {}).get("default") or "",
+            "basePrompt": (settings.get("base_prompt") or {}).get("default") or "",
+            "model": (settings.get("model") or {}).get("default") or "",
+        },
+    }
+
+
 class TelegramPluginSettings:
-    def __init__(self, db: Any) -> None:
+    def __init__(self, db: Any, plugins: Any = None) -> None:
         self.db = db
+        self.plugins = plugins
 
     async def panel(self, account: PlayerokAccount) -> dict[str, Any]:
         async with self.db() as session:
@@ -61,8 +87,60 @@ class TelegramPluginSettings:
                 "stock": list(by_country.values()),
                 "rules": rules_json(rules),
                 "config": config_json(config),
+                "ai": await self.ai_config(account),
                 "countries": list(dict.fromkeys([*(name for name, _ in COUNTRY_PRESETS), *by_country])),
             }
+
+    async def ai_config(self, account: PlayerokAccount) -> dict[str, Any]:
+        plugin = self.plugins.plugins.get(AI_PLUGIN_ID) if self.plugins else None
+        if plugin is None:
+            return {"available": False}
+        enabled, config = await self.plugins.resolved_state(account.id, plugin)
+        return ai_config_json(enabled, config, plugin.settings)
+
+    async def configure_ai(self, account: PlayerokAccount, body: dict[str, Any]) -> dict[str, Any]:
+        plugin = self.plugins.plugins.get(AI_PLUGIN_ID) if self.plugins else None
+        if plugin is None:
+            raise web.HTTPNotFound(reason="Плагин ИИ не установлен. Включите его в разделе «Плагины».")
+        allowed = {"enabled", "baseUrl", "apiToken", "model", "basePrompt", "mode", "notifyTg", "resetToken"}
+        if not body or set(body) - allowed:
+            raise web.HTTPBadRequest(reason="Некорректные настройки ИИ.")
+
+        enabled = body.get("enabled")
+        if "enabled" in body and type(enabled) is not bool:
+            raise web.HTTPBadRequest(reason="Некорректное значение переключателя ИИ.")
+
+        values: dict[str, Any] = {}
+        if "baseUrl" in body:
+            base_url = body["baseUrl"]
+            if not isinstance(base_url, str) or not AI_HOST.fullmatch(base_url.strip()):
+                raise web.HTTPBadRequest(reason="Укажите Base URL вида https://api.anthropic.com")
+            values["base_url"] = base_url.strip()
+        for field, key in (("apiToken", "api_key"), ("model", "model"), ("basePrompt", "base_prompt")):
+            if field not in body:
+                continue
+            value = body[field]
+            if not isinstance(value, str) or len(value.strip()) > AI_LIMITS[field]:
+                raise web.HTTPBadRequest(reason="Некорректное значение настройки ИИ.")
+            if field == "apiToken" and not value.strip():
+                continue  # пустое поле означает «не менять»
+            values[key] = value.strip()
+        if "mode" in body:
+            mode = body["mode"]
+            if mode not in ((plugin.settings.get("mode") or {}).get("choices") or []):
+                raise web.HTTPBadRequest(reason="Неизвестный режим работы ИИ.")
+            values["mode"] = mode
+        if "notifyTg" in body:
+            if type(body["notifyTg"]) is not bool:
+                raise web.HTTPBadRequest(reason="Некорректная настройка уведомлений ИИ.")
+            values["notify_tg_on_reply"] = body["notifyTg"]
+        if "resetToken" in body:
+            if body["resetToken"] is not True or len(body) != 1:
+                raise web.HTTPBadRequest(reason="Сброс токена выполняется отдельно.")
+            values["api_key"] = ""
+
+        await self.plugins.configure_state(account.id, plugin, enabled=enabled, values=values or None)
+        return await self.ai_config(account)
 
     async def configure(self, account: PlayerokAccount, body: dict[str, Any]) -> dict[str, Any]:
         if not body or set(body) - {"apiId", "apiHash", "reset"}:

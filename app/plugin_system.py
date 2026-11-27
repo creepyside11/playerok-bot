@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import importlib.util
 import inspect
 import logging
@@ -74,6 +75,35 @@ class PluginContext:
                 str(text),
                 reply_markup=reply_markup,
             )
+
+    async def notify_pinned(self, text: str, reply_markup: Any = None) -> Any:
+        """Отправить продавцу сообщение и закрепить его в чате с ботом."""
+        message = await self.notify(text, reply_markup)
+        message_id = getattr(message, "message_id", None)
+        if not message_id:
+            return message
+        try:
+            await self.bot.pin_chat_message(
+                self.account.tg_user_id, message_id, disable_notification=False,
+            )
+        except Exception as exc:
+            logger.warning("Не удалось закрепить сообщение продавца (%s)", type(exc).__name__)
+        return message
+
+    async def call_seller(self, chat_id: str, *, buyer: str = "", question: str = "") -> None:
+        """Позвать продавца: крупное сообщение в Telegram, закреплённое в чате."""
+        lines = [
+            "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨",
+            "🚨  <b>НУЖЕН ПРОДАВЕЦ</b>  🚨",
+            "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨",
+            "",
+            f"👤 Покупатель: <b>{html.escape(buyer or 'Покупатель')}</b>",
+            f"💬 Чат: <code>{html.escape(str(chat_id))}</code>",
+        ]
+        if question:
+            lines += ["", f"❓ Вопрос: <i>{html.escape(question[:900])}</i>"]
+        lines += ["", "Ответьте покупателю в Playerok — сообщение закреплено, пока вы не разберёте заказ."]
+        await self.notify_pinned("\n".join(lines))
 
     async def get_item(self, item_id: str) -> Any:
         """Получить полную информацию о товаре Playerok."""

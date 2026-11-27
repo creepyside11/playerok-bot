@@ -262,7 +262,7 @@ class MiniApp:
         self.plugins = plugins
         self.token = token
         self.bot_profile = bot_profile
-        self.telegram_plugins = TelegramPluginSettings(db)
+        self.telegram_plugins = TelegramPluginSettings(db, plugins)
         self.withdrawal_locks: dict[str, asyncio.Lock] = {}
         self.withdrawal_cooldowns: dict[str, float] = {}
 
@@ -579,6 +579,10 @@ class MiniApp:
             return web.json_response(await self.telegram_plugins.panel(account))
         return web.json_response(await self.telegram_plugins.configure(account, await read_json(request)))
 
+    async def telegram_plugin_ai(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        return web.json_response(await self.telegram_plugins.configure_ai(account, await read_json(request)))
+
     async def telegram_plugin_bind(self, request: web.Request) -> web.Response:
         account = await self.account(request)
         body = await read_json(request)
@@ -685,6 +689,7 @@ class MiniApp:
             ("POST", "/listings/{item_id}/photo", self.photo),
             ("GET", "/telegram-accounts", self.telegram_plugin),
             ("PATCH", "/telegram-accounts", self.telegram_plugin),
+            ("PATCH", "/telegram-accounts/ai", self.telegram_plugin_ai),
             ("POST", "/telegram-accounts/rules", self.telegram_plugin_bind),
             ("PATCH", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),
             ("DELETE", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),

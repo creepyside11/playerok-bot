@@ -968,7 +968,7 @@ async function sendPhotoForm(form) {
 }
 
 function renderTelegramPlugin() {
-  const options = tabs([["stock", "Склад"], ["rules", "Привязки лотов"], ["api", "Telegram API"]], telegramTab, "telegramTab", "Настройки ТГ-аккаунтов");
+  const options = tabs([["stock", "Склад"], ["rules", "Привязки лотов"], ["api", "Telegram API"], ["ai", "ИИ-помощник"]], telegramTab, "telegramTab", "Настройки ТГ-аккаунтов");
   const countryOptions = `<datalist id="tg-countries">${telegramPanel.countries.map((country) => `<option value="${safe(country)}"></option>`).join("")}</datalist>`;
   let content = "";
   if (telegramTab === "stock") {
@@ -984,6 +984,8 @@ function renderTelegramPlugin() {
       <label class="field">API Hash<input name="apiHash" type="password" maxlength="32" autocomplete="new-password" placeholder="${config.apiHashSet ? "Сохранён. Введите новый при необходимости" : "Не задан"}"></label>
       <p class="form-error" role="alert" hidden></p><div class="detail-buttons"><button class="button primary" type="submit">Сохранить API</button>
       ${!config.defaults ? button("Сбросить API", "telegramReset") : ""}</div></form>`;
+  } else if (telegramTab === "ai") {
+    content = renderTelegramAi(telegramPanel.ai);
   } else {
     const rules = telegramPanel.rules;
     content = `${countryOptions}<form id="telegram-bind-form">
@@ -1008,6 +1010,49 @@ function renderTelegramPlugin() {
         : '<p>Привязок пока нет.</p>'}</div>`;
   }
   showDrawer("ТГ-аккаунты", `<div class="telegram-panel">${options}${content}</div>`);
+}
+
+function renderTelegramAi(ai) {
+  if (!ai?.available) {
+    return placeholder("ИИ-помощник не установлен", "Включите плагин «ИИ Ассистент (#аск)» в разделе «Плагины».", "plug",
+      button("К плагинам", "nav", { value: "plugins", glyph: "plug", variant: "flat" }));
+  }
+  return `<form id="telegram-ai-form">
+    <div class="preference"><span>ИИ отвечает покупателям</span>${toggle("Включить ИИ-помощника", ai.enabled, "telegramAiSwitch")}</div>
+    <p class="payout-note">Покупатель зовёт помощника командой <b>#аск</b>, останавливает — <b>#аскстоп</b>. Команды #код и #продавец работают всегда.</p>
+    <label class="field">Base URL<input name="baseUrl" value="${safe(ai.baseUrl)}" maxlength="300"
+      placeholder="https://api.anthropic.com" autocomplete="off" spellcheck="false" required></label>
+    <label class="field">API Token<input name="apiToken" type="password" maxlength="512" autocomplete="new-password"
+      placeholder="${ai.tokenSet ? "Сохранён. Введите новый, чтобы заменить" : "Не задан"}"></label>
+    <label class="field">ID модели<input name="model" value="${safe(ai.model)}" maxlength="200"
+      placeholder="claude-sonnet-4-20250514" autocomplete="off" spellcheck="false"></label>
+    <label class="field">Базовый промпт<textarea name="basePrompt" rows="6" maxlength="8000"
+      placeholder="Роль и правила помощника">${safe(ai.basePrompt)}</textarea></label>
+    <label class="field">Режим работы<select name="mode">
+      ${ai.modes.map((mode) => `<option value="${safe(mode)}"${mode === ai.mode ? " selected" : ""}>${safe((ai.modeLabels || {})[mode] || aiModeName(mode))}</option>`).join("")}
+    </select></label>
+    <label class="field inline">Уведомлять в TG об ответах ИИ<input type="checkbox" name="notifyTg"${ai.notifyTg ? " checked" : ""}></label>
+    <p class="form-error" role="alert" hidden></p>
+    <div class="detail-buttons"><button class="button primary" type="submit">Сохранить ИИ</button>
+    ${ai.tokenSet ? button("Сбросить токен", "telegramAiResetToken", { variant: "flat" }) : ""}</div>
+  </form>`;
+}
+
+function aiModeName(mode) {
+  return {
+    help_command_only: "Только по команде #аск",
+    always_after_help: "Диалог 30 минут после #аск",
+    all_messages: "Отвечать на все сообщения",
+  }[mode] || mode;
+}
+
+async function telegramAi(patch) {
+  const sequence = drawerSequence;
+  const result = await request(path("/telegram-accounts/ai"), { method: "PATCH", body: patch });
+  if (sequence !== drawerSequence) return;
+  telegramPanel.ai = result;
+  renderTelegramPlugin();
+  notify("Настройки ИИ сохранены");
 }
 
 async function loadTelegramLots(append = false) {
@@ -1125,6 +1170,12 @@ document.addEventListener("click", (event) => {
   if (action === "telegramMoreLots") loadTelegramLots(true).catch((error) => notify(error.message, true));
   if (action === "telegramStockBot") openTelegramStock();
   if (action === "telegramReset") askConfirmation("Сбросить Telegram API к стандартным значениям?", () => telegramConfig({ reset: true }));
+  if (action === "telegramAiSwitch") {
+    target.disabled = true;
+    telegramAi({ enabled: target.getAttribute("aria-checked") !== "true" })
+      .catch((error) => notify(error.message, true)).finally(() => { target.disabled = false; });
+  }
+  if (action === "telegramAiResetToken") askConfirmation("Удалить сохранённый токен ИИ?", () => telegramAi({ resetToken: true }));
   if (action === "telegramRuleSwitch") {
     target.disabled = true;
     telegramRule(value, "PATCH", { enabled: target.getAttribute("aria-checked") !== "true" })
@@ -1189,6 +1240,19 @@ document.addEventListener("submit", async (event) => {
     if (form.id === "payout-form") await submitPayout(form);
     if (form.id === "listing-form") await saveListingForm(form);
     if (form.id === "listing-photo-form") await sendPhotoForm(form);
+    if (form.id === "telegram-ai-form") {
+      const data = new FormData(form);
+      const patch = {
+        baseUrl: String(data.get("baseUrl") || "").trim(),
+        model: String(data.get("model") || "").trim(),
+        basePrompt: String(data.get("basePrompt") || "").trim(),
+        mode: String(data.get("mode") || ""),
+        notifyTg: form.elements.notifyTg.checked,
+      };
+      const token = String(data.get("apiToken") || "").trim();
+      if (token) patch.apiToken = token;
+      await telegramAi(patch);
+    }
     if (form.id === "telegram-api-form") {
       const patch = {};
       const apiId = form.elements.apiId.valueAsNumber;
