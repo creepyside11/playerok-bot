@@ -829,6 +829,8 @@ def item_by_typename(data: dict) -> "MyItem | Item | ItemProfile":
         return item_profile(data)
     elif type_name in ["Item", "ForeignItem"]:
         return item(data)
+    elif "attachment" in data:
+        return item_profile(data)
     else:
         return None
 
@@ -1115,10 +1117,11 @@ def chat_message(data: dict) -> "ChatMessage":
         game=game(data.get("game")),
         user=user_profile(data.get("user")),
         deal=item_deal(data.get("deal")),
-        item=item(data.get("item")),
+        item=item_by_typename(data.get("item")) or item(data.get("item")),
         transaction=transaction(data.get("transaction")),
         moderator=moderator(data.get("moderator")),
         event=ChatMessageEvents.__members__.get(data.get("event")),
+        raw_event=data.get("event"),
         event_by_user=user_profile(data.get("eventByUser")),
         event_to_user=user_profile(data.get("eventToUser")),
         is_auto_response=data.get("isAutoResponse"),

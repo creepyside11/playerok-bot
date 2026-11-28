@@ -32,6 +32,7 @@ const drawings = {
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/>',
   check: '<path d="m5 12 4 4L19 6"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
 };
 const statuses = {
   PAID: ["Оплачено", "teal"], PENDING: ["В работе", "amber"], SENT: ["Выполнено", "teal"],
@@ -71,6 +72,8 @@ let toastTimer = 0;
 let latestBalance = null;
 let payoutOptions = null;
 let editedListing = null;
+let listingWizard = null;
+let publicationQuote = null;
 let telegramPanel = null;
 let telegramTab = "stock";
 let telegramLots = [];
@@ -241,17 +244,47 @@ function more(action) {
   return `<div class="more">${button(action === "older" ? "Ранее" : "Загрузить ещё", action, { variant: "flat" })}</div>`;
 }
 
+function chatPreview(message) {
+  if (!message) return "Диалог";
+  if (message.systemEvent) return [message.systemEvent.title, message.item?.name].filter(Boolean).join(" · ");
+  return message.text || (message.images?.length ? "Вложение" : "Событие Playerok");
+}
+
 function chatRows(list) {
   return list.map((chat) => `<button class="row-button" data-action="chat" data-value="${safe(chat.id)}"
-    aria-pressed="${chat.id === currentChat}" data-search="${safe(`${chat.title} ${chat.last?.text || ""}`)}">
+    aria-pressed="${chat.id === currentChat}" data-search="${safe(`${chat.title} ${chatPreview(chat.last)}`)}">
       ${avatar(chat.title, chat.avatar)}
       <span class="row-text"><strong>${safe(chat.title)}</strong>
-       <small>${safe(chat.last?.text || (chat.last ? (chat.last.images?.length ? "Вложение" : "Событие Playerok") : "Диалог"))}</small></span>
+       <small class="${chat.last?.systemEvent ? "event-preview" : ""}">${chat.last?.systemEvent ? icon(chat.last.systemEvent.icon) : ""}<span>${safe(chatPreview(chat.last))}</span></small></span>
       <span class="row-right"><small>${dateTime(chat.last?.time)}</small>${chat.unread ? `<span class="unread">${count(chat.unread)}</span>` : ""}</span>
     </button>`).join("");
 }
 
+function eventCard(message) {
+  const event = message.systemEvent;
+  const item = message.item;
+  const tone = ["paid", "sent", "success", "danger", "warning", "neutral"].includes(event.tone) ? event.tone : "neutral";
+  const price = rubles(item?.price);
+  return `<article class="event-card event-${tone}" aria-label="${safe(event.title)}">
+    <header class="event-head">
+      <span class="event-icon">${icon(event.icon)}</span>
+      <div class="event-heading"><small>Событие Playerok</small><strong>${safe(event.title)}</strong></div>
+      <time>${dateTime(message.time, true)}</time>
+    </header>
+    ${event.description ? `<p class="event-description">${safe(event.description)}</p>` : ""}
+    ${item ? `<div class="event-product">
+      <div class="event-cover" aria-hidden="true">${icon("bag")}${item.cover ? image(item.cover) : ""}</div>
+      <div class="event-product-info"><strong>${safe(item.name || "Товар")}</strong>
+        <div class="event-price"><span>Цена товара</span><b>${price === "—" ? "Не указана" : safe(price)}</b></div>
+      </div>
+    </div>` : event.trade ? '<p class="event-unavailable">Данные товара недоступны</p>' : ""}
+    ${event.detail ? `<p class="event-detail">${safe(event.detail)}</p>` : ""}
+    ${(message.images || []).map((src) => `<div class="event-attachment">${image(src, "Вложение Playerok")}</div>`).join("")}
+  </article>`;
+}
+
 function bubble(message) {
+  if (message.systemEvent) return eventCard(message);
   const system = Boolean(message.event && !message.author);
   return `<article class="bubble ${system ? "system" : message.mine ? "mine" : ""}">
     ${message.text ? `<p>${safe(message.text)}</p>` : ""}
@@ -309,8 +342,8 @@ function listingRows(list) {
 function sales() {
   const bar = `<div class="toolbar">${tabs([["deals", "Сделки"], ["listings", "Мои лоты"]], salesTab, "salesTab", "Раздел продаж")}${search("Поиск по товарам")}</div>`;
   const filters = salesTab === "listings" ? tabs(listingFilters, listingType, "listingType", "Статус лота") : "";
-  return `${hero("sales")}${bar}${filters}${panel ? `<div class="panel">
-    ${panel.items.length ? (salesTab === "deals" ? dealRows(panel.items) : listingRows(panel.items)) : placeholder("Здесь пока пусто", "", "bag")}
+  return `${hero("sales", "", salesTab === "listings" ? button("Выставить лот", "newListing", { glyph: "plus", variant: "primary" }) : "")}${bar}${filters}${panel ? `<div class="panel">
+    ${panel.items.length ? (salesTab === "deals" ? dealRows(panel.items) : listingRows(panel.items)) : placeholder("Здесь пока пусто", "", "bag", salesTab === "listings" ? button("Создать первый лот", "newListing", { glyph: "plus", variant: "primary" }) : "")}
     ${panel.cursor ? more("page") : ""}
   </div>` : pending()}`;
 }
@@ -875,6 +908,268 @@ function openPayoutSite(contacts = false) {
   else window.open(url, "_blank", "noopener,noreferrer");
 }
 
+function wizardProgress(step) {
+  return `<div class="wizard-progress" aria-label="Шаг ${step} из 4">
+    ${["Раздел", "Категория", "Данные", "Публикация"].map((label, i) =>
+      `<span class="${i + 1 === step ? "current" : i + 1 < step ? "done" : ""}"><b>${i + 1 < step ? icon("check") : i + 1}</b>${label}</span>`).join("")}</div>`;
+}
+
+function wizardValid(sequence, wizard) {
+  return sequence === drawerSequence && listingWizard === wizard && currentAccount?.id === wizard.accountId;
+}
+
+function wizardError(title, error, retry) {
+  showDrawer("Выставить лот", placeholder(title, error.message, "info") + (retry || ""));
+}
+
+function showCatalogGames() {
+  const wizard = listingWizard;
+  const rows = wizard.games.map((game) => `<button class="row-button" data-action="listingGame" data-value="${safe(game.id)}">
+    ${avatar(game.name, game.cover)}<span class="row-text"><strong>${safe(game.name)}</strong></span>${icon("right", "caret")}</button>`).join("");
+  showDrawer("Выставить лот", `${wizardProgress(1)}<p>Выберите игру, приложение или раздел каталога Playerok.</p>
+    <form id="listing-catalog-form" class="wizard-search">
+      <label class="field">Поиск<input name="q" type="search" value="${safe(wizard.query)}" maxlength="120" placeholder="Название игры или приложения"></label>
+      <button class="button primary" type="submit">${icon("search")}Найти</button>
+    </form>
+    <p class="form-error" id="listing-catalog-error" role="alert" hidden></p>
+    <div class="panel wizard-catalog">${rows || placeholder("Ничего не найдено", "Попробуйте другое название.", "search")}</div>
+    ${wizard.cursor ? button("Показать ещё", "listingMoreGames", { variant: "flat", glyph: "down" }) : ""}`);
+}
+
+async function loadCatalogGames(query = "", append = false) {
+  const wizard = listingWizard;
+  if (!wizard || wizard.accountId !== currentAccount?.id || append && !wizard.cursor) return;
+  const sequence = ++drawerSequence;
+  const search = new URLSearchParams({ q: query });
+  if (append) search.set("cursor", wizard.cursor);
+  if (!append) {
+    wizard.games = [];
+    wizard.cursor = null;
+    showDrawer("Выставить лот", wizardProgress(1) + skeleton());
+  }
+  try {
+    const result = await request(path("/catalog/games?") + search.toString());
+    if (!wizardValid(sequence, wizard)) return;
+    const known = new Set(append ? wizard.games.map((entry) => entry.id) : []);
+    wizard.games = (append ? wizard.games : []).concat(result.items.filter((entry) => !known.has(entry.id)));
+    wizard.cursor = result.cursor;
+    wizard.query = query;
+    showCatalogGames();
+  } catch (error) {
+    if (!wizardValid(sequence, wizard)) return;
+    wizard.query = query;
+    showCatalogGames();
+    const feedback = drawer.querySelector("#listing-catalog-error");
+    feedback.textContent = error.message;
+    feedback.hidden = false;
+  }
+}
+
+function newListing() {
+  if (!currentAccount) return;
+  listingWizard = { accountId: currentAccount.id, query: "", games: [], cursor: null, game: null, schema: null };
+  loadCatalogGames();
+}
+
+function showListingCategories() {
+  const game = listingWizard.game;
+  const rows = game.categories.map((entry) => `<button class="row-button" data-action="listingCategory" data-value="${safe(entry.id)}">
+    <span class="quick-icon">${icon("layers")}</span><span class="row-text"><strong>${safe(entry.name)}</strong></span>${icon("right", "caret")}</button>`).join("");
+  showDrawer("Выставить лот", `${wizardProgress(2)}<div class="wizard-context">${icon("bag")}<strong>${safe(game.name)}</strong></div>
+    <div class="panel wizard-catalog">${rows || placeholder("Категорий нет", "Выберите другой раздел.", "info")}</div>
+    ${button("К разделам", "listingGamesBack", { glyph: "back", variant: "flat" })}`);
+}
+
+async function chooseListingGame(gameId) {
+  const wizard = listingWizard;
+  const sequence = ++drawerSequence;
+  showDrawer("Выставить лот", wizardProgress(2) + skeleton());
+  try {
+    const game = await request(path(`/catalog/games/${encodeURIComponent(gameId)}`));
+    if (!wizardValid(sequence, wizard)) return;
+    wizard.game = game;
+    wizard.schema = null;
+    showListingCategories();
+  } catch (error) {
+    if (wizardValid(sequence, wizard)) wizardError("Каталог недоступен", error,
+      button("К разделам", "listingGamesBack", { glyph: "back", variant: "flat" }));
+  }
+}
+
+function showListingMethods() {
+  const schema = listingWizard.schema;
+  showDrawer("Выставить лот", `${wizardProgress(2)}<div class="wizard-context">${icon("layers")}<strong>${safe(schema.name)}</strong></div>
+    <h3>Способ получения</h3><div class="panel wizard-catalog">${schema.methods.map((method) =>
+      `<button class="row-button" data-action="listingMethod" data-value="${safe(method.id)}"><span class="row-text"><strong>${safe(method.name)}</strong></span>${icon("right", "caret")}</button>`).join("")}</div>
+    ${button("К категориям", "listingCategoriesBack", { glyph: "back", variant: "flat" })}`);
+}
+
+async function chooseListingCategory(categoryId, methodId = null) {
+  const wizard = listingWizard;
+  const sequence = ++drawerSequence;
+  const params = methodId ? `?method=${encodeURIComponent(methodId)}` : "";
+  showDrawer("Выставить лот", wizardProgress(2) + skeleton());
+  try {
+    const schema = await request(path(`/catalog/categories/${encodeURIComponent(categoryId)}${params}`));
+    if (!wizardValid(sequence, wizard)) return;
+    wizard.schema = schema;
+    if (schema.ready) showListingDraftForm();
+    else showListingMethods();
+  } catch (error) {
+    if (wizardValid(sequence, wizard)) wizardError("Не удалось загрузить параметры", error,
+      button("К категориям", "listingCategoriesBack", { glyph: "back", variant: "flat" }));
+  }
+}
+
+function listingOptionField(group, index) {
+  const name = `option-${index}`;
+  if (group.kind === "range") return `<label class="field">${safe(group.label)}<input name="${name}" type="number" step="1"
+    ${group.minimum !== null ? `min="${safe(group.minimum)}"` : ""} ${group.maximum !== null ? `max="${safe(group.maximum)}"` : ""} placeholder="Не выбрано"></label>`;
+  const choices = group.choices.map((choice) => `<option value="${safe(choice.value)}">${safe(choice.label)}</option>`).join("");
+  return `<label class="field">${safe(group.label)}<select name="${name}" ${group.multiple ? 'multiple size="4"' : ""}>
+    ${group.multiple ? "" : '<option value="">Не выбрано</option>'}${choices}</select></label>`;
+}
+
+function showListingDraftForm() {
+  const wizard = listingWizard;
+  const schema = wizard.schema;
+  const context = [wizard.game.name, schema.name, schema.methods.find((entry) => entry.id === schema.methodId)?.name].filter(Boolean).join(" · ");
+  const back = button("Назад", "listingSchemaBack", { glyph: "back", variant: "flat" });
+  if (schema.blocked) {
+    showDrawer("Выставить лот", `${wizardProgress(3)}<div class="wizard-context">${icon("layers")}<strong>${safe(context)}</strong></div>
+      ${placeholder("Категория пока недоступна", "Для неё необходимы закрытые данные, которые этот мастер не запрашивает.", "info")}
+      ${back}`);
+    return;
+  }
+  showDrawer("Выставить лот", `${wizardProgress(3)}<div class="wizard-context">${icon("layers")}<strong>${safe(context)}</strong></div>
+    <form id="listing-create-form">
+      <label class="field">Название товара<input name="name" maxlength="120" required placeholder="Короткое название"></label>
+      <label class="field">Цена, ₽<input name="price" type="number" min="1" max="10000000" step="1" inputmode="numeric" required placeholder="0"></label>
+      <label class="field">Описание<textarea name="description" rows="4" maxlength="4096" required placeholder="Что получает покупатель"></textarea></label>
+      ${schema.options.length ? `<section class="wizard-fields"><h3>Параметры товара</h3>${schema.options.map(listingOptionField).join("")}</section>` : ""}
+      ${schema.fields.length ? `<section class="wizard-fields"><h3>Дополнительные поля</h3>${schema.fields.map((field, index) =>
+        `<label class="field">${safe(field.label)}<input name="data-${index}" maxlength="2048" ${field.required ? "required" : "placeholder=Необязательно"}></label>`).join("")}</section>` : ""}
+      <label class="field">Комментарий покупателю<textarea name="comment" rows="2" minlength="2" maxlength="2048" required placeholder="Инструкция или сообщение после покупки"></textarea></label>
+      <section class="wizard-fields"><h3>Фотографии товара</h3>
+        <label class="wizard-upload">${icon("layers")}<span><strong>Выбрать фотографии</strong><small>JPEG, PNG, WebP · до 10 фото, 30 МБ суммарно</small></span><input name="images" type="file" multiple accept="image/jpeg,image/png,image/webp"></label>
+        <p id="listing-photo-summary" class="wizard-photo-summary" aria-live="polite">Файлы не выбраны</p>
+      </section>
+      <p class="wizard-note">${icon("info")}Сначала создадим черновик. Плата за размещение не списывается без подтверждения.</p>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="form-actions">${back}<button class="button primary" type="submit">${icon("check")}Создать черновик</button></div>
+    </form>`);
+}
+
+async function submitListingDraft(form) {
+  const wizard = listingWizard;
+  const schema = wizard.schema;
+  const options = Object.create(null);
+  const fields = Object.create(null);
+  schema.options.forEach((group, index) => {
+    const input = form.elements.namedItem(`option-${index}`);
+    if (group.multiple && group.kind !== "range") {
+      const values = [...input.selectedOptions].map((entry) => entry.value);
+      if (values.length) options[group.field] = values;
+    } else if (input.value !== "") options[group.field] = group.kind === "range" ? input.valueAsNumber : input.value;
+  });
+  schema.fields.forEach((field, index) => {
+    const value = form.elements.namedItem(`data-${index}`).value.trim();
+    if (value) fields[field.id] = value;
+  });
+  const photos = [...form.elements.images.files];
+  if (photos.length > 10 || photos.some((file) => file.size > 10 * 1024 * 1024)
+      || photos.reduce((sum, file) => sum + file.size, 0) > 30 * 1024 * 1024) {
+    throw new Error("До 10 фотографий, максимум 10 МБ на фото и 30 МБ суммарно.");
+  }
+  const body = new FormData();
+  body.append("data", JSON.stringify({ categoryId: schema.id, methodId: schema.methodId,
+    name: form.elements.name.value.trim(), price: form.elements.price.valueAsNumber,
+    description: form.elements.description.value.trim(), comment: form.elements.comment.value.trim(), options, fields }));
+  photos.forEach((file) => body.append("image", file));
+  const sequence = drawerSequence;
+  const created = await request(path("/listings"), { method: "POST", body });
+  if (!wizardValid(sequence, wizard)) return;
+  editedListing = created;
+  listingWizard = null;
+  listingType = created.status === "DRAFT" ? "DRAFT" : "";
+  salesTab = "listings";
+  loadPanel({ fresh: true });
+  notify(created.status === "DRAFT" ? "Черновик создан" : "Лот создан");
+  if (created.canPublish) await listingPublication(created.id);
+  else showListingEditor();
+}
+
+async function listingPublication(id) {
+  const sequence = ++drawerSequence;
+  const account = currentAccount?.id;
+  showDrawer("Публикация лота", wizardProgress(4) + skeleton());
+  try {
+    const quote = await request(path(`/listings/${encodeURIComponent(id)}/publication`));
+    if (sequence !== drawerSequence || account !== currentAccount?.id) return;
+    publicationQuote = quote;
+    showPublicationQuote();
+  } catch (error) {
+    if (sequence !== drawerSequence || account !== currentAccount?.id) return;
+    showDrawer("Публикация лота", `${placeholder("Условия публикации недоступны", error.message, "info")}
+      <div class="detail-buttons">${button("Обновить", "publishListing", { value: id, glyph: "refresh" })}
+      ${button("К лоту", "editListing", { value: id, glyph: "back", variant: "flat" })}</div>`);
+  }
+}
+
+function showPublicationQuote() {
+  const quote = publicationQuote;
+  const tariffs = quote.tariffs;
+  const first = tariffs.find((entry) => entry.available);
+  showDrawer("Публикация лота", `${wizardProgress(4)}
+    <div class="wizard-publication-summary">${icon("bag")}<div><small>Цена продажи</small><strong>${rubles(quote.price)}</strong><p>${safe(quote.name)}</p></div></div>
+    <div class="detail-rows"><div><span>Доступный баланс</span><strong>${rubles(quote.balance)}</strong></div></div>
+    <form id="listing-publish-form">
+      <h3>Тариф размещения</h3>
+      <div class="publication-tariffs">${tariffs.length ? tariffs.map((entry) => `<label class="publication-tariff ${entry.available ? "" : "unavailable"}">
+        <input type="radio" name="tariff" value="${safe(entry.id)}" ${entry.id === first?.id ? "checked" : ""} ${entry.available ? "" : "disabled"} required>
+        <span><strong>${safe(entry.name)}</strong><small>${entry.available ? Number(entry.fee) === 0 ? "Бесплатное размещение" : `Остаток: ${rubles(entry.remaining)}` : "Тариф недоступен"}</small></span>
+        <b>${rubles(entry.fee)}</b></label>`).join("") : '<p>Playerok пока не предложил тарифы.</p>'}</div>
+      <div id="publication-estimate" class="detail-rows"></div>
+      <label class="field inline">Подтверждаю размещение и выбранную стоимость<input type="checkbox" name="confirm" required></label>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="form-actions"><button class="button primary" type="submit" ${first ? "" : "disabled"}>Опубликовать</button></div>
+    </form>
+    <div class="detail-buttons">${button("Оставить лот", "editListing", { value: quote.itemId, glyph: "back", variant: "flat" })}${button("Обновить тарифы", "publishListing", { value: quote.itemId, glyph: "refresh", variant: "flat" })}</div>`);
+  updatePublicationEstimate();
+}
+
+function updatePublicationEstimate() {
+  const form = drawer.querySelector("#listing-publish-form");
+  if (!form || !publicationQuote) return;
+  const tariff = publicationQuote.tariffs.find((entry) => entry.id === form.elements.tariff?.value);
+  const estimate = form.querySelector("#publication-estimate");
+  estimate.innerHTML = tariff ? `<div><span>Стоимость размещения</span><strong>${rubles(tariff.fee)}</strong></div>
+    <div><span>Остаток после размещения</span><strong>${rubles(tariff.remaining)}</strong></div>` : "";
+  const submit = form.querySelector("[type=submit]");
+  submit.textContent = tariff && Number(tariff.fee) > 0 ? `Опубликовать · списать ${rubles(tariff.fee)}` : "Опубликовать";
+}
+
+async function submitPublication(form) {
+  const quote = publicationQuote;
+  const tariff = quote?.tariffs.find((entry) => entry.id === form.elements.tariff?.value);
+  if (!tariff?.available || !form.elements.confirm.checked) throw new Error("Выберите доступный тариф и подтвердите публикацию.");
+  const sequence = drawerSequence;
+  const account = currentAccount?.id;
+  const result = await request(path(`/listings/${encodeURIComponent(quote.itemId)}/publication`), {
+    method: "POST", body: { token: quote.token, tariffId: tariff.id, confirm: true },
+  });
+  if (sequence !== drawerSequence || account !== currentAccount?.id) return;
+  publicationQuote = null;
+  editedListing = result;
+  listingType = "";
+  loadPanel({ fresh: true });
+  showDrawer("Лот размещён", `<div class="wizard-publication-result">${icon("check")}<h3>${safe(result.name)}</h3>${status(result.status)}
+    <strong>${rubles(result.price)}</strong><p>${result.status === "APPROVED" ? "Товар опубликован." : "Playerok принял лот. Ожидается проверка."}</p></div>
+    <div class="detail-buttons">${button("К лоту", "editListing", { value: result.id, glyph: "bag", variant: "primary" })}
+    ${result.slug ? button("На Playerok", "listing", { value: result.slug, glyph: "external" }) : ""}</div>`);
+  notify("Playerok подтвердил размещение");
+}
+
 function editedListingPath(suffix = "") {
   return path(`/listings/${encodeURIComponent(editedListing.id)}${suffix}`);
 }
@@ -907,6 +1202,7 @@ function showListingEditor() {
       ${entry.slug ? button("На Playerok", "listing", { value: entry.slug, glyph: "external" }) : ""}</div></form>`
       : `<p>${safe(entry.name)} · ${rubles(entry.price)}</p><p>${safe(entry.description)}</p><p>Playerok пока не разрешает редактировать этот лот.</p>
         ${entry.slug ? button("На Playerok", "listing", { value: entry.slug, glyph: "external" }) : ""}`}
+    ${entry.canPublish ? `<div class="seller-subsection">${button("Опубликовать лот", "publishListing", { value: entry.id, glyph: "plus", variant: "primary" })}</div>` : ""}
     ${renderListingPhotos()}`);
 }
 
@@ -1133,6 +1429,12 @@ function listingLink(slug) {
 
 document.addEventListener("change", (event) => {
   const target = event.target;
+  if (target.matches?.('#listing-publish-form [name="tariff"]')) updatePublicationEstimate();
+  if (target.matches?.('#listing-create-form [name="images"]')) {
+    const photos = [...target.files];
+    const summary = document.querySelector("#listing-photo-summary");
+    if (summary) summary.textContent = photos.length ? `${photos.length} фото · ${(photos.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024).toFixed(1)} МБ` : "Файлы не выбраны";
+  }
   if (target.id !== "payout-provider") return;
   const provider = payoutProviderData(target.value);
   const body = document.querySelector("#payout-body");
@@ -1165,6 +1467,22 @@ document.addEventListener("click", (event) => {
     go("sales");
   }
   if (action === "editListing") editListing(value);
+  if (action === "newListing") newListing();
+  if (action === "listingGame") chooseListingGame(value);
+  if (action === "listingMoreGames") {
+    target.disabled = true;
+    loadCatalogGames(listingWizard.query, true).finally(() => { target.disabled = false; });
+  }
+  if (action === "listingGamesBack") { drawerSequence += 1; showCatalogGames(); }
+  if (action === "listingCategory") chooseListingCategory(value);
+  if (action === "listingMethod") chooseListingCategory(listingWizard.schema.id, value);
+  if (action === "listingCategoriesBack") { drawerSequence += 1; showListingCategories(); }
+  if (action === "listingSchemaBack") {
+    drawerSequence += 1;
+    if (listingWizard.schema.methods.length) showListingMethods();
+    else showListingCategories();
+  }
+  if (action === "publishListing") listingPublication(value);
   if (action === "telegramPlugin") telegramPluginDrawer();
   if (action === "telegramTab") telegramChangeTab(value).catch((error) => notify(error.message, true));
   if (action === "telegramMoreLots") loadTelegramLots(true).catch((error) => notify(error.message, true));
@@ -1238,6 +1556,9 @@ document.addEventListener("submit", async (event) => {
   submit.disabled = true;
   try {
     if (form.id === "payout-form") await submitPayout(form);
+    if (form.id === "listing-catalog-form") await loadCatalogGames(form.elements.q.value.trim());
+    if (form.id === "listing-create-form") await submitListingDraft(form);
+    if (form.id === "listing-publish-form") await submitPublication(form);
     if (form.id === "listing-form") await saveListingForm(form);
     if (form.id === "listing-photo-form") await sendPhotoForm(form);
     if (form.id === "telegram-ai-form") {
@@ -1314,6 +1635,10 @@ document.addEventListener("submit", async (event) => {
     submit.disabled = false;
   }
 });
+
+desk.addEventListener("error", (event) => {
+  if (event.target.matches?.(".event-cover img")) event.target.hidden = true;
+}, true);
 
 telegram?.ready?.();
 telegram?.expand?.();

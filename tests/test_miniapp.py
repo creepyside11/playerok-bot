@@ -83,8 +83,11 @@ async def test_portal_uses_owned_accounts_shared_plugin_state_and_chats(tmp_path
         seller = NS(id=own.playerok_user_id, username=own.username)
         incoming = NS(id="msg-1", text="Купил товар", user=buyer, images=[], file=None, created_at=None)
         reply = NS(id="msg-2", text="Ответ", user=seller, images=[], file=None, created_at=None)
+        payment = NS(id="msg-3", text="{ITEM_PAID}", user=None, images=[], created_at=None,
+                     deal=NS(id="deal", item=NS(id="lot", name="Набор", price=125,
+                                                attachment=NS(url="https://cdn.playerok.com/lot.webp"))))
         chat = NS(id="thread", type="PM", status="FINISHED", users=[buyer, seller], is_texting_allowed=True,
-                  unread_messages_counter=1, last_message=incoming)
+                  unread_messages_counter=1, last_message=payment)
         elsewhere = NS(id="other", type="PM", users=[buyer])
         page_info = NS(has_next_page=True, end_cursor="older-page")
         pok = AsyncMock()
@@ -95,7 +98,7 @@ async def test_portal_uses_owned_accounts_shared_plugin_state_and_chats(tmp_path
             if operation == "get_chat":
                 return chat if chat_id == "thread" else elsewhere
             if operation == "get_chat_messages":
-                return NS(messages=[incoming], page_info=page_info, total_count=1)
+                return NS(messages=[incoming, payment], page_info=page_info, total_count=2)
             return None
 
         pok.call.side_effect = call
@@ -127,11 +130,17 @@ async def test_portal_uses_owned_accounts_shared_plugin_state_and_chats(tmp_path
                 assert response.status == 404
 
             response = await client.get(f"{base}/chats", headers=authorize())
-            assert (await response.json())["items"][0]["canReply"] is True
+            chat_data = (await response.json())["items"][0]
+            assert chat_data["canReply"] is True
+            assert chat_data["last"]["systemEvent"]["title"] == "Товар оплачен"
+            assert chat_data["last"]["item"]["name"] == "Набор"
             thread = await client.get(f"{base}/chats/thread", headers=authorize())
             history = await thread.json()
             assert history["cursor"] == "older-page"
             assert history["items"][0]["text"] == "Купил товар"
+            assert history["items"][1]["systemEvent"]["tone"] == "paid"
+            assert history["items"][1]["item"]["price"] == "125"
+            assert history["items"][1]["item"]["cover"] == "https://cdn.playerok.com/lot.webp"
             response = await client.post(f"{base}/chats/thread/reply", headers=authorize(), json={"text": "Ответ"})
             assert response.status == 201
             assert (await response.json())["mine"] is True

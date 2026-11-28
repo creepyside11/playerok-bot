@@ -24,7 +24,13 @@ from playerokapi.types import MyItem
 
 from .config import Settings
 from .item_delivery import BUYER_MESSAGE_ERROR, ListingFieldsUnavailable, listing_comment_update, valid_buyer_message
-from .item_publication import amount
+from .item_publication import (
+    PublicationChanged, PublicationUnconfirmed, amount, can_publish, confirm_publication,
+    publication_balance, publication_tariffs, tariff_price,
+)
+from .miniapp_listings import (
+    MAX_PHOTO_SIZE, catalog_schema, draft_payload, named_entry, read_draft_multipart, valid_photo,
+)
 from .miniapp_telegram import TelegramPluginSettings, country_value
 from .models import DEFAULT_SETTINGS, PlayerokAccount, TelegramUser
 from .playerok import PlayerokGateway
@@ -38,7 +44,7 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).with_name("miniapp_static")
 MAX_AUTH_AGE = 12 * 60 * 60
 PAGE_SIZE = 20
-MAX_PHOTO_SIZE = 10 * 1024 * 1024
+PUBLICATION_QUOTE_TTL = 5 * 60
 CHAT_TYPES = {kind.name: kind for kind in ChatTypes}
 SECRET_KEY = re.compile(r"token|secret|password|passwd|apikey|apihash|cookie|session|proxy|privatekey|goldenkey|accesskey|authorization|credentials")
 NOTIFICATIONS = DEFAULT_SETTINGS["notifications"]
@@ -106,17 +112,93 @@ def account_json(account: PlayerokAccount) -> dict[str, str]:
     return {"id": str(account.id), "username": account.username}
 
 
-def message_json(message: Any, own_id: str) -> dict[str, Any]:
+# Events can arrive as an enum, a new/unknown API event, or a text placeholder.
+# Keep the presentation independent of the current deal status (historical events
+# must not change to "completed" just because the deal was completed later).
+CHAT_EVENT_TAG = re.compile(r"(?:\{\{([A-Z][A-Z0-9_]*)\}\}|\{([A-Z][A-Z0-9_]*)\})")
+CHAT_EVENT_GROUPS = (
+    (("ITEM_PAID", "OFFICIAL_ITEM_PAID"), "Товар оплачен", "Оплата подтверждена Playerok.", "paid", "bag", True),
+    (("ITEM_SEND", "ITEM_SENT"), "Товар передан", "Продавец отметил товар как переданный.", "sent", "send", True),
+    (("DEAL_CONFIRMED", "ITEM_CONFIRM", "ITEM_CONFIRMED", "ITEM_RECEIVED"), "Сделка завершена", "Получение товара подтверждено.", "success", "check", True),
+    (("DEAL_CONFIRMED_AUTOMATICALLY", "ITEM_CONFIRMED_AUTOMATICALLY", "ITEM_AUTO_CONFIRMED"), "Сделка завершена автоматически", "Playerok подтвердил сделку.", "success", "check", True),
+    (("DEAL_ROLLED_BACK", "ITEM_ROLLED_BACK", "ITEM_REFUND", "ITEM_REFUNDED"), "Возврат средств", "Сделка возвращена.", "danger", "refresh", True),
+    (("DEAL_HAS_PROBLEM", "PROBLEM_REPORTED", "ITEM_PROBLEM", "ITEM_HAS_PROBLEM"), "Проблема со сделкой", "По сделке открыто обращение.", "warning", "info", True),
+    (("DEAL_PROBLEM_RESOLVED", "PROBLEM_RESOLVED", "ITEM_PROBLEM_RESOLVED"), "Проблема решена", "Обращение по сделке закрыто.", "success", "check", True),
+    (("DEAL_CANCELLED", "ITEM_CANCELLED", "ITEM_CANCEL"), "Сделка отменена", "", "danger", "close", True),
+    (("DEAL_STATUS_CHANGED",), "Статус сделки изменён", "", "neutral", "refresh", True),
+    (("NEW_REVIEW", "DEAL_REVIEW", "ITEM_REVIEW"), "Новый отзыв", "", "neutral", "chat", True),
+    (("CHAT_START", "CHAT_STARTED"), "Диалог начался", "", "neutral", "chat", False),
+    (("CHAT_FINISH", "CHAT_FINISHED"), "Диалог завершён", "", "neutral", "check", False),
+)
+CHAT_EVENT_PRESENTATION = {
+    code: (title, description, tone, icon, trade)
+    for codes, title, description, tone, icon, trade in CHAT_EVENT_GROUPS
+    for code in codes
+}
+
+
+def chat_event_json(message: Any) -> dict[str, Any] | None:
+    text = (getattr(message, "text", None) or "").strip()
+    tag = CHAT_EVENT_TAG.fullmatch(text)
+    linked = bool(getattr(message, "deal", None) or getattr(message, "item", None))
+    code = status_name(getattr(message, "event", None)) or getattr(message, "raw_event", None)
+    # Do not turn a customer's ordinary text into a trusted payment/status card.
+    author = getattr(message, "user", None)
+    if not code and tag and not (getattr(author, "id", None) or getattr(author, "username", None)):
+        code = tag.group(1) or tag.group(2)
+    if not code:
+        return None
+    title, description, tone, icon, trade = CHAT_EVENT_PRESENTATION.get(
+        code, ("Событие Playerok", "", "neutral", "info", linked),
+    )
+    return {
+        "code": code, "title": title, "description": description, "tone": tone, "icon": icon,
+        "trade": trade or linked, "detail": text if not tag else "",
+    }
+
+
+def chat_item_json(message: Any, chat_deals: Any = ()) -> dict[str, Any] | None:
+    """Use only the lot attached to this message or its exact deal ID."""
+    deal = getattr(message, "deal", None)
+    deal_id = getattr(deal, "id", None)
+    matched_deal = next((entry for entry in chat_deals or ()
+                         if deal_id and getattr(entry, "id", None) == deal_id), None)
+    candidates = [item for item in (
+        getattr(deal, "item", None), getattr(message, "item", None), getattr(matched_deal, "item", None),
+    ) if item is not None]
+    if not candidates:
+        return None
+    item_id = getattr(candidates[0], "id", None)
+    # Never accidentally label an older purchase using a different lot in the chat.
+    candidates = [entry for entry in candidates if entry is candidates[0] or (
+        item_id and getattr(entry, "id", None) == item_id
+    )]
+    name = next((entry.name for entry in candidates if getattr(entry, "name", None)), None)
+    price = next((value for entry in candidates
+                  if (value := amount(getattr(entry, "price", None))) is not None and value >= 0), None)
+    cover = next((url for entry in candidates for photo in (
+        [getattr(entry, "attachment", None)] + list(getattr(entry, "attachments", None) or [])
+    ) if (url := media_url(getattr(photo, "url", None)))), None)
+    return {
+        "id": str(item_id) if item_id else None, "name": name,
+        "price": format(price, "f") if price is not None else None, "cover": cover,
+    }
+
+
+def message_json(message: Any, own_id: str, chat_deals: Any = ()) -> dict[str, Any]:
     author = getattr(message, "user", None)
     media = list(getattr(message, "images", None) or [])
     if getattr(message, "file", None):
         media.append(message.file)
+    event = chat_event_json(message)
     return {
         "id": str(message.id),
         "text": message.text or "",
         "author": getattr(author, "username", None),
         "mine": str(getattr(author, "id", "") or "") == own_id,
         "event": status_name(getattr(message, "event", None)),
+        "systemEvent": event,
+        "item": chat_item_json(message, chat_deals) if event else None,
         "time": getattr(message, "created_at", None),
         "images": list(dict.fromkeys(url for entry in media if (url := media_url(getattr(entry, "url", None))))),
     }
@@ -131,7 +213,7 @@ def chat_json(chat: Any, own_id: str) -> dict[str, Any]:
         "title": title or getattr(other, "username", None) or "Диалог",
         "avatar": media_url(getattr(other, "avatar_url", None)),
         "unread": chat.unread_messages_counter or 0,
-        "last": message_json(chat.last_message, own_id) if chat.last_message else None,
+        "last": message_json(chat.last_message, own_id, getattr(chat, "deals", None)) if chat.last_message else None,
         "canReply": kind != "NOTIFICATIONS" and chat.is_texting_allowed is not False
                     and status_name(getattr(chat, "status", None)) != "CLOSED",
     }
@@ -155,6 +237,7 @@ def listing_details_json(item: Any) -> dict[str, Any]:
         "description": getattr(item, "description", "") or "",
         "basePrice": getattr(item, "raw_price", None),
         "editable": getattr(item, "is_editable", None) is not False,
+        "canPublish": can_publish(item),
         "photos": [
             {"id": str(photo.id), "url": url}
             for photo in getattr(item, "attachments", None) or []
@@ -265,6 +348,8 @@ class MiniApp:
         self.telegram_plugins = TelegramPluginSettings(db, plugins)
         self.withdrawal_locks: dict[str, asyncio.Lock] = {}
         self.withdrawal_cooldowns: dict[str, float] = {}
+        self.listing_locks: dict[str, asyncio.Lock] = {}
+        self.publication_quotes: dict[tuple[str, str], dict[str, Any]] = {}
 
     @web.middleware
     async def middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
@@ -454,7 +539,9 @@ class MiniApp:
         client = await self.gateway.get_client(account)
         chat = await self.get_owned_chat(client, account.playerok_user_id, request.match_info["chat_id"])
         page = await client.call("get_chat_messages", chat.id, count=PAGE_SIZE, after_cursor=cursor(request))
-        result = paginate(page, "messages", lambda entry: message_json(entry, account.playerok_user_id))
+        result = paginate(page, "messages", lambda entry: message_json(
+            entry, account.playerok_user_id, getattr(chat, "deals", None),
+        ))
         return web.json_response({"chat": chat_json(chat, account.playerok_user_id), **result})
 
     async def reply(self, request: web.Request) -> web.Response:
@@ -494,6 +581,117 @@ class MiniApp:
         states = [ItemStatuses[scope]] if scope else None
         page = await client.call("get_my_items", statuses=states, count=PAGE_SIZE, after_cursor=cursor(request))
         return web.json_response(paginate(page, "items", listing_json))
+
+    async def catalog_games(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        query = request.query.get("q", "").strip()
+        if len(query) > 120:
+            raise web.HTTPBadRequest(reason="Введите название не длиннее 120 символов.")
+        client = await self.gateway.get_client(account)
+        page = await client.call("get_games", name=query or None, count=PAGE_SIZE, after_cursor=cursor(request))
+        return web.json_response(paginate(page, "games", lambda game: {
+            **named_entry(game), "cover": media_url(getattr(getattr(game, "logo", None), "url", None)),
+        }))
+
+    async def catalog_game(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        game_id = resource_id(request.match_info["game_id"])
+        game = await client.call("get_game", id=game_id)
+        if not game or str(game.id) != game_id:
+            raise web.HTTPNotFound(reason="Раздел каталога не найден.")
+        return web.json_response({
+            **named_entry(game),
+            "categories": [named_entry(entry) for entry in getattr(game, "categories", None) or [] if entry and entry.id],
+        })
+
+    async def catalog_category(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        category_id = resource_id(request.match_info["category_id"])
+        method = request.query.get("method")
+        schema, _ = await catalog_schema(client, category_id, resource_id(method) if method else None)
+        return web.json_response(schema)
+
+    async def create_listing(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        if request.content_type == "application/json":
+            body, photos = await read_json(request), []
+        else:
+            body, photos = await read_draft_multipart(request)
+        client = await self.gateway.get_client(account)
+        payload = await draft_payload(client, body)
+        key = str(account.id)
+        lock = self.listing_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            raise web.HTTPConflict(reason="Дождитесь завершения предыдущего действия с лотом.")
+        async with lock:
+            try:
+                draft = await client.create_item(**payload, attachments=photos)
+            except (RequestFailedError, RequestSendingError, RequestPlayerokError) as exc:
+                raise web.HTTPBadGateway(reason=playerok_error_text(exc) + " Перед повтором проверьте черновики.") from exc
+            except (KeyError, ValueError, TypeError) as exc:
+                raise web.HTTPBadGateway(reason="Playerok не подтвердил создание черновика. Проверьте список перед повтором.") from exc
+            if draft is None or not getattr(draft, "id", None):
+                raise web.HTTPBadGateway(reason="Playerok не подтвердил создание черновика. Проверьте список перед повтором.")
+        return web.json_response(listing_details_json(draft), status=201)
+
+    async def listing_quote(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        client = await self.gateway.get_client(account)
+        item = await self.owned_listing(client, account, request.match_info["item_id"])
+        if not can_publish(item):
+            raise web.HTTPConflict(reason="Playerok пока не разрешает опубликовать этот лот.")
+        prices = (int(item.price), tariff_price(item))
+        tariffs = await publication_tariffs(client, str(item.id), prices[1])
+        balance = await publication_balance(client)
+        now = time.monotonic()
+        self.publication_quotes = {key: value for key, value in self.publication_quotes.items() if value["expires"] > now}
+        quote_token = uuid.uuid4().hex
+        self.publication_quotes[(str(account.id), str(item.id))] = {
+            "token": quote_token, "prices": prices, "tariffs": {entry.id: entry for entry in tariffs},
+            "balance": balance, "expires": now + PUBLICATION_QUOTE_TTL,
+        }
+        return web.json_response({
+            "token": quote_token, "itemId": str(item.id), "name": item.name, "price": prices[0], "basePrice": prices[1],
+            "balance": format(balance, "f") if balance is not None else None,
+            "tariffs": [{
+                "id": entry.id, "name": entry.name, "fee": format(entry.fee, "f"),
+                "available": entry.fee == 0 or balance is not None and balance >= entry.fee,
+                "remaining": format(balance - entry.fee, "f") if balance is not None and balance >= entry.fee else None,
+            } for entry in tariffs],
+        })
+
+    async def publish_listing(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        item_id = resource_id(request.match_info["item_id"])
+        body = await read_json(request)
+        if body.get("confirm") is not True or not isinstance(body.get("token"), str) or not isinstance(body.get("tariffId"), str):
+            raise web.HTTPBadRequest(reason="Выберите тариф и подтвердите публикацию.")
+        key = (str(account.id), item_id)
+        lock = self.listing_locks.setdefault(key[0], asyncio.Lock())
+        if lock.locked():
+            raise web.HTTPConflict(reason="Дождитесь завершения предыдущего действия с лотом.")
+        async with lock:
+            quote = self.publication_quotes.get(key)
+            if not quote or quote["expires"] <= time.monotonic() or quote["token"] != body["token"]:
+                raise web.HTTPConflict(reason="Условия публикации устарели. Обновите тарифы.")
+            tariff = quote["tariffs"].get(body["tariffId"])
+            if not tariff or tariff.fee > 0 and (quote["balance"] is None or quote["balance"] < tariff.fee):
+                raise web.HTTPBadRequest(reason="Тариф недоступен или недостаточно средств.")
+            # One-time confirmation; never retry a mutation automatically.
+            self.publication_quotes.pop(key, None)
+            client = await self.gateway.get_client(account)
+            await self.owned_listing(client, account, item_id)
+            try:
+                result = await confirm_publication(client, item_id, quote["prices"], tariff, quote["balance"])
+            except PublicationChanged as exc:
+                raise web.HTTPConflict(reason="Цена, тариф или баланс изменились. Обновите условия публикации.") from exc
+            except PublicationUnconfirmed as exc:
+                raise web.HTTPConflict(reason="Playerok пока не подтвердил размещение. Проверьте статус лота перед повтором.") from exc
+            except (RequestFailedError, RequestSendingError, RequestPlayerokError) as exc:
+                raise web.HTTPBadGateway(reason=playerok_error_text(exc) + " Проверьте статус лота перед повтором.") from exc
+        return web.json_response(listing_details_json(result))
 
     @staticmethod
     async def owned_listing(client: Any, account: PlayerokAccount, item_id: str) -> Any:
@@ -561,10 +759,7 @@ class MiniApp:
             picture.extend(chunk)
             if len(picture) > MAX_PHOTO_SIZE:
                 raise web.HTTPRequestEntityTooLarge(max_size=MAX_PHOTO_SIZE, actual_size=len(picture))
-        if not (
-            picture.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"))
-            or picture[:4] == b"RIFF" and picture[8:12] == b"WEBP"
-        ):
+        if not valid_photo(picture):
             raise web.HTTPBadRequest(reason="Поддерживаются изображения JPEG, PNG и WebP.")
         updated = await client.update_item(
             str(item.id), add_attachments=[bytes(picture)], remove_attachments=[remove] if remove else None,
@@ -683,7 +878,13 @@ class MiniApp:
             ("POST", "/chats/{chat_id}/reply", self.reply),
             ("POST", "/chats/{chat_id}/read", self.read_chat),
             ("GET", "/deals", self.deals),
+            ("GET", "/catalog/games", self.catalog_games),
+            ("GET", "/catalog/games/{game_id}", self.catalog_game),
+            ("GET", "/catalog/categories/{category_id}", self.catalog_category),
             ("GET", "/listings", self.listings),
+            ("POST", "/listings", self.create_listing),
+            ("GET", "/listings/{item_id}/publication", self.listing_quote),
+            ("POST", "/listings/{item_id}/publication", self.publish_listing),
             ("GET", "/listings/{item_id}", self.listing),
             ("PATCH", "/listings/{item_id}", self.listing),
             ("POST", "/listings/{item_id}/photo", self.photo),

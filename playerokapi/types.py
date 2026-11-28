@@ -2863,7 +2863,8 @@ class ChatMessage:
                  is_suspicious: bool, is_bulk_messaging: bool, game: Game | None, images: list[FileObject] | None,
                  user: UserProfile, deal: ItemDeal | None, item: ItemProfile | None, transaction: Transaction | None,
                  moderator: Moderator | None, event_by_user: UserProfile | None, event_to_user: UserProfile | None, 
-                 is_auto_response: bool, event: ChatMessageEvents | None, buttons: list[ChatMessageButton]):
+                 is_auto_response: bool, event: ChatMessageEvents | None, buttons: list[ChatMessageButton],
+                 raw_event: str | None = None):
         self.id: str = id
         """ ID сообщения. """
         self.text: str = text
@@ -2900,6 +2901,8 @@ class ChatMessage:
         """ Авто-ответ ли это. """
         self.event: ChatMessageEvents | None = event
         """ Ивент сообщения. """
+        self.raw_event: str | None = raw_event
+        """ Исходный код события, в том числе ещё неизвестный библиотеке. """
         self.buttons: list[ChatMessageButton] = buttons
         """ Кнопки сообщения. """
 
