@@ -119,8 +119,13 @@ CHAT_EVENT_TAG = re.compile(r"(?:\{\{([A-Z][A-Z0-9_]*)\}\}|\{([A-Z][A-Z0-9_]*)\}
 CHAT_EVENT_GROUPS = (
     (("ITEM_PAID", "OFFICIAL_ITEM_PAID"), "Товар оплачен", "Оплата подтверждена Playerok.", "paid", "bag", True),
     (("ITEM_SEND", "ITEM_SENT"), "Товар передан", "Продавец отметил товар как переданный.", "sent", "send", True),
-    (("DEAL_CONFIRMED", "ITEM_CONFIRM", "ITEM_CONFIRMED", "ITEM_RECEIVED"), "Сделка завершена", "Получение товара подтверждено.", "success", "check", True),
-    (("DEAL_CONFIRMED_AUTOMATICALLY", "ITEM_CONFIRMED_AUTOMATICALLY", "ITEM_AUTO_CONFIRMED"), "Сделка завершена автоматически", "Playerok подтвердил сделку.", "success", "check", True),
+    ((
+        "DEAL_CONFIRMED", "ITEM_CONFIRM", "ITEM_CONFIRMED", "ITEM_RECEIVE", "ITEM_RECEIVED",
+        "DEAL_COMPLETED", "ITEM_COMPLETED", "ITEM_CONFIRMED_BY_BUYER", "DEAL_CONFIRMED_BY_BUYER",
+        "BUYER_CONFIRMED", "ITEM_CONFIRMATION", "ITEM_CONFIRM_BY_BUYER",
+        "DEAL_CONFIRM", "ITEM_ACCEPTED", "ITEM_DEAL_CONFIRMED",
+    ), "Сделка завершена", "Покупатель подтвердил получение товара.", "success", "check", True),
+    (("DEAL_CONFIRMED_AUTOMATICALLY", "ITEM_CONFIRMED_AUTOMATICALLY", "ITEM_AUTO_CONFIRMED", "ITEM_CONFIRMED_AUTO", "DEAL_AUTO_CONFIRMED"), "Сделка завершена автоматически", "Playerok подтвердил сделку.", "success", "check", True),
     (("DEAL_ROLLED_BACK", "ITEM_ROLLED_BACK", "ITEM_REFUND", "ITEM_REFUNDED"), "Возврат средств", "Сделка возвращена.", "danger", "refresh", True),
     (("DEAL_HAS_PROBLEM", "PROBLEM_REPORTED", "ITEM_PROBLEM", "ITEM_HAS_PROBLEM"), "Проблема со сделкой", "По сделке открыто обращение.", "warning", "info", True),
     (("DEAL_PROBLEM_RESOLVED", "PROBLEM_RESOLVED", "ITEM_PROBLEM_RESOLVED"), "Проблема решена", "Обращение по сделке закрыто.", "success", "check", True),
@@ -140,20 +145,65 @@ CHAT_EVENT_PRESENTATION = {
 def chat_event_json(message: Any) -> dict[str, Any] | None:
     text = (getattr(message, "text", None) or "").strip()
     tag = CHAT_EVENT_TAG.fullmatch(text)
+    tag_code = (tag.group(1) or tag.group(2)) if tag else None
     linked = bool(getattr(message, "deal", None) or getattr(message, "item", None))
-    code = status_name(getattr(message, "event", None)) or getattr(message, "raw_event", None)
-    # Do not turn a customer's ordinary text into a trusted payment/status card.
+    api_code = status_name(getattr(message, "event", None)) or getattr(message, "raw_event", None)
     author = getattr(message, "user", None)
-    if not code and tag and not (getattr(author, "id", None) or getattr(author, "username", None)):
-        code = tag.group(1) or tag.group(2)
-    if not code:
+    has_author = bool(getattr(author, "id", None) or getattr(author, "username", None))
+    has_event_actor = any(
+        getattr(actor, "id", None) or getattr(actor, "username", None)
+        for actor in (getattr(message, "event_by_user", None), getattr(message, "event_to_user", None))
+    )
+
+    # Playerok can put the buyer/seller into "user" on a template-only message.
+    # Recognize those placeholders too, but never confuse a user-typed string
+    # with an authenticated deal event or use it to change the deal's state.
+    verified = True
+    source = "event"
+    if api_code in CHAT_EVENT_PRESENTATION:
+        code = api_code
+    elif tag_code in CHAT_EVENT_PRESENTATION:
+        code = tag_code
+        verified = not has_author or has_event_actor
+    elif api_code:
+        code = api_code
+    elif tag_code and not has_author:
+        code = tag_code
+    else:
         return None
     title, description, tone, icon, trade = CHAT_EVENT_PRESENTATION.get(
         code, ("Событие Playerok", "", "neutral", "info", linked),
     )
+    if not verified:
+        # A tagged user message is not itself proof of an event. The exact
+        # linked deal's API status can nevertheless independently verify the
+        # displayed status; label it as such, not as an event at this timestamp.
+        deal = getattr(message, "deal", None)
+        deal_status = status_name(getattr(deal, "status", None))
+        expected_title = {
+            "SENT": "Товар передан",
+            "CONFIRMED": "Сделка завершена",
+            "CONFIRMED_AUTOMATICALLY": "Сделка завершена автоматически",
+        }.get(deal_status)
+        if getattr(deal, "id", None) and expected_title == title:
+            verified = True
+            source = "deal"
+            description = "Статус сделки подтверждён Playerok."
+    if not verified:
+        source = "template"
+        if tone == "paid":
+            title = "Сообщение об оплате"
+        elif tone == "sent":
+            title = "Передача товара"
+        elif tone == "success" and icon == "check" and trade and code not in {
+            "DEAL_PROBLEM_RESOLVED", "PROBLEM_RESOLVED", "ITEM_PROBLEM_RESOLVED",
+        }:
+            title = "Подтверждение сделки"
+        description = "Шаблон статуса в сообщении. Проверьте состояние сделки в разделе «Продажи»."
+        tone = "neutral"
     return {
         "code": code, "title": title, "description": description, "tone": tone, "icon": icon,
-        "trade": trade or linked, "detail": text if not tag else "",
+        "trade": trade or linked, "detail": text if not tag else "", "verified": verified, "source": source,
     }
 
 
@@ -161,10 +211,12 @@ def chat_item_json(message: Any, chat_deals: Any = ()) -> dict[str, Any] | None:
     """Use only the lot attached to this message or its exact deal ID."""
     deal = getattr(message, "deal", None)
     deal_id = getattr(deal, "id", None)
-    matched_deal = next((entry for entry in chat_deals or ()
-                         if deal_id and getattr(entry, "id", None) == deal_id), None)
+    matched_items = [
+        getattr(entry, "item", None) for entry in chat_deals or ()
+        if deal_id and getattr(entry, "id", None) == deal_id
+    ]
     candidates = [item for item in (
-        getattr(deal, "item", None), getattr(message, "item", None), getattr(matched_deal, "item", None),
+        getattr(deal, "item", None), getattr(message, "item", None), *matched_items,
     ) if item is not None]
     if not candidates:
         return None
@@ -539,8 +591,15 @@ class MiniApp:
         client = await self.gateway.get_client(account)
         chat = await self.get_owned_chat(client, account.playerok_user_id, request.match_info["chat_id"])
         page = await client.call("get_chat_messages", chat.id, count=PAGE_SIZE, after_cursor=cursor(request))
+        # Completed deals may no longer be in the chat's active-deal list.
+        # Reuse product data from other events on this page only by exact deal ID.
+        known_deals = list(getattr(chat, "deals", None) or [])
+        known_deals.extend(
+            deal for entry in getattr(page, "messages", None) or []
+            if (deal := getattr(entry, "deal", None)) is not None
+        )
         result = paginate(page, "messages", lambda entry: message_json(
-            entry, account.playerok_user_id, getattr(chat, "deals", None),
+            entry, account.playerok_user_id, known_deals,
         ))
         return web.json_response({"chat": chat_json(chat, account.playerok_user_id), **result})
 

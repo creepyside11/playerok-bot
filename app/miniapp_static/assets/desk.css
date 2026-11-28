@@ -150,6 +150,7 @@ svg{display:block}
 .bubble img{display:block;max-width:100%;max-height:240px;border-radius:8px;margin-top:5px}
 /* Deal and system events are distinct from buyer/seller message bubbles. */
 .row-text small.event-preview{display:flex;gap:5px;align-items:center;color:var(--jade)}
+.row-text small.event-preview.unverified{color:var(--muted)}
 .event-preview .icon{width:13px;height:13px}
 .event-preview span{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .event-card{--event-accent:var(--muted);--event-tint:#26342b;--event-border:#3b4d3e;align-self:center;flex:none;width:min(100%,410px);min-width:0;display:grid;gap:11px;padding:13px;border:1px solid var(--event-border);border-radius:17px;background:linear-gradient(140deg,var(--event-tint),var(--surface) 65%);box-shadow:0 5px 18px #0002;overflow-wrap:anywhere}

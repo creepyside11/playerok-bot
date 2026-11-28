@@ -96,8 +96,8 @@ def test_missing_price_invalid_media_and_real_event_details():
     assert card["item"]["cover"] is None
 
 
-@pytest.mark.parametrize("text", ["{ITEM_PAID}", "Обычный текст {ITEM_SEND}", "Привет!"])
-def test_authored_text_is_never_mistaken_for_system_event(text):
+@pytest.mark.parametrize("text", ["Обычный текст {ITEM_SEND}", "Привет!", "{{UNKNOWN_TAG}}"])
+def test_authored_normal_text_is_not_mistaken_for_system_event(text):
     message = chat_message({
         "id": "m", "text": text, "user": {"id": "buyer", "username": "buyer"},
         "deal": {"id": "deal-1"},
@@ -106,6 +106,79 @@ def test_authored_text_is_never_mistaken_for_system_event(text):
     assert result["text"] == text
     assert result["systemEvent"] is None
     assert result["item"] is None
+
+
+@pytest.mark.parametrize(("tag", "title", "verified_title", "tone"), [
+    ("{{ITEM_SENT}}", "Передача товара", "Товар передан", "sent"),
+    ("{{ITEM_CONFIRMED}}", "Подтверждение сделки", "Сделка завершена", "success"),
+    ("{{DEAL_CONFIRMED}}", "Подтверждение сделки", "Сделка завершена", "success"),
+    ("{{ITEM_CONFIRMED_BY_BUYER}}", "Подтверждение сделки", "Сделка завершена", "success"),
+    ("{ITEM_PAID}", "Сообщение об оплате", "Товар оплачен", "paid"),
+])
+@pytest.mark.parametrize("actor_metadata", [False, True])
+def test_template_with_author_is_recognized_without_forging_verified_status(
+    tag, title, verified_title, tone, actor_metadata,
+):
+    raw = {
+        "id": "m", "text": tag, "event": None,
+        "user": {"id": "buyer", "username": "buyer"},
+        "deal": {"id": "deal-1"},
+    }
+    if actor_metadata:
+        raw["eventByUser"] = {"id": "buyer", "username": "buyer"}
+    result = message_json(chat_message(raw), "seller")
+    assert result["systemEvent"]["title"] == (verified_title if actor_metadata else title)
+    assert result["systemEvent"]["tone"] == (tone if actor_metadata else "neutral")
+    assert result["systemEvent"]["verified"] is actor_metadata
+    assert result["systemEvent"]["detail"] == ""
+    if not actor_metadata:
+        assert "Проверьте состояние сделки" in result["systemEvent"]["description"]
+
+
+@pytest.mark.parametrize(("tag", "status", "title", "tone"), [
+    ("{{ITEM_SENT}}", "SENT", "Товар передан", "sent"),
+    ("{{ITEM_CONFIRMED}}", "CONFIRMED", "Сделка завершена", "success"),
+    ("{{DEAL_CONFIRMED_AUTOMATICALLY}}", "CONFIRMED_AUTOMATICALLY", "Сделка завершена автоматически", "success"),
+])
+def test_template_with_matching_actual_deal_status_can_show_verified_status(tag, status, title, tone):
+    result = message_json(chat_message({
+        "id": "m", "text": tag, "user": {"id": "buyer"},
+        "deal": {"id": "deal-1", "status": status},
+    }), "seller")
+    event = result["systemEvent"]
+    assert event["source"] == "deal"
+    assert event["verified"]
+    assert event["title"] == title and event["tone"] == tone
+
+
+def test_unverified_confirmation_is_not_promoted_when_deal_only_paid():
+    result = message_json(chat_message({
+        "id": "m", "text": "{{ITEM_CONFIRMED}}", "user": {"id": "buyer"},
+        "deal": {"id": "deal-1", "status": "PAID"},
+    }), "seller")
+    assert result["systemEvent"]["source"] == "template"
+    assert not result["systemEvent"]["verified"]
+
+
+def test_generic_api_event_does_not_override_known_template():
+    result = message_json(chat_message({
+        "id": "m", "event": "NEW_MESSAGE", "text": "{{ITEM_SENT}}",
+        "user": {"id": "seller", "username": "seller"},
+    }), "seller")
+    assert result["systemEvent"]["code"] == "ITEM_SENT"
+    assert not result["systemEvent"]["verified"]
+
+
+def test_multiple_deal_hints_recover_complete_item_data():
+    message = chat_message({
+        "id": "m", "text": "{{ITEM_SENT}}",
+        "user": {"id": "seller"}, "deal": {"id": "deal-1", "item": {"id": "lot-1"}},
+    })
+    same = NS(id="deal-1", item=NS(id="lot-1", name="Набор", price=125, attachment=NS(url=COVER)))
+    wrong = NS(id="old-deal", item=NS(id="lot-2", name="Чужой", price=99))
+    partial = NS(id="deal-1", item=None)
+    result = message_json(message, "seller", [wrong, partial, same])
+    assert result["item"] == {"id": "lot-1", "name": "Набор", "price": "125", "cover": COVER}
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node недоступен")
@@ -129,9 +202,30 @@ def test_rendered_card_and_chat_preview_hide_service_tags_and_escape_html():
       const missing = {...message, item: null};
       assert.match(context.bubble(missing), /Данные товара недоступны/);
       assert.match(context.bubble({text: 'Обычное сообщение', mine: true}), /bubble mine/);
+      const sent = JSON.parse(process.argv[3]);
+      const sentCard = context.bubble(sent);
+      assert.match(sentCard, /event-card event-neutral/);
+      assert.match(sentCard, /Передача товара/);
+      assert.match(sentCard, /Статус из сообщения/);
+      assert.ok(!sentCard.includes('ITEM_SENT'));
+      assert.match(context.chatPreview(sent), /Шаблон статуса · Передача товара/);
+      const confirmed = JSON.parse(process.argv[4]);
+      const confirmedCard = context.bubble(confirmed);
+      assert.match(confirmedCard, /event-card event-success/);
+      assert.match(confirmedCard, /Сделка завершена/);
+      assert.ok(!confirmedCard.includes('ITEM_CONFIRMED'));
     """
     result = subprocess.run(
-        ["node", "-e", script, str(ASSETS / "desk.js"), json.dumps(message_json(purchase(), "seller"))],
+        [
+            "node", "-e", script, str(ASSETS / "desk.js"), json.dumps(message_json(purchase(), "seller")),
+            json.dumps(message_json(chat_message({
+                "id": "sent", "text": "{{ITEM_SENT}}", "user": {"id": "seller"},
+            }), "seller")),
+            json.dumps(message_json(chat_message({
+                "id": "confirmed", "text": "{{ITEM_CONFIRMED}}", "user": {"id": "buyer"},
+                "eventByUser": {"id": "buyer"},
+            }), "seller")),
+        ],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr

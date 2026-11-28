@@ -246,7 +246,10 @@ function more(action) {
 
 function chatPreview(message) {
   if (!message) return "Диалог";
-  if (message.systemEvent) return [message.systemEvent.title, message.item?.name].filter(Boolean).join(" · ");
+  if (message.systemEvent) return [
+    message.systemEvent.verified === false ? "Шаблон статуса" : message.systemEvent.source === "deal" ? "Статус сделки" : "",
+    message.systemEvent.title, message.item?.name,
+  ].filter(Boolean).join(" · ");
   return message.text || (message.images?.length ? "Вложение" : "Событие Playerok");
 }
 
@@ -255,7 +258,7 @@ function chatRows(list) {
     aria-pressed="${chat.id === currentChat}" data-search="${safe(`${chat.title} ${chatPreview(chat.last)}`)}">
       ${avatar(chat.title, chat.avatar)}
       <span class="row-text"><strong>${safe(chat.title)}</strong>
-       <small class="${chat.last?.systemEvent ? "event-preview" : ""}">${chat.last?.systemEvent ? icon(chat.last.systemEvent.icon) : ""}<span>${safe(chatPreview(chat.last))}</span></small></span>
+       <small class="${chat.last?.systemEvent ? `event-preview${chat.last.systemEvent.verified === false ? " unverified" : ""}` : ""}">${chat.last?.systemEvent ? icon(chat.last.systemEvent.icon) : ""}<span>${safe(chatPreview(chat.last))}</span></small></span>
       <span class="row-right"><small>${dateTime(chat.last?.time)}</small>${chat.unread ? `<span class="unread">${count(chat.unread)}</span>` : ""}</span>
     </button>`).join("");
 }
@@ -268,7 +271,7 @@ function eventCard(message) {
   return `<article class="event-card event-${tone}" aria-label="${safe(event.title)}">
     <header class="event-head">
       <span class="event-icon">${icon(event.icon)}</span>
-      <div class="event-heading"><small>Событие Playerok</small><strong>${safe(event.title)}</strong></div>
+      <div class="event-heading"><small>${event.verified === false ? "Статус из сообщения" : event.source === "deal" ? "Статус сделки" : "Событие Playerok"}</small><strong>${safe(event.title)}</strong></div>
       <time>${dateTime(message.time, true)}</time>
     </header>
     ${event.description ? `<p class="event-description">${safe(event.description)}</p>` : ""}
