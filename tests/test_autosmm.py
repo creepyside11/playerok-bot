@@ -17,7 +17,7 @@ from plugins.autosmm import on_deal
 
 
 @pytest.mark.asyncio
-async def test_autosmm_on_deal_flow():
+async def test_autosmm_on_deal_flow(monkeypatch):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -116,8 +116,10 @@ async def test_autosmm_on_deal_flow():
             assert quantity == 1000
             return {"order": "998877"}
 
-    plugin_mod.SmmApiClient = FakeSmmClient
+    monkeypatch.setattr(plugin_mod, "SmmApiClient", FakeSmmClient)
 
+    await on_deal(ctx, deal)
+    # A repeated deal observation cannot dispatch a second order.
     await on_deal(ctx, deal)
 
     # Проверяем отправку сообщения покупателю
@@ -140,3 +142,6 @@ async def test_autosmm_on_deal_flow():
         assert saved_order is not None
         assert saved_order.smm_order_id == "998877"
         assert saved_order.quantity == 1000
+        assert saved_order.provider_url == "https://smmway.com/api/v2"
+        assert saved_order.deal_completed
+    await engine.dispose()

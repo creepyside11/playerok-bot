@@ -7,12 +7,14 @@ import re
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.autosmm_manager import (
     AutoSmmConfig,
     AutoSmmLotRule,
     AutoSmmOrder,
     SmmApiClient,
+    resolve_lot_rule, provider_id,
 )
 from playerokapi.enums import ItemDealStatuses
 
@@ -21,12 +23,12 @@ logger = logging.getLogger("plugin.autosmm")
 PLUGIN_META = {
     "id": "autosmm",
     "name": "AutoSMM (Накрутка / SMM панель)",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "author": "Playerok Bot",
     "description": (
         "Автоматическое создание заказов в SMM-панелях (smmway и любых сервисах со стандартным SMM API v2) "
         "при покупке лотов на Playerok. Удобный графический интерфейс привязки товаров, каталог услуг, "
-        "баланс и автоматический перевод заказов в статус «Выполнен»."
+        "привязки по фразе, история и статус заказов, ручные запросы refill при поддержке панели."
     ),
     "settings": {
         "auto_confirm_deal": {
@@ -92,28 +94,11 @@ async def on_deal(ctx: Any, deal: Any) -> None:
         return
 
     async with ctx.db() as session:
-        # 1. Проверяем правило привязки лота
-        rules = (await session.scalars(
-            select(AutoSmmLotRule).where(
-                AutoSmmLotRule.account_id == account.id,
-                AutoSmmLotRule.enabled.is_(True),
-            )
-        )).all()
-
-        rule = None
-        for r in rules:
-            if str(r.lot_id).strip() == str(item_id).strip() or str(r.lot_id).strip() == "*":
-                rule = r
-                break
-
-        if not rule and getattr(deal, "item", None):
-            item_slug = str(getattr(deal.item, "slug", "") or "").strip()
-            item_title = str(getattr(deal.item, "name", "") or "").strip().lower()
-            for r in rules:
-                if (item_slug and r.lot_id == item_slug) or (item_title and r.lot_title.strip().lower() in item_title):
-                    rule = r
-                    break
-
+        # Exact lot ID first, then the longest explicitly configured keyword.
+        rule = await resolve_lot_rule(
+            session, account.id, item_id, str(getattr(item, "name", "") or ""),
+            str(getattr(item, "slug", "") or ""),
+        )
         if not rule:
             return
 
@@ -145,9 +130,12 @@ async def on_deal(ctx: Any, deal: Any) -> None:
             from app.handlers import svc
             cipher = svc().cipher
         try:
-            api_key = cipher.decrypt(cfg.api_key_encrypted) if cipher else cfg.api_key_encrypted
+            api_key = cipher.decrypt(cfg.api_key_encrypted) if cipher else None
         except Exception:
-            api_key = cfg.api_key_encrypted
+            api_key = None
+        if not api_key:
+            await ctx.notify("⚠️ AutoSMM: не удалось прочитать ключ панели. Сохраните ключ заново.")
+            return
 
         api_url = cfg.api_url or "https://smmway.com/api/v2"
         service_id = rule.service_id
@@ -169,53 +157,60 @@ async def on_deal(ctx: Any, deal: Any) -> None:
     if link.startswith("@"):
         link = f"https://t.me/{link[1:]}"
 
-    # 5. Отправляем заказ в SMM панель
-    client = SmmApiClient(api_url=api_url, api_key=api_key)
+    # Reserve the unique deal before the network mutation. A timeout or a
+    # concurrent callback must not cause duplicate paid orders.
     try:
-        resp = await client.create_order(service_id=service_id, link=link, quantity=quantity)
-    except Exception as exc:
-        logger.error("AutoSMM create_order failed for deal %s: %s", deal_id, exc)
-        await ctx.notify(
-            f"❌ <b>AutoSMM: Ошибка соединения с SMM-панелью:</b>\n"
-            f"Сделка: <code>{deal_id}</code>\n"
-            f"Ошибка: <code>{html.escape(str(exc)[:250])}</code>"
-        )
+        client = SmmApiClient(api_url=api_url, api_key=api_key)
+    except Exception:
+        await ctx.notify("⚠️ AutoSMM: проверьте HTTPS-адрес SMM-панели.")
         return
-
-    if "error" in resp:
-        err_msg = str(resp.get("error"))
-        logger.error("AutoSMM returned error for deal %s: %s", deal_id, err_msg)
-        await ctx.notify(
-            f"❌ <b>AutoSMM: Сервис вернул отказ</b> по сделке <code>{deal_id}</code>:\n"
-            f"Причина: <b>{html.escape(err_msg)}</b>\n"
-            f"Услуга: #{service_id}, Ссылка: <code>{html.escape(link)}</code>"
-        )
-        return
-
-    smm_order_id = str(resp.get("order") or "0")
-
-    # 6. Сохраняем в БД
     async with ctx.db() as session:
         order_rec = AutoSmmOrder(
-            account_id=account.id,
-            deal_id=deal_id,
-            chat_id=chat_id,
-            smm_order_id=smm_order_id,
-            service_id=service_id,
-            service_name=service_name,
-            link=link,
-            quantity=quantity,
-            status="Pending",
-            deal_completed=False,
+            account_id=account.id, deal_id=deal_id, chat_id=chat_id,
+            smm_order_id="0", service_id=service_id, service_name=service_name,
+            link=link, quantity=quantity, status="Requesting", deal_completed=False,
+            provider_url=client.api_url,
         )
         session.add(order_rec)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            return
+
+    status, smm_order_id, error = "Unknown", "0", None
+    try:
+        resp = await client.create_order(service_id=service_id, link=link, quantity=quantity)
+        if resp.get("error"):
+            status, error = "Rejected", str(resp["error"])[:250]
+        elif raw_id := provider_id(resp.get("order")):
+            smm_order_id, status = raw_id, "Pending"
+        else:
+            error = "Панель не вернула ID заказа. Проверьте его вручную, не отправляйте повторно."
+    except Exception as exc:
+        logger.warning("AutoSMM order result unknown for deal %s (%s)", deal_id, type(exc).__name__)
+        error = "Ответ панели не получен. Проверьте заказ вручную, не отправляйте повторно."
+
+    async with ctx.db() as session:
+        record = await session.scalar(select(AutoSmmOrder).where(
+            AutoSmmOrder.account_id == account.id, AutoSmmOrder.deal_id == deal_id,
+        ))
+        if record:
+            record.smm_order_id, record.status = smm_order_id, status
+            await session.commit()
+
+    if status != "Pending":
+        await ctx.notify(
+            f"⚠️ AutoSMM: заказ по сделке <code>{html.escape(deal_id)}</code> не подтверждён. "
+            f"{html.escape(error or 'Проверьте панель вручную.')}"
+        )
+        return
 
     # 7. Автозавершение сделки в статус SENT (выполнен)
     cfg_auto = getattr(ctx, "config", {}) or {}
     auto_complete = cfg_auto.get("auto_confirm_deal", True) and rule_auto_sent
+    sent_ok = False
     if auto_complete:
-        sent_ok = False
         try:
             await ctx.update_deal(deal_id, ItemDealStatuses.SENT)
             sent_ok = True
@@ -253,7 +248,7 @@ async def on_deal(ctx: Any, deal: Any) -> None:
                 f"🎯 Услуга: {service_name}\n"
                 f"🔢 Количество: {quantity} шт.\n"
                 f"🔗 Ссылка: {link}\n\n"
-                f"Выполнение начнется в течение нескольких минут. Пожалуйста, подтвердите получение заказа!"
+                f"Статус можно проверить у продавца. Подтверждайте получение только после выполнения заказа."
             )
         except Exception:
             pass
@@ -269,5 +264,5 @@ async def on_deal(ctx: Any, deal: Any) -> None:
             f"🎯 Услуга: #{service_id} ({html.escape(service_name)})\n"
             f"🔗 Ссылка: <code>{html.escape(link)}</code>\n"
             f"🔢 Количество: <b>{quantity} шт.</b>\n"
-            f"✅ Статус заказа на Playerok: «Выполнен»"
+            f"Статус Playerok: {'«Выполнен»' if sent_ok else 'без изменений'}"
         )

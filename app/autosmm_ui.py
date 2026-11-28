@@ -15,7 +15,9 @@ from .autosmm_manager import (
     AutoSmmConfig,
     AutoSmmLotRule,
     AutoSmmOrder,
-    SmmApiClient,
+    SmmApiClient, SmmError, bind_service, get_configured_client, get_owned_order,
+    normalize_api_url, provider_service, refresh_order, request_order_refill, valid_keyword,
+    valid_service_id, validate_quantity,
 )
 from .handlers import active_account, clip, edit, require_account, svc
 from .models import PlayerokAccount
@@ -29,25 +31,16 @@ router = Router(name="autosmm_ui")
 class AutoSmmState(StatesGroup):
     api_url = State()
     api_key = State()
+    keyword = State()
     custom_service_id = State()
     custom_quantity = State()
 
 
 async def _get_smm_client(account: PlayerokAccount) -> tuple[SmmApiClient | None, AutoSmmConfig | None]:
-    async with svc().db() as session:
-        cfg = await session.scalar(
-            select(AutoSmmConfig).where(AutoSmmConfig.account_id == account.id)
-        )
-    if not cfg or not cfg.api_key_encrypted:
-        return None, cfg
-
-    cipher = svc().cipher
     try:
-        api_key = cipher.decrypt(cfg.api_key_encrypted) if cipher else cfg.api_key_encrypted
-    except Exception:
-        api_key = cfg.api_key_encrypted
-
-    return SmmApiClient(api_url=cfg.api_url, api_key=api_key), cfg
+        return await get_configured_client(svc().db, svc().cipher, account.id)
+    except SmmError:
+        return None, None
 
 
 # --- ГЛАВНОЕ МЕНЮ AUTOSMM ---
@@ -85,6 +78,7 @@ async def autosmm_main_menu(call: CallbackQuery, state: FSMContext) -> None:
         [InlineKeyboardButton(text="🌐 Настроить API URL", callback_data="autosmm:apiurl")],
         [InlineKeyboardButton(text="📋 Каталог услуг SMM", callback_data="autosmm:services:0")],
         [InlineKeyboardButton(text=f"🔗 Привязать лот Playerok ({total_rules})", callback_data="autosmm:lots")],
+        [InlineKeyboardButton(text="🔤 Привязать по ключевому слову", callback_data="autosmm:keyword")],
         [InlineKeyboardButton(text="⚙️ Список привязок", callback_data="autosmm:rules")],
         [InlineKeyboardButton(text=f"📊 История заказов ({total_orders})", callback_data="autosmm:history:0")],
         [InlineKeyboardButton(text="⬅️ Меню плагинов", callback_data="plugins:mine")],
@@ -95,7 +89,7 @@ async def autosmm_main_menu(call: CallbackQuery, state: FSMContext) -> None:
         "Интеграция с сервисами SMM (smmway и любыми SMM v2 панелями):\n"
         "• Покупатель оплачивает лот на Playerok (подписчики, лайки, просмотры)\n"
         "• Бот сам извлекает ссылку из заказа и мгновенно создает задачу в SMM панели\n"
-        "• Заказ на Playerok автоматически переводится в статус «Выполнен»\n\n"
+        "• Статус заказа и доступность refill можно проверить в истории\n\n"
         f"<b>Статус панели:</b>\n{bal_text}\n\n"
         f"📦 Привязано лотов: <b>{total_rules}</b> | Отправлено заказов: <b>{total_orders}</b>"
     )
@@ -146,8 +140,10 @@ async def autosmm_apiurl_save(message: Message, state: FSMContext) -> None:
         return
 
     url = (message.text or "").strip()
-    if not url.startswith("http"):
-        await message.answer("⚠️ URL должен начинаться с http:// или https://")
+    try:
+        url = normalize_api_url(url)
+    except SmmError as exc:
+        await message.answer(html.escape(str(exc)))
         return
 
     await state.clear()
@@ -198,8 +194,8 @@ async def autosmm_apikey_save(message: Message, state: FSMContext) -> None:
         api_url = cfg.api_url if cfg else "https://smmway.com/api/v2"
 
     # Проверяем ключ
-    client = SmmApiClient(api_url=api_url, api_key=raw_key)
     try:
+        client = SmmApiClient(api_url=api_url, api_key=raw_key)
         bal = await client.get_balance()
         balance = bal.get("balance", "0")
         currency = bal.get("currency", "RUB")
@@ -372,6 +368,7 @@ async def autosmm_bind_srv_choose_lot(call: CallbackQuery) -> None:
     for item in items:
         b.button(text=f"📦 {clip(item.name, 26)}", callback_data=f"autosmm:pair:{item.id}:{service_id}")
     b.adjust(1)
+    b.row(InlineKeyboardButton(text="🔤 По ключевой фразе", callback_data=f"autosmm:keyword_srv:{service_id}"))
     b.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="autosmm:services:0"))
 
     await edit(call, f"🔗 <b>К какому лоту привязать услугу #{service_id}?</b>", b.as_markup())
@@ -417,50 +414,36 @@ async def autosmm_pair_confirm(call: CallbackQuery) -> None:
     service_id = str(parts[3])
 
     client, _ = await _get_smm_client(account)
-    service_name = f"Услуга #{service_id}"
-    if client:
-        try:
-            services = await client.get_services()
-            s = next((x for x in services if str(x.get("service") or x.get("id")) == service_id), None)
-            if s:
-                service_name = s.get("name", service_name)
-        except Exception:
-            pass
-
+    if not client:
+        await call.answer("Настройте API панели", show_alert=True)
+        return
     try:
+        service = provider_service(await client.get_services(), service_id)
+        if not service:
+            raise SmmError("Услуга не найдена.")
         pok_client = await svc().gateway.get_client(account)
-        item = await pok_client.get_item(lot_id)
-        lot_title = getattr(item, "name", f"Лот {lot_id}")
-    except Exception:
-        lot_title = f"Лот {lot_id}"
-
-    async with svc().db() as session:
-        rule = await session.scalar(
-            select(AutoSmmLotRule).where(
-                AutoSmmLotRule.account_id == account.id,
-                AutoSmmLotRule.lot_id == lot_id,
-            )
-        )
-        if rule:
-            rule.service_id = service_id
-            rule.service_name = service_name
-            rule.lot_title = lot_title
-            rule.enabled = True
-        else:
-            rule = AutoSmmLotRule(
-                account_id=account.id,
-                lot_id=lot_id,
-                lot_title=lot_title,
-                service_id=service_id,
-                service_name=service_name,
-                quantity=100,
-                enabled=True,
-            )
-            session.add(rule)
-        await session.commit()
+        from .miniapp import MiniApp
+        item = await MiniApp.owned_listing(pok_client, account, lot_id)
+        lot_title = str(item.name or "Лот")
+        async with svc().db() as session:
+            old = await session.scalar(select(AutoSmmLotRule).where(
+                AutoSmmLotRule.account_id == account.id, AutoSmmLotRule.lot_id == lot_id,
+            ))
+        quantity = old.quantity if old else 100
+        try:
+            quantity = validate_quantity(quantity, service)
+        except SmmError:
+            minimum, maximum = int(service.get("min") or 1), int(service.get("max") or 10_000_000)
+            quantity = validate_quantity(max(minimum, min(100, maximum)), service)
+        rule = await bind_service(svc().db, account.id, service=service, quantity=quantity,
+                                  lot_id=lot_id, lot_title=lot_title)
+        service_name = rule.service_name
+    except Exception as exc:
+        await call.answer(str(exc)[:180], show_alert=True)
+        return
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔢 Настроить количество (100 по умолч.)", callback_data=f"autosmm:rule_view:{rule.id}")],
+        [InlineKeyboardButton(text="🔢 Настроить количество", callback_data=f"autosmm:rule_view:{rule.id}")],
         [InlineKeyboardButton(text="⚙️ Список привязок", callback_data="autosmm:rules")],
         [InlineKeyboardButton(text="🚀 В меню AutoSMM", callback_data="autosmm:open")],
     ])
@@ -474,6 +457,150 @@ async def autosmm_pair_confirm(call: CallbackQuery) -> None:
         f"При покупке лота бот автоматически найдёт ссылку покупателя и запустит накрутку!",
         markup,
     )
+
+
+@router.callback_query((F.data == "autosmm:keyword") | F.data.startswith("autosmm:keyword_srv:"))
+async def autosmm_keyword_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    client, _ = await _get_smm_client(account)
+    if not client:
+        await call.answer("Сначала настройте API-ключ и URL", show_alert=True)
+        return
+    selected = call.data.rsplit(":", 1)[-1] if call.data.startswith("autosmm:keyword_srv:") else None
+    await state.clear()
+    await state.update_data(account_id=str(account.id), selected_service=selected)
+    await state.set_state(AutoSmmState.keyword)
+    await edit(call, "🔤 <b>Введите ключевое слово или фразу из названия лота.</b>\n"
+               "Регистр не важен; точный ID лота имеет приоритет. Более длинная фраза выигрывает при совпадении.",
+               InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="autosmm:open")]]))
+
+
+async def wizard_account(message: Message, state: FSMContext) -> PlayerokAccount | None:
+    account = await active_account(message.from_user.id if message.from_user else 0)
+    data = await state.get_data()
+    if not account or data.get("account_id") != str(account.id):
+        await state.clear()
+        await message.answer("Аккаунт изменился. Откройте AutoSMM заново.")
+        return None
+    return account
+
+
+@router.message(AutoSmmState.keyword, F.text)
+async def autosmm_keyword_value(message: Message, state: FSMContext) -> None:
+    if not await wizard_account(message, state):
+        return
+    if not valid_keyword(message.text):
+        await message.answer("Введите фразу от 2 до 128 символов.")
+        return
+    await state.update_data(keyword=message.text.strip())
+    data = await state.get_data()
+    if data.get("selected_service") and valid_service_id(data["selected_service"]):
+        await autosmm_service_selected(message, state, data["selected_service"])
+    else:
+        await state.set_state(AutoSmmState.custom_service_id)
+        await message.answer("⚡ Введите ID услуги из каталога SMM-панели.")
+
+
+async def autosmm_service_selected(message: Message, state: FSMContext, service_id: str) -> None:
+    account = await wizard_account(message, state)
+    if not account:
+        return
+    try:
+        if not valid_service_id(service_id):
+            raise SmmError("Некорректный ID услуги.")
+        client, _ = await _get_smm_client(account)
+        if not client:
+            raise SmmError("Настройте API-ключ.")
+        service = provider_service(await client.get_services(), service_id)
+        if not service:
+            raise SmmError("Услуга не найдена в каталоге.")
+    except Exception as exc:
+        await state.set_state(AutoSmmState.custom_service_id)
+        await message.answer(html.escape(str(exc)[:250]) + " Введите ID ещё раз:")
+        return
+    await state.update_data(selected_service=service_id)
+    await state.set_state(AutoSmmState.custom_quantity)
+    await message.answer(
+        f"🔢 <b>{html.escape(str(service.get('name') or service_id)[:256])}</b>\n"
+        f"Введите количество (мин.: {html.escape(str(service.get('min', '—')))}, "
+        f"макс.: {html.escape(str(service.get('max', '—')))})."
+    )
+
+
+@router.message(AutoSmmState.custom_service_id, F.text)
+async def autosmm_service_id_value(message: Message, state: FSMContext) -> None:
+    await autosmm_service_selected(message, state, (message.text or "").strip())
+
+
+@router.message(AutoSmmState.custom_quantity, F.text)
+async def autosmm_custom_quantity(message: Message, state: FSMContext) -> None:
+    account = await wizard_account(message, state)
+    if not account:
+        return
+    data = await state.get_data()
+    try:
+        value = (message.text or "").strip()
+        if not value.isascii() or not value.isdigit() or len(value) > 8:
+            raise SmmError("Введите целое количество.")
+        quantity = int(value)
+        client, _ = await _get_smm_client(account)
+        if not client:
+            raise SmmError("API-ключ не настроен.")
+        if data.get("rule_id"):
+            async with svc().db() as session:
+                row = await session.get(AutoSmmLotRule, data["rule_id"])
+                if not row or row.account_id != account.id:
+                    raise SmmError("Привязка не найдена.")
+                service_id = row.service_id
+            service = provider_service(await client.get_services(), service_id)
+            if not service:
+                raise SmmError("Услуга больше недоступна.")
+            quantity = validate_quantity(quantity, service)
+            async with svc().db() as session:
+                row = await session.get(AutoSmmLotRule, data["rule_id"], with_for_update=True)
+                if not row or row.account_id != account.id or row.service_id != service_id:
+                    raise SmmError("Привязка изменилась.")
+                row.quantity = quantity
+                await session.commit()
+        else:
+            service = provider_service(await client.get_services(), data.get("selected_service"))
+            if not service:
+                raise SmmError("Услуга больше недоступна.")
+            row = await bind_service(svc().db, account.id, service=service, quantity=quantity, keyword=data.get("keyword"))
+    except (ValueError, TypeError) as exc:
+        await message.answer(html.escape(str(exc)[:250]) + " Введите количество ещё раз:")
+        return
+    except Exception:
+        await message.answer("Не удалось получить каталог SMM. Попробуйте позже.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Привязка сохранена: <b>{html.escape(row.lot_title)}</b> → #{html.escape(row.service_id)}, {row.quantity} шт.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Настроить привязку", callback_data=f"autosmm:rule_view:{row.id}")],
+            [InlineKeyboardButton(text="Список привязок", callback_data="autosmm:rules")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("autosmm:qty_custom:"))
+async def autosmm_custom_qty_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    rule_id = int(call.data.rsplit(":", 1)[-1])
+    async with svc().db() as session:
+        row = await session.get(AutoSmmLotRule, rule_id)
+    if not row or row.account_id != account.id:
+        await call.answer("Привязка не найдена", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(account_id=str(account.id), rule_id=rule_id)
+    await state.set_state(AutoSmmState.custom_quantity)
+    await edit(call, f"Введите количество для услуги #{html.escape(row.service_id)}:",
+               InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="autosmm:open")]]))
 
 
 # --- СПИСОК ПРИВЯЗОК ---
@@ -492,6 +619,7 @@ async def autosmm_rules_list(call: CallbackQuery) -> None:
     if not rules:
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Привязать лот", callback_data="autosmm:lots")],
+            [InlineKeyboardButton(text="🔤 Привязать по слову", callback_data="autosmm:keyword")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="autosmm:open")],
         ])
         await edit(call, "📋 Пока нет привязанных лотов к AutoSMM.", markup)
@@ -500,12 +628,13 @@ async def autosmm_rules_list(call: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     for r in rules:
         st = "🟢" if r.enabled else "⏸"
-        title = f"{st} {clip(r.lot_title, 18)} -> #{r.service_id} ({r.quantity} шт.)"
+        title = f"{st} {'🔤 ' if r.keyword else '📦 '}{clip(r.lot_title, 18)} → #{r.service_id} ({r.quantity})"
         b.button(text=title, callback_data=f"autosmm:rule_view:{r.id}")
         b.button(text="🗑", callback_data=f"autosmm:rule_del:{r.id}")
     b.adjust(2)
 
     b.row(InlineKeyboardButton(text="➕ Привязать ещё лот", callback_data="autosmm:lots"))
+    b.row(InlineKeyboardButton(text="🔤 Привязать по слову", callback_data="autosmm:keyword"))
     b.row(InlineKeyboardButton(text="⬅️ В меню AutoSMM", callback_data="autosmm:open"))
 
     text = "📋 <b>Привязанные лоты AutoSMM:</b>\n\n<i>Нажмите на строку для изменения количества накрутки.</i>"
@@ -528,7 +657,7 @@ async def autosmm_rule_view(call: CallbackQuery) -> None:
     st = "🟢 Включено" if rule.enabled else "⏸ На паузе"
     text = (
         f"⚙️ <b>Настройка привязки #{rule.id}</b>\n\n"
-        f"📦 Товар: <b>{html.escape(rule.lot_title)}</b>\n"
+        f"{'🔤 Фраза' if rule.keyword else '📦 Товар'}: <b>{html.escape(rule.lot_title)}</b>\n"
         f"⚡ Услуга: <b>{html.escape(rule.service_name or rule.service_id)}</b> (#{rule.service_id})\n"
         f"🔢 Количество: <b>{rule.quantity} шт.</b>\n"
         f"Статус: <b>{st}</b>"
@@ -545,6 +674,7 @@ async def autosmm_rule_view(call: CallbackQuery) -> None:
             InlineKeyboardButton(text="1 000", callback_data=f"autosmm:set_qty:{rule.id}:1000"),
             InlineKeyboardButton(text="5 000", callback_data=f"autosmm:set_qty:{rule.id}:5000"),
         ],
+        [InlineKeyboardButton(text="🔢 Своё количество", callback_data=f"autosmm:qty_custom:{rule.id}")],
         [InlineKeyboardButton(text="⏸ Включить/Пауза", callback_data=f"autosmm:rule_toggle:{rule.id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"autosmm:rule_del:{rule.id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data="autosmm:rules")],
@@ -562,11 +692,12 @@ async def autosmm_set_qty(call: CallbackQuery) -> None:
     rule_id = int(parts[2])
     qty = int(parts[3])
 
-    async with svc().db() as session:
-        rule = await session.get(AutoSmmLotRule, rule_id)
-        if rule and rule.account_id == account.id:
-            rule.quantity = qty
-            await session.commit()
+    try:
+        from .miniapp_autosmm import AutoSmmPanel
+        await AutoSmmPanel(svc().db, svc().cipher).update_rule(account.id, rule_id, {"quantity": qty})
+    except Exception as exc:
+        await call.answer(str(exc)[:180], show_alert=True)
+        return
 
     await call.answer(f"Количество установлено: {qty}")
     await autosmm_rule_view(call)
@@ -642,12 +773,15 @@ async def autosmm_history(call: CallbackQuery) -> None:
     lines = []
     for o in orders:
         lines.append(
-            f"• <b>Заказ #{o.smm_order_id}</b> (Сделка: <code>{o.deal_id}</code>)\n"
-            f"  Услуга: #{o.service_id} | Кол-во: <b>{o.quantity}</b>\n"
-            f"  Ссылка: <code>{clip(o.link, 30)}</code> | Статус: <i>{o.status}</i>"
+            f"• <b>Заказ #{html.escape(o.smm_order_id)}</b> (Сделка: <code>{html.escape(o.deal_id)}</code>)\n"
+            f"  Услуга: #{html.escape(o.service_id)} | Кол-во: <b>{o.quantity}</b>\n"
+            f"  Ссылка: <code>{html.escape(clip(o.link, 30))}</code> | Статус: <i>{html.escape(o.status)}</i>"
+            + (f"\n  Refill: {html.escape(o.refill_status)}" if o.refill_status else "")
         )
 
     b = InlineKeyboardBuilder()
+    for order in orders:
+        b.row(InlineKeyboardButton(text=f"Заказ #{order.smm_order_id} · статус / refill", callback_data=f"autosmm:order:{order.id}"))
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"autosmm:history:{page - 1}"))
@@ -659,3 +793,85 @@ async def autosmm_history(call: CallbackQuery) -> None:
 
     text = f"📊 <b>История заказов SMM (Стр. {page + 1})</b>\n\n" + "\n\n".join(lines)
     await edit(call, text, b.as_markup())
+
+
+@router.callback_query(F.data.startswith("autosmm:order:"))
+async def autosmm_order_view(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    order_id = int(call.data.rsplit(":", 1)[-1])
+    try:
+        order = await get_owned_order(svc().db, account.id, order_id)
+    except SmmError:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+    await call.answer("Проверяю статус…")
+    available, warning = False, ""
+    try:
+        client, _ = await _get_smm_client(account)
+        if not client:
+            raise SmmError("Настройте API панели.")
+        order, available = await refresh_order(svc().db, account.id, order_id, client)
+    except Exception as exc:
+        warning = f"\n⚠️ {html.escape(str(exc)[:250])}"
+    text = (
+        f"📊 <b>Заказ #{html.escape(order.smm_order_id)}</b>\n\n"
+        f"Сделка: <code>{html.escape(order.deal_id)}</code>\n"
+        f"Услуга: #{html.escape(order.service_id)} · {html.escape(order.service_name)}\n"
+        f"Количество: {order.quantity}\n"
+        f"Ссылка: <code>{html.escape(order.link)}</code>\n"
+        f"Статус: <b>{html.escape(order.status)}</b>\n"
+        f"Refill: <b>{html.escape(order.refill_status or 'не запрашивался')}</b>\n"
+        f"ID refill: <code>{html.escape(order.refill_id or '—')}</code>" + warning
+    )
+    rows = []
+    if available:
+        rows.append([InlineKeyboardButton(text="🔄 Запросить refill", callback_data=f"autosmm:refill_ask:{order.id}")])
+    rows += [[InlineKeyboardButton(text="Обновить статус", callback_data=f"autosmm:order:{order.id}")],
+             [InlineKeyboardButton(text="К истории", callback_data="autosmm:history:0")]]
+    await edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("autosmm:refill_ask:"))
+async def autosmm_refill_ask(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    order_id = int(call.data.rsplit(":", 1)[-1])
+    try:
+        order = await get_owned_order(svc().db, account.id, order_id)
+    except SmmError:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+    legacy = not bool(order.provider_url)
+    note = "\n⚠️ Это старый заказ. Подтвердите, что он действительно принадлежит настроенной сейчас панели." if legacy else ""
+    await edit(call, f"Запросить refill для заказа #{html.escape(order.smm_order_id)}?{note}\n"
+               "Будет отправлен один запрос. Панель проверит доступность.",
+               InlineKeyboardMarkup(inline_keyboard=[
+                   [InlineKeyboardButton(text="Подтвердить" + (" текущую панель" if legacy else ""),
+                                         callback_data=f"autosmm:refill_yes:{order.id}:{int(legacy)}")],
+                   [InlineKeyboardButton(text="Отмена", callback_data=f"autosmm:order:{order.id}")],
+               ]))
+
+
+@router.callback_query(F.data.startswith("autosmm:refill_yes:"))
+async def autosmm_refill_confirm(call: CallbackQuery) -> None:
+    account = await require_account(call)
+    if not account:
+        return
+    _, _, raw_id, legacy = call.data.split(":")
+    order_id = int(raw_id)
+    await call.answer("Отправляю запрос…")
+    try:
+        client, _ = await _get_smm_client(account)
+        if not client:
+            raise SmmError("Настройте API панели.")
+        order = await request_order_refill(svc().db, account.id, order_id, client, confirm_legacy=legacy == "1")
+        text = f"✅ Refill принят: <code>#{html.escape(order.refill_id or '—')}</code>. Статус: {html.escape(order.refill_status or '—')}."
+    except Exception as exc:
+        text = f"⚠️ {html.escape(str(exc)[:250])}"
+    await edit(call, text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="К заказу / проверить статус", callback_data=f"autosmm:order:{order_id}")],
+        [InlineKeyboardButton(text="К истории", callback_data="autosmm:history:0")],
+    ]))

@@ -383,3 +383,21 @@ svg{display:block}
 .wizard-publication-result>.icon{width:46px;height:46px;padding:10px;background:#263d2b;color:var(--lime);border-radius:50%}
 .wizard-publication-result>strong{font-size:24px;color:var(--lime)}
 @media(max-width:360px){.wizard-progress{gap:3px}.wizard-progress span{font-size:9px}.wizard-progress b{width:25px;height:25px}.form-actions .button{white-space:normal}}
+
+/* AutoSMM: compact account-scoped order and rule management. */
+.smm-overview{display:flex;gap:12px;align-items:center;padding:13px;border:1px solid var(--line);border-radius:14px;background:var(--well);margin-bottom:13px}
+.smm-overview .row-text{flex:1;min-width:0}
+.smm-overview .row-text small{overflow-wrap:anywhere;white-space:normal}
+.smm-body{display:grid;gap:12px;margin-top:14px}
+.smm-section{display:grid;gap:14px}
+.smm-section h3{font-size:15px}
+.smm-rules{display:grid;gap:10px}
+.smm-rule{display:grid;gap:12px;padding:12px;border:1px solid var(--line);border-radius:13px;background:var(--well)}
+.smm-rule-head{display:flex;align-items:center;gap:10px;min-width:0}
+.smm-rule-head .row-text{flex:1;min-width:0}
+.smm-rule-head .row-text strong,.smm-rule-head .row-text small,.smm-service-row .row-text strong,.smm-service-row .row-text small{white-space:normal;overflow-wrap:anywhere}
+.smm-rule-form{padding-top:10px;border-top:1px solid var(--line)}
+.smm-service-row{gap:8px;align-items:center}
+.smm-service-row .status{flex:none;max-width:90px;white-space:normal;overflow-wrap:anywhere}
+
+.smm-toolbar{margin-bottom:12px}

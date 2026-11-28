@@ -22,6 +22,8 @@ from playerokapi.exceptions import (
 )
 from playerokapi.types import MyItem
 
+from .autosmm_manager import SmmError
+from .miniapp_autosmm import AutoSmmPanel
 from .config import Settings
 from .item_delivery import BUYER_MESSAGE_ERROR, ListingFieldsUnavailable, listing_comment_update, valid_buyer_message
 from .item_publication import (
@@ -398,6 +400,7 @@ class MiniApp:
         self.token = token
         self.bot_profile = bot_profile
         self.telegram_plugins = TelegramPluginSettings(db, plugins)
+        self.autosmm = AutoSmmPanel(db, getattr(gateway, "cipher", None))
         self.withdrawal_locks: dict[str, asyncio.Lock] = {}
         self.withdrawal_cooldowns: dict[str, float] = {}
         self.listing_locks: dict[str, asyncio.Lock] = {}
@@ -418,6 +421,8 @@ class MiniApp:
             return await handler(request)
         except web.HTTPException as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
+        except SmmError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
         except (BotCheckDetectedException, UnauthorizedError, RequestFailedError, RequestPlayerokError, RequestSendingError) as exc:
             return web.json_response({"error": playerok_error_text(exc)}, status=502)
         except Exception as exc:
@@ -855,6 +860,55 @@ class MiniApp:
         body = None if request.method == "DELETE" else await read_json(request)
         return web.json_response(await self.telegram_plugins.update_rule(account, rule_id, body))
 
+    @staticmethod
+    def autosmm_offset(request: web.Request) -> int:
+        value = request.query.get("offset", "0")
+        if not re.fullmatch(r"[0-9]{1,6}", value):
+            raise web.HTTPBadRequest(reason="Некорректная страница.")
+        return int(value)
+
+    async def autosmm_panel(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        return web.json_response(await self.autosmm.panel(account.id))
+
+    async def autosmm_catalog(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        query = request.query.get("q", "")
+        if len(query) > 128:
+            raise web.HTTPBadRequest(reason="Слишком длинный запрос.")
+        return web.json_response(await self.autosmm.catalog(account.id, query, self.autosmm_offset(request)))
+
+    async def autosmm_balance(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        return web.json_response(await self.autosmm.balance(account.id))
+
+    async def autosmm_orders(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        return web.json_response(await self.autosmm.orders(account.id, self.autosmm_offset(request)))
+
+    async def autosmm_bind(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        body = await read_json(request)
+        item = None
+        if "lotId" in body:
+            client = await self.gateway.get_client(account)
+            item = await self.owned_listing(client, account, resource_id(body["lotId"]))
+        return web.json_response(await self.autosmm.bind(account.id, body, item), status=201)
+
+    async def autosmm_rule(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        body = None if request.method == "DELETE" else await read_json(request)
+        return web.json_response(await self.autosmm.update_rule(account.id, int(request.match_info["rule_id"]), body))
+
+    async def autosmm_order(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        return web.json_response(await self.autosmm.order(account.id, int(request.match_info["order_id"])))
+
+    async def autosmm_refill(self, request: web.Request) -> web.Response:
+        account = await self.account(request)
+        body = await read_json(request)
+        return web.json_response(await self.autosmm.refill(account.id, int(request.match_info["order_id"]), body))
+
     async def plugin_json(self, account: PlayerokAccount, plugin: PluginSpec) -> dict[str, Any]:
         enabled, config = await self.plugins.resolved_state(account.id, plugin)
         fields = []
@@ -873,6 +927,7 @@ class MiniApp:
             "id": plugin.id, "name": plugin.name, "version": plugin.version,
             "description": plugin.description, "enabled": enabled, "fields": fields,
             "telegramAccounts": plugin.id == "telegram_accounts",
+            "autoSmm": plugin.id == "autosmm",
         }
 
     async def installed_plugins(self, request: web.Request) -> web.Response:
@@ -953,6 +1008,15 @@ class MiniApp:
             ("POST", "/telegram-accounts/rules", self.telegram_plugin_bind),
             ("PATCH", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),
             ("DELETE", r"/telegram-accounts/rules/{rule_id:\d{1,10}}", self.telegram_plugin_rule),
+            ("GET", "/autosmm", self.autosmm_panel),
+            ("GET", "/autosmm/catalog", self.autosmm_catalog),
+            ("GET", "/autosmm/balance", self.autosmm_balance),
+            ("GET", "/autosmm/orders", self.autosmm_orders),
+            ("POST", "/autosmm/rules", self.autosmm_bind),
+            ("PATCH", r"/autosmm/rules/{rule_id:\d{1,10}}", self.autosmm_rule),
+            ("DELETE", r"/autosmm/rules/{rule_id:\d{1,10}}", self.autosmm_rule),
+            ("GET", r"/autosmm/orders/{order_id:\d{1,10}}", self.autosmm_order),
+            ("POST", r"/autosmm/orders/{order_id:\d{1,10}}/refill", self.autosmm_refill),
             ("GET", "/plugins", self.installed_plugins),
             ("PATCH", "/plugins/{plugin_id}", self.update_plugin),
             ("GET", "/notifications", self.notification_settings),

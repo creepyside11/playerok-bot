@@ -25,6 +25,11 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "session_revoked": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "telegram_account_lot_rules": {"keyword": "VARCHAR(128)"},
+    "autosmm_lot_rules": {"keyword": "VARCHAR(128)"},
+    "autosmm_orders": {
+        "provider_url": "VARCHAR(256)", "refill_id": "VARCHAR(128)", "refill_status": "VARCHAR(64)",
+        "refill_requested_at": "TIMESTAMP WITH TIME ZONE",
+    },
     "telegram_users": {
         "web_login": "VARCHAR(64)",
         "web_password_hash": "VARCHAR(128)",

@@ -75,6 +75,12 @@ let editedListing = null;
 let listingWizard = null;
 let publicationQuote = null;
 let telegramPanel = null;
+let smmPanel = null;
+let smmTab = "rules";
+let smmCatalog = null;
+let smmOrders = null;
+let smmQuery = "";
+let smmSelectedService = "";
 let telegramTab = "stock";
 let telegramLots = [];
 let telegramLotsCursor = null;
@@ -368,6 +374,7 @@ function pluginCard(plugin) {
       ${plugin.enabled ? "Включён" : "Выключен"}</span>
       ${plugin.telegramAccounts
         ? button("Управление", "telegramPlugin", { glyph: "settings" })
+        : plugin.autoSmm ? button("Управление", "autosmmPlugin", { glyph: "settings" })
         : button("Настройки", "plugin", { value: plugin.id, glyph: "settings" })}
     </div></article>`;
 }
@@ -1407,6 +1414,212 @@ async function telegramRule(id, method, body) {
   notify(method === "DELETE" ? "Привязка удалена" : "Привязка сохранена");
 }
 
+function smmStateBadge(value) {
+  const raw = String(value || "—");
+  const colors = { completed: "green", pending: "amber", processing: "teal", "in progress": "teal",
+    partial: "amber", requesting: "amber", unknown: "amber", rejected: "red", canceled: "red", cancelled: "red", failed: "red" };
+  return `<span class="status ${colors[raw.toLowerCase()] || ""}">${safe(raw)}</span>`;
+}
+
+function smmRuleCard(rule) {
+  return `<article class="smm-rule">
+    <div class="smm-rule-head"><span class="quick-icon">${icon(rule.keyword ? "search" : "bag")}</span>
+      <div class="row-text"><small>${rule.keyword ? "Ключевая фраза" : "Конкретный лот"}</small>
+      <strong>${safe(rule.keyword || rule.title)}</strong><small>Услуга #${safe(rule.serviceId)} · ${safe(rule.serviceName)}</small></div>
+      ${toggle("Привязка", rule.enabled, "smmToggleRule", rule.id)}</div>
+    <form class="smm-rule-form" data-rule="${safe(rule.id)}">
+      <label class="field">Количество<input type="number" name="quantity" min="1" max="10000000" step="1" value="${safe(rule.quantity)}" required></label>
+      <label class="field inline">Отметить сделку SENT после запуска<input type="checkbox" name="autoSent" ${rule.autoSent ? "checked" : ""}></label>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="detail-buttons"><button class="button" type="submit">Сохранить</button>
+      ${button("Удалить", "smmDeleteRule", { value: rule.id, glyph: "close", variant: "flat" })}</div>
+    </form></article>`;
+}
+
+function renderSmmPanel() {
+  const configured = smmPanel.configured;
+  let body = "";
+  if (smmTab === "rules") {
+    body = `<div class="smm-section"><h3>Новая привязка</h3>
+      ${configured ? `<form id="smm-bind-form">
+      <label class="field">Ключевая фраза<input name="keyword" maxlength="128" placeholder="Слово или фраза из названия лота"></label>
+      <label class="field">Или ID конкретного лота<input name="lotId" maxlength="128" placeholder="Оставьте пустым при привязке по фразе"></label>
+      <label class="field">ID услуги SMM<input name="serviceId" maxlength="48" value="${safe(smmSelectedService)}" required></label>
+      <label class="field">Количество<input name="quantity" type="number" min="1" max="10000000" step="1" required placeholder="100"></label>
+      <p class="payout-note">Точный ID имеет приоритет. Для нескольких совпадений выбирается наиболее длинная фраза. Количество проверяется по каталогу.</p>
+      <p class="form-error" role="alert" hidden></p>
+      <button type="submit" class="button primary">${icon("plus")}Добавить привязку</button></form>` : '<p>Сначала настройте API панели в меню AutoSMM Telegram-бота.</p>'}
+      <h3>Привязки · ${count(smmPanel.rules.length)}</h3>
+      ${smmPanel.rules.length ? `<div class="smm-rules">${smmPanel.rules.map(smmRuleCard).join("")}</div>` : placeholder("Пока нет привязок", "", "bag")}</div>`;
+  } else if (smmTab === "catalog") {
+    const list = smmCatalog?.items || [];
+    body = `<form id="smm-search-form" class="wizard-search">
+      <label class="field">Поиск услуг<input name="q" type="search" maxlength="128" value="${safe(smmQuery)}" placeholder="ID, название или категория"></label>
+      <button class="button primary" type="submit">Найти</button><p class="form-error" role="alert" hidden></p></form>
+      ${smmCatalog ? `<small class="payout-note">Найдено: ${count(smmCatalog.total)}</small><div class="panel wizard-catalog">${list.map((service) =>
+        `<button class="row-button smm-service-row" data-action="smmBindService" data-value="${safe(service.id)}"><span class="row-text">
+        <strong>#${safe(service.id)} · ${safe(service.name)}</strong><small>${safe(service.category)} · ${safe(service.min || "—")}–${safe(service.max || "—")}</small>
+        <small>Тариф: ${safe(service.rate || "—")} / 1000 · Refill: ${service.refill ? "доступен" : "нет"}</small></span>${icon("right", "caret")}</button>`).join("") || placeholder("Нет услуг", "Попробуйте другой запрос.", "search")}</div>
+        ${smmCatalog.next !== null ? button("Показать ещё", "smmCatalogMore", { value: smmCatalog.next, glyph: "down" }) : ""}` : skeleton()}`;
+  } else {
+    body = smmOrders ? `<small class="payout-note">Всего заказов: ${count(smmOrders.total)}</small>
+      <div class="panel wizard-catalog">${smmOrders.items.map((entry) =>
+      `<button class="row-button smm-service-row" data-action="smmOrder" data-value="${safe(entry.id)}"><span class="row-text">
+        <strong>Заказ #${safe(entry.orderId)}</strong><small>${safe(entry.serviceName || entry.serviceId)} · ${count(entry.quantity)} шт.</small>
+        <small>${entry.refillStatus ? `Refill: ${safe(entry.refillStatus)}` : "Refill не запрашивался"}</small></span>${smmStateBadge(entry.status)}${icon("right", "caret")}</button>`).join("") || placeholder("Заказов пока нет", "", "bag")}</div>
+        ${smmOrders.next !== null ? button("Показать ещё", "smmOrdersMore", { value: smmOrders.next, glyph: "down" }) : ""}` : skeleton();
+  }
+  showDrawer("AutoSMM", `<div class="smm-overview"><span class="plugin-icon">${icon("plug")}</span>
+    <div class="row-text"><strong>${configured ? "SMM-панель подключена" : "Панель не подключена"}</strong><small>${safe(smmPanel.apiUrl || "Настройки API в Telegram-боте")}</small></div>
+    <span class="signal ${configured ? "live" : ""}"></span></div>
+    <div class="detail-buttons smm-toolbar">
+      ${configured ? button(smmPanel.balance ? `${smmPanel.balance.balance} ${smmPanel.balance.currency}` : "Баланс панели", "smmBalance", { glyph: "wallet" }) : ""}
+      ${button("Настройки плагина", "plugin", { value: "autosmm", glyph: "settings", variant: "flat" })}
+    </div>
+    ${tabs([["rules", "Привязки"], ["catalog", "Услуги"], ["orders", "Заказы"]], smmTab, "smmTab", "Раздел AutoSMM")}
+    <div class="smm-body">${body}</div>`);
+}
+
+async function smmPluginDrawer() {
+  const sequence = ++drawerSequence;
+  smmTab = "rules"; smmCatalog = null; smmOrders = null; smmQuery = ""; smmSelectedService = "";
+  showDrawer("AutoSMM", skeleton());
+  try {
+    const data = await request(path("/autosmm"));
+    if (sequence !== drawerSequence) return;
+    smmPanel = data;
+    renderSmmPanel();
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("AutoSMM", placeholder("Не удалось открыть", error.message, "info",
+      button("Повторить", "autosmmPlugin")));
+  }
+}
+
+async function smmBalance(target) {
+  const sequence = drawerSequence;
+  target.disabled = true;
+  try {
+    const balance = await request(path("/autosmm/balance"));
+    if (sequence !== drawerSequence) return;
+    smmPanel.balance = balance;
+    renderSmmPanel();
+  } catch (error) {
+    if (sequence === drawerSequence) notify(error.message, true);
+  } finally {
+    target.disabled = false;
+  }
+}
+
+async function loadSmmCatalog(query = smmQuery, offset = 0) {
+  const sequence = ++drawerSequence;
+  smmQuery = query;
+  if (offset === 0) smmCatalog = null;
+  renderSmmPanel();
+  try {
+    const data = await request(path(`/autosmm/catalog?${new URLSearchParams({ q: query, offset })}`));
+    if (sequence !== drawerSequence || smmTab !== "catalog") return;
+    smmCatalog = { ...data, items: [...(offset ? smmCatalog?.items || [] : []), ...data.items] };
+    renderSmmPanel();
+  } catch (error) {
+    if (sequence === drawerSequence) {
+      smmCatalog = { items: [], total: 0, next: null };
+      renderSmmPanel();
+      const feedback = drawer.querySelector("#smm-search-form .form-error");
+      feedback.textContent = error.message; feedback.hidden = false;
+    }
+  }
+}
+
+async function loadSmmOrders(offset = 0) {
+  const sequence = ++drawerSequence;
+  if (!offset) smmOrders = null;
+  renderSmmPanel();
+  try {
+    const data = await request(path(`/autosmm/orders?offset=${offset}`));
+    if (sequence !== drawerSequence || smmTab !== "orders") return;
+    smmOrders = { ...data, items: [...(offset ? smmOrders?.items || [] : []), ...data.items] };
+    renderSmmPanel();
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("AutoSMM", placeholder("История недоступна", error.message, "info", button("Назад", "autosmmPlugin")));
+  }
+}
+
+function smmChangeTab(value) {
+  drawerSequence += 1;
+  smmTab = value;
+  renderSmmPanel();
+  if (value === "catalog") loadSmmCatalog();
+  if (value === "orders") loadSmmOrders();
+}
+
+async function smmBind(form) {
+  const keyword = form.elements.keyword.value.trim(), lotId = form.elements.lotId.value.trim();
+  if (Boolean(keyword) === Boolean(lotId)) throw new Error("Выберите ID лота или ключевую фразу (одно из двух).");
+  const sequence = drawerSequence;
+  const row = await request(path("/autosmm/rules"), { method: "POST", body: {
+    ...(keyword ? { keyword } : { lotId }), serviceId: form.elements.serviceId.value.trim(),
+    quantity: form.elements.quantity.valueAsNumber,
+  } });
+  if (sequence !== drawerSequence) return;
+  smmPanel.rules = [row, ...smmPanel.rules.filter((entry) => entry.id !== row.id)];
+  smmSelectedService = "";
+  renderSmmPanel();
+  notify("Привязка сохранена");
+}
+
+async function smmUpdateRule(id, patch = null) {
+  const sequence = drawerSequence;
+  const row = await request(path(`/autosmm/rules/${encodeURIComponent(id)}`), { method: patch === null ? "DELETE" : "PATCH", body: patch === null ? undefined : patch });
+  if (sequence !== drawerSequence) return;
+  smmPanel.rules = patch === null ? smmPanel.rules.filter((entry) => entry.id !== row.id)
+    : smmPanel.rules.map((entry) => entry.id === row.id ? row : entry);
+  renderSmmPanel();
+  notify(patch === null ? "Привязка удалена" : "Привязка сохранена");
+}
+
+function showSmmOrder(order) {
+  showDrawer("Заказ AutoSMM", `<div class="wizard-publication-summary">${icon("bag")}<div><small>Заказ панели</small><strong>#${safe(order.orderId)}</strong><p>${safe(order.serviceName)}</p></div></div>
+    <div class="detail-rows"><div><span>Статус заказа</span>${smmStateBadge(order.status)}</div>
+      <div><span>Услуга</span><strong>#${safe(order.serviceId)}</strong></div><div><span>Количество</span><strong>${count(order.quantity)}</strong></div>
+      <div><span>Сделка Playerok</span><strong>${safe(order.dealId)}</strong></div>
+      <div><span>Ссылка</span><strong>${safe(order.link)}</strong></div>
+      <div><span>Refill</span>${smmStateBadge(order.refillStatus || "Не запрашивался")}</div>
+      ${order.refillId ? `<div><span>ID refill</span><strong>#${safe(order.refillId)}</strong></div>` : ""}</div>
+    ${order.canRefill ? `<form id="smm-refill-form" data-order="${safe(order.id)}">
+      <label class="field inline">Подтверждаю ручной запрос refill<input type="checkbox" name="confirm" required></label>
+      ${order.legacy ? '<label class="field inline">Старый заказ принадлежит текущей панели<input type="checkbox" name="confirmLegacy" required></label>' : ""}
+      <p class="form-error" role="alert" hidden></p><button class="button primary" type="submit">${icon("refresh")}Запросить refill</button></form>`
+      : '<p class="payout-note">Refill сейчас недоступен, уже запрошен или не поддерживается услугой. Обновите статус.</p>'}
+    <div class="detail-buttons">
+      ${button("Обновить", "smmOrder", { value: order.id, glyph: "refresh" })}
+      ${button("История", "smmTab", { value: "orders", glyph: "back", variant: "flat" })}</div>`);
+}
+
+async function smmOrderDrawer(id) {
+  const sequence = ++drawerSequence;
+  showDrawer("Заказ AutoSMM", skeleton());
+  try {
+    const result = await request(path(`/autosmm/orders/${encodeURIComponent(id)}`));
+    if (sequence !== drawerSequence) return;
+    showSmmOrder(result);
+  } catch (error) {
+    if (sequence === drawerSequence) showDrawer("Заказ AutoSMM", placeholder("Статус недоступен", error.message, "info",
+      button("Обновить", "smmOrder", { value: id, glyph: "refresh" })) + button("К истории", "smmTab", { value: "orders" }));
+  }
+}
+
+async function submitSmmRefill(form) {
+  const sequence = drawerSequence;
+  const id = form.dataset.order;
+  if (!form.elements.confirm.checked) throw new Error("Подтвердите запрос.");
+  const result = await request(path(`/autosmm/orders/${encodeURIComponent(id)}/refill`), {
+    method: "POST", body: { confirm: true, confirmLegacy: Boolean(form.elements.confirmLegacy?.checked) },
+  });
+  if (sequence !== drawerSequence) return;
+  showSmmOrder(result);
+  notify("Запрос refill принят");
+}
+
 function askConfirmation(message, action) {
   if (telegram?.isVersionAtLeast?.("6.2") && telegram.showConfirm) {
     telegram.showConfirm(message, (confirmed) => { if (confirmed) action().catch((error) => notify(error.message, true)); });
@@ -1487,6 +1700,19 @@ document.addEventListener("click", (event) => {
   }
   if (action === "publishListing") listingPublication(value);
   if (action === "telegramPlugin") telegramPluginDrawer();
+  if (action === "autosmmPlugin") smmPluginDrawer();
+  if (action === "smmTab") smmChangeTab(value);
+  if (action === "smmBalance") smmBalance(target);
+  if (action === "smmBindService") { smmSelectedService = value; smmChangeTab("rules"); }
+  if (action === "smmCatalogMore") loadSmmCatalog(smmQuery, Number(value));
+  if (action === "smmOrdersMore") loadSmmOrders(Number(value));
+  if (action === "smmOrder") smmOrderDrawer(value);
+  if (action === "smmToggleRule") {
+    target.disabled = true;
+    smmUpdateRule(value, { enabled: target.getAttribute("aria-checked") !== "true" })
+      .catch(error => notify(error.message, true)).finally(() => { target.disabled = false; });
+  }
+  if (action === "smmDeleteRule") askConfirmation("Удалить привязку?", () => smmUpdateRule(value));
   if (action === "telegramTab") telegramChangeTab(value).catch((error) => notify(error.message, true));
   if (action === "telegramMoreLots") loadTelegramLots(true).catch((error) => notify(error.message, true));
   if (action === "telegramStockBot") openTelegramStock();
@@ -1559,6 +1785,12 @@ document.addEventListener("submit", async (event) => {
   submit.disabled = true;
   try {
     if (form.id === "payout-form") await submitPayout(form);
+    if (form.id === "smm-bind-form") await smmBind(form);
+    if (form.id === "smm-search-form") await loadSmmCatalog(form.elements.q.value.trim());
+    if (form.id === "smm-refill-form") await submitSmmRefill(form);
+    if (form.classList.contains("smm-rule-form")) await smmUpdateRule(form.dataset.rule, {
+      quantity: form.elements.quantity.valueAsNumber, autoSent: form.elements.autoSent.checked,
+    });
     if (form.id === "listing-catalog-form") await loadCatalogGames(form.elements.q.value.trim());
     if (form.id === "listing-create-form") await submitListingDraft(form);
     if (form.id === "listing-publish-form") await submitPublication(form);
